@@ -38,6 +38,25 @@ def auto_score_alert(alert: FlowAlert) -> tuple[int, list[str]]:
         score += 5
         reasons.append(f"{sentiment} sentiment")
 
+    if alert.source:
+        source = alert.source.lower()
+
+        if source == "flow":
+            score += 6
+            reasons.append("flow source")
+        elif source == "scanner":
+            score += 5
+            reasons.append("scanner source")
+        elif source == "news":
+            score += 3
+            reasons.append("news source")
+        elif source == "earnings":
+            score += 4
+            reasons.append("earnings source")
+        elif source == "macro":
+            score += 2
+            reasons.append("macro source")
+
     if alert.catalyst:
         score += 5
         reasons.append("catalyst present")
