@@ -40,6 +40,23 @@ async def send_test():
         "status_code": response.status_code
     }
 
+@app.post("/score-only")
+async def score_only(alert: FlowAlert):
+    final_score = alert.score
+    score_reasons = []
+
+    if final_score is None:
+        final_score, score_reasons = auto_score_alert(alert)
+
+    return {
+        "ok": True,
+        "posted": False,
+        "ticker": alert.ticker,
+        "score": final_score,
+        "score_reasons": score_reasons,
+        "passes_threshold": final_score >= MIN_ALERT_SCORE,
+        "min_alert_score": MIN_ALERT_SCORE
+    }
 
 @app.post("/flow-alert")
 async def flow_alert(alert: FlowAlert):
