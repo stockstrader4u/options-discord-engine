@@ -5,8 +5,8 @@ from typing import Literal
 class FlowAlert(BaseModel):
     ticker: str
     contract: str
-    premium: str
-    sentiment: str
+    premium: int
+    sentiment: Literal["bullish", "bearish", "neutral"]
     note: str | None = None
     score: int | None = None
     levels: str | None = None

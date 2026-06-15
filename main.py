@@ -1,3 +1,4 @@
+from datetime import datetime
 from fastapi import FastAPI
 from dotenv import load_dotenv
 import os
@@ -85,12 +86,25 @@ async def flow_alert(alert: FlowAlert):
     elif alert.sentiment.lower() == "neutral":
         emoji = "🟡"
 
+    dte_display = alert.dte_bucket.replace("_", " ").title()
+    source_display = alert.source.replace("_", " ").title()
+    alert_label = f"{source_display} Alert"
+    try:
+        premium_display = f"${alert.premium:,}"
+    except Exception:
+        premium_display = alert.premium
+    sentiment_display = alert.sentiment.title()
+    timestamp_display = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     lines = [
-        f"{emoji} **{alert.ticker} flow alert**",
+        f"{emoji} **{alert.ticker} {alert_label}**",
+        "",
+        f"**Time:** {timestamp_display}",
         f"**Contract:** {alert.contract}",
-        f"**Premium:** {alert.premium}",
-        f"**Sentiment:** {alert.sentiment}",
-        f"**Source:** {alert.source}",
+        f"**Premium:** {premium_display}",
+        f"**Sentiment:** {sentiment_display}",
+        f"**Source:** {source_display}",
+        f"**DTE Bucket:** {dte_display}",
         f"**Score:** {final_score}/100"
     ]
 
@@ -102,11 +116,15 @@ async def flow_alert(alert: FlowAlert):
 
     if alert.catalyst:
         lines.append(f"**Catalyst:** {alert.catalyst}")
-
+    
     if score_reasons:
-        lines.append(f"**Why it passed:** {', '.join(score_reasons)}")
+        lines.append("")
+        lines.append("**Why it passed:**")
+        for reason in score_reasons:
+            lines.append(f"• {reason}")
 
     if alert.note:
+        lines.append("")
         lines.append(f"**Note:** {alert.note}")
 
     message = "\n".join(lines)

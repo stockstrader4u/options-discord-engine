@@ -1,37 +1,24 @@
 from models import FlowAlert
 
 
-def parse_premium_to_number(premium: str) -> float:
-    value = premium.replace("$", "").replace(",", "").strip().upper()
-
-    if value.endswith("K"):
-        return float(value[:-1]) * 1_000
-    if value.endswith("M"):
-        return float(value[:-1]) * 1_000_000
-    return float(value)
-
-
 def auto_score_alert(alert: FlowAlert) -> tuple[int, list[str]]:
     score = 35
     reasons = []
 
-    try:
-        premium_value = parse_premium_to_number(alert.premium)
+    premium_value = alert.premium
 
-        if premium_value >= 500_000:
-            score += 18
-            reasons.append("very large premium")
-        elif premium_value >= 250_000:
-            score += 14
-            reasons.append("large premium")
-        elif premium_value >= 100_000:
-            score += 10
-            reasons.append("solid premium")
-        elif premium_value >= 50_000:
-            score += 5
-            reasons.append("decent premium")
-    except Exception:
-        reasons.append("premium unreadable")
+    if premium_value >= 500_000:
+        score += 18
+        reasons.append("very large premium")
+    elif premium_value >= 250_000:
+        score += 14
+        reasons.append("large premium")
+    elif premium_value >= 100_000:
+        score += 10
+        reasons.append("solid premium")
+    elif premium_value >= 50_000:
+        score += 5
+        reasons.append("decent premium")
 
     sentiment = alert.sentiment.lower()
     if sentiment in ["bullish", "bearish"]:
@@ -43,29 +30,29 @@ def auto_score_alert(alert: FlowAlert) -> tuple[int, list[str]]:
 
         if source == "flow":
             score += 6
-            reasons.append("flow source")
+            reasons.append("flow-driven setup")
         elif source == "scanner":
             score += 5
-            reasons.append("scanner source")
+            reasons.append("scanner-confirmed setup")
         elif source == "news":
             score += 3
-            reasons.append("news source")
+            reasons.append("news-backed setup")
         elif source == "earnings":
             score += 4
-            reasons.append("earnings source")
+            reasons.append("earnings-driven setup")
         elif source == "macro":
             score += 2
-            reasons.append("macro source")
+            reasons.append("macro-backed setup")
 
     if alert.dte_bucket == "weeklies":
         score += 6
-        reasons.append("weeklies setup")
+        reasons.append("weeklies contract")
     elif alert.dte_bucket == "next_week":
         score += 4
-        reasons.append("next-week setup")
+        reasons.append("next-week contract")
     elif alert.dte_bucket == "monthly":
         score += 1
-        reasons.append("monthly setup")
+        reasons.append("monthly contract")
 
     if alert.catalyst:
         score += 5
