@@ -53,6 +53,19 @@ def auto_score_alert(alert: FlowAlert) -> tuple[int, list[str]]:
         elif source == "earnings":
             score += 4
             reasons.append("earnings source")
+        elif source == "macro":
+            score += 2
+            reasons.append("macro source")
+
+    if alert.dte_bucket == "weeklies":
+        score += 6
+        reasons.append("weeklies setup")
+    elif alert.dte_bucket == "next_week":
+        score += 4
+        reasons.append("next-week setup")
+    elif alert.dte_bucket == "monthly":
+        score += 1
+        reasons.append("monthly setup")
 
     if alert.catalyst:
         score += 5

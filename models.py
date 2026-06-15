@@ -12,4 +12,5 @@ class FlowAlert(BaseModel):
     levels: str | None = None
     catalyst: str | None = None
     flow_type: str | None = None
-    source: Literal["flow", "news", "earnings", "scanner"] = "flow"
+    source: Literal["flow", "news", "earnings", "scanner", "macro"] = "flow"
+    dte_bucket: Literal["weeklies", "next_week", "monthly", "unknown"] = "unknown"
