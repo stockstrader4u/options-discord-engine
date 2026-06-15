@@ -1,4 +1,5 @@
 from pydantic import BaseModel
+from typing import Literal
 
 
 class FlowAlert(BaseModel):
@@ -11,4 +12,4 @@ class FlowAlert(BaseModel):
     levels: str | None = None
     catalyst: str | None = None
     flow_type: str | None = None
-    source: str | None = "flow"
+    source: Literal["flow", "news", "earnings", "scanner"] = "flow"

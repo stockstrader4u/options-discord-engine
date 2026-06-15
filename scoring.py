@@ -53,9 +53,6 @@ def auto_score_alert(alert: FlowAlert) -> tuple[int, list[str]]:
         elif source == "earnings":
             score += 4
             reasons.append("earnings source")
-        elif source == "macro":
-            score += 2
-            reasons.append("macro source")
 
     if alert.catalyst:
         score += 5
