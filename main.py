@@ -52,6 +52,7 @@ async def score_only(alert: FlowAlert):
         "ok": True,
         "posted": False,
         "ticker": alert.ticker,
+        "source": alert.source,
         "score": final_score,
         "score_reasons": score_reasons,
         "passes_threshold": final_score >= MIN_ALERT_SCORE,
@@ -89,6 +90,7 @@ async def flow_alert(alert: FlowAlert):
         f"**Contract:** {alert.contract}",
         f"**Premium:** {alert.premium}",
         f"**Sentiment:** {alert.sentiment}",
+        f"**Source:** {alert.source}",
         f"**Score:** {final_score}/100"
     ]
 

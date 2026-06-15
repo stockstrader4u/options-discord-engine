@@ -11,3 +11,4 @@ class FlowAlert(BaseModel):
     levels: str | None = None
     catalyst: str | None = None
     flow_type: str | None = None
+    source: str | None = "flow"
