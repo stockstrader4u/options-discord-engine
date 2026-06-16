@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 .env
+alerts.db
+alerts.db-shm
+alerts.db-wal
