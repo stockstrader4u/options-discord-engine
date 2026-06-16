@@ -82,11 +82,10 @@ def _sqlite_conn() -> sqlite3.Connection:
 
 
 def _pg_conn():
-    """Return a psycopg2 connection with RealDictCursor row factory."""
-    import psycopg2
-    import psycopg2.extras
-    conn = psycopg2.connect(DATABASE_URL)
-    conn.autocommit = False
+    """Return a psycopg3 connection with dict row factory."""
+    import psycopg
+    from psycopg.rows import dict_row
+    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
     return conn
 
 
@@ -105,21 +104,9 @@ def get_connection():
 
 @contextmanager
 def db_cursor():
-    """
-    Context manager yielding (conn, cursor).
-    Commits on success, rolls back on exception.
-
-    Example:
-        with db_cursor() as (conn, cur):
-            cur.execute("SELECT 1")
-    """
     conn = get_connection()
     try:
-        if _POSTGRES:
-            import psycopg2.extras
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        else:
-            cur = conn.cursor()
+        cur = conn.cursor()
         yield conn, cur
         conn.commit()
     except Exception:
