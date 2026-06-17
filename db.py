@@ -9,7 +9,7 @@ Selection logic:
   - Otherwise → use SQLite (DB_PATH, default alerts.db)
 
 PostgreSQL notes:
-  - Uses psycopg2
+  - Uses psycopg (v3)
   - All queries use %s placeholders (not ?)
   - datetime() SQL functions replaced with NOW()
   - Parameterized queries work identically
@@ -407,16 +407,14 @@ def init_all_tables() -> None:
 
 def alert_hash_exists_in_window(alert_hash: str, window_minutes: int) -> bool:
     """Dedup check — True if this hash was published within window_minutes."""
-    p = "%" + "s" if _POSTGRES else "?"
-
     if _POSTGRES:
         sql = """
             SELECT 1 FROM published_alerts
             WHERE alert_hash = %s
-              AND published_at >= NOW() - INTERVAL %s
+              AND published_at >= NOW() - make_interval(mins => %s)
             LIMIT 1
         """
-        params = (alert_hash, f"{window_minutes} minutes")
+        params = (alert_hash, window_minutes)
     else:
         sql = """
             SELECT 1 FROM published_alerts
