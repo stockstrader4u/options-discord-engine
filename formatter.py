@@ -8,18 +8,6 @@ Two output modes:
 Two payload types:
   - plain_text: simple Discord webhook content string
   - embed:      structured Discord embed payload with color, fields, timestamp
-
-Usage:
-    from formatter import format_alert, FormatMode, PayloadType
-
-    # Subscriber plain text
-    msg = format_alert(alert, enrichment, classification, score, reasons)
-
-    # Internal embed for ops channel
-    payload = format_alert(
-        alert, enrichment, classification, score, reasons,
-        mode="internal", payload_type="embed"
-    )
 """
 
 from __future__ import annotations
@@ -38,6 +26,9 @@ PayloadType = Literal["plain_text", "embed"]
 _COLOR_BULLISH = 0x00C851   # green
 _COLOR_BEARISH = 0xFF4444   # red
 _COLOR_NEUTRAL = 0xFFBB33   # amber
+
+# Divider shown between alerts so they're easy to scan in Discord
+ALERT_DIVIDER = "─────────────────────────"
 
 
 # ---------------------------------------------------------------------------
@@ -67,28 +58,22 @@ def _premium_display(premium: int) -> str:
 
 
 def _contract_short(contract: str) -> str:
-    """Extract just the expiry + strike + type, e.g. 'Jul 18 · $130C'"""
+    """Extract strike + expiry, e.g. '$130C · Jul 18'"""
     parts = contract.split()
     if len(parts) >= 3:
-        ticker = parts[0]
         expiry = parts[1]
         strike_type = parts[2]
-
-        # Parse expiry date
         try:
             dt = datetime.strptime(expiry, "%Y-%m-%d")
             expiry_fmt = dt.strftime("%b %d")
         except ValueError:
             expiry_fmt = expiry
-
-        # Format strike
         strike_num = strike_type[:-1]
         pc = "C" if strike_type.endswith("C") else "P"
         try:
             strike_fmt = f"${float(strike_num):.0f}{pc}"
         except ValueError:
             strike_fmt = strike_type
-
         return f"{strike_fmt} · {expiry_fmt}"
     return contract
 
@@ -96,19 +81,32 @@ def _contract_short(contract: str) -> str:
 def _dte_display(enrichment: FlowEnrichment) -> str:
     if enrichment.dte is not None and enrichment.dte > 0:
         return f"{enrichment.dte}d"
-    bucket = enrichment.dte_bucket.replace("_", " ").title()
-    return bucket
+    return enrichment.dte_bucket.replace("_", " ").title()
 
 
 def _embed_color(sentiment: str) -> int:
-    return {
-        "bullish": _COLOR_BULLISH,
-        "bearish": _COLOR_BEARISH,
-    }.get(sentiment.lower(), _COLOR_NEUTRAL)
+    return {"bullish": _COLOR_BULLISH, "bearish": _COLOR_BEARISH}.get(
+        sentiment.lower(), _COLOR_NEUTRAL
+    )
 
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _vol_oi_line(alert: FlowAlert) -> str | None:
+    """
+    Return a formatted volume/OI line when both values are available.
+    e.g. "📊 Vol 33,326 · OI 9,878 · Vol/OI 3.4x"
+    This replaces the vague RVOL/classification tags in the subscriber card.
+    """
+    if alert.volume is None or alert.open_interest is None:
+        return None
+    vol = alert.volume
+    oi = alert.open_interest
+    ratio = vol / oi if oi > 0 else 0.0
+    oi_str = f"{oi:,}" if oi > 0 else "—"
+    return f"📊 Vol {vol:,} · OI {oi_str} · Vol/OI {ratio:.1f}x"
 
 
 # ---------------------------------------------------------------------------
@@ -130,57 +128,40 @@ def _subscriber_plain(
     dte_str = _dte_display(enrichment)
     conviction = _conviction_label(score)
 
-    # Header — punchy, trader-focused
-    catalyst_suffix = ""
-    if alert.catalyst:
-        catalyst_suffix = f" into {alert.catalyst}"
+    catalyst_suffix = f" into {alert.catalyst}" if alert.catalyst else ""
     header = f"{emoji} **{alert.ticker} — {direction} {flow}{catalyst_suffix}**"
 
     lines = [
+        ALERT_DIVIDER,
         header,
         "",
         f"📋 `{contract_short}` · {dte_str}",
         f"💰 {premium_str} premium · {flow}",
     ]
 
-    # Moneyness if useful
+    # Moneyness + real spot price
     if enrichment.moneyness_tier not in ("unknown",):
         tier = enrichment.moneyness_tier.replace("_", " ").upper()
         if enrichment.spot_price:
-            lines.append(f"📍 {tier} · ${enrichment.spot_price:,.0f} spot")
+            lines.append(f"📍 {tier} · ${enrichment.spot_price:,.2f} spot")
         else:
             lines.append(f"📍 {tier}")
 
-    # Levels
+    # Real volume and open interest — replaces vague RVOL/classification tags
+    vol_oi = _vol_oi_line(alert)
+    if vol_oi:
+        lines.append(vol_oi)
+
+    # Key levels if set
     if alert.levels:
         lines.append(f"🎯 {alert.levels}")
 
-    # Catalyst (only if not already in header)
-    if alert.catalyst and len(catalyst_suffix) == 0:
-        lines.append(f"📅 Catalyst: {alert.catalyst}")
-
     lines.append("")
 
-    # Conviction + score
+    # Conviction + score — the one meaningful summary line
     lines.append(f"▸ **Conviction: {conviction}** · Score {score}/100")
 
-    # One-line setup summary based on classification
-    setup_parts = []
-    if classification.trade_style.label != "unknown":
-        setup_parts.append(classification.trade_style.label)
-    if classification.intent.label not in ("unknown", "speculative"):
-        setup_parts.append(classification.intent.label)
-    if classification.momentum.label not in ("unknown",):
-        setup_parts.append(f"{classification.momentum.label} momentum")
-
-    if setup_parts:
-        lines.append(f"▸ {' · '.join(setup_parts).title()}")
-
-    # RVOL if elevated
-    if enrichment.rvol_label in ("extreme", "high") and enrichment.rvol:
-        lines.append(f"▸ RVOL {enrichment.rvol}x — elevated volume")
-
-    # Note — only if it adds real context (not JarvisFlow boilerplate)
+    # Note only if it adds real context (skip JarvisFlow boilerplate)
     if alert.note and "JarvisFlow" not in alert.note:
         lines.append(f"\n_{alert.note}_")
 
@@ -217,29 +198,22 @@ def _subscriber_embed(
 
     if enrichment.moneyness_tier not in ("unknown",):
         tier = enrichment.moneyness_tier.replace("_", " ").upper()
-        spot_str = f" · ${enrichment.spot_price:,.0f} spot" if enrichment.spot_price else ""
+        spot_str = f" · ${enrichment.spot_price:,.2f}" if enrichment.spot_price else ""
         fields.append({"name": "Moneyness", "value": f"{tier}{spot_str}", "inline": True})
 
-    if enrichment.rvol and enrichment.rvol_label in ("extreme", "high"):
-        fields.append({"name": "RVOL", "value": f"{enrichment.rvol}x ({enrichment.rvol_label})", "inline": True})
+    # Real volume/OI instead of RVOL
+    if alert.volume is not None and alert.open_interest is not None:
+        ratio = alert.volume / alert.open_interest if alert.open_interest > 0 else 0.0
+        fields.append({
+            "name": "Volume / OI",
+            "value": f"Vol {alert.volume:,} · OI {alert.open_interest:,} · {ratio:.1f}x",
+            "inline": True,
+        })
 
     if alert.levels:
         fields.append({"name": "🎯 Key Levels", "value": alert.levels, "inline": False})
-
     if alert.catalyst:
         fields.append({"name": "📅 Catalyst", "value": alert.catalyst, "inline": False})
-
-    # Setup summary
-    setup_parts = []
-    if classification.trade_style.label != "unknown":
-        setup_parts.append(classification.trade_style.label.title())
-    if classification.momentum.label != "unknown":
-        setup_parts.append(f"{classification.momentum.label} momentum".title())
-    if classification.setup_quality.label == "actionable":
-        setup_parts.append("✅ Actionable")
-
-    if setup_parts:
-        fields.append({"name": "Setup", "value": " · ".join(setup_parts), "inline": False})
 
     fields.append({
         "name": "Conviction",
@@ -259,7 +233,7 @@ def _subscriber_embed(
 
 
 # ---------------------------------------------------------------------------
-# Internal format — plain text (current format + all debug info)
+# Internal format — plain text
 # ---------------------------------------------------------------------------
 
 def _internal_plain(
@@ -274,6 +248,7 @@ def _internal_plain(
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     lines = [
+        ALERT_DIVIDER,
         f"{emoji} **[INTERNAL] {alert.ticker} {alert.source.title()} Alert**",
         "",
         f"**Time:** {ts}",
@@ -291,26 +266,29 @@ def _internal_plain(
     if alert.catalyst:
         lines.append(f"**Catalyst:** {alert.catalyst}")
 
-    # Score breakdown
     if reasons:
         lines += ["", "**Score components:**"]
         for r in reasons:
             lines.append(f"• {r}")
 
-    # Enrichment
     lines += [
         "",
         f"**Enrichment:** {enrichment.moneyness_tier.replace('_',' ').upper()} | "
         f"{enrichment.dte if enrichment.dte is not None else '?'}d DTE | "
-        f"${enrichment.spot_price:,.0f} spot | "
+        f"${enrichment.spot_price:,.2f} spot | "
         f"RVOL {enrichment.rvol}x ({enrichment.rvol_label}) | "
         f"{enrichment.premium_tier} premium",
     ]
 
+    if alert.volume is not None and alert.open_interest is not None:
+        ratio = alert.volume / alert.open_interest if alert.open_interest > 0 else 0.0
+        lines.append(
+            f"**Volume/OI:** Vol {alert.volume:,} · OI {alert.open_interest:,} · {ratio:.1f}x"
+        )
+
     if enrichment.structure_notes:
         lines.append(f"**Structure:** {' · '.join(enrichment.structure_notes)}")
 
-    # Classification
     lines += [
         "",
         "**Classification:**",
@@ -359,14 +337,21 @@ def _internal_embed(
     if alert.catalyst:
         fields.append({"name": "Catalyst", "value": alert.catalyst, "inline": False})
 
-    # Enrichment block
     enrich_val = (
         f"{enrichment.moneyness_tier.replace('_',' ').upper()} | "
         f"{enrichment.dte if enrichment.dte is not None else '?'}d | "
-        f"${enrichment.spot_price:,.0f} spot | "
+        f"${enrichment.spot_price:,.2f} spot | "
         f"RVOL {enrichment.rvol}x ({enrichment.rvol_label})"
     )
     fields.append({"name": "Enrichment", "value": enrich_val, "inline": False})
+
+    if alert.volume is not None and alert.open_interest is not None:
+        ratio = alert.volume / alert.open_interest if alert.open_interest > 0 else 0.0
+        fields.append({
+            "name": "Volume / OI",
+            "value": f"Vol {alert.volume:,} · OI {alert.open_interest:,} · {ratio:.1f}x",
+            "inline": False,
+        })
 
     if enrichment.structure_notes:
         fields.append({
@@ -375,7 +360,6 @@ def _internal_embed(
             "inline": False,
         })
 
-    # Score reasons
     if reasons:
         fields.append({
             "name": "Score components",
@@ -383,7 +367,6 @@ def _internal_embed(
             "inline": False,
         })
 
-    # Classification summary
     class_val = (
         f"Style: {classification.trade_style.label} ({classification.trade_style.confidence})\n"
         f"Intent: {classification.intent.label} ({classification.intent.confidence})\n"
@@ -421,40 +404,19 @@ def format_alert(
     mode: FormatMode = "subscriber",
     payload_type: PayloadType = "plain_text",
 ) -> str | dict[str, Any]:
-    """
-    Format an alert for Discord.
-
-    Args:
-        alert: The raw FlowAlert.
-        enrichment: FlowEnrichment from enrich_alert().
-        classification: FlowClassification from classify_alert().
-        score: Final conviction score (0-100).
-        reasons: Score component reasons list.
-        mode: "subscriber" (clean) or "internal" (full debug).
-        payload_type: "plain_text" returns a string.
-                      "embed" returns a Discord embed dict payload.
-
-    Returns:
-        str for plain_text, dict for embed.
-    """
     if mode == "subscriber":
         if payload_type == "embed":
             return _subscriber_embed(alert, enrichment, classification, score, reasons)
         return _subscriber_plain(alert, enrichment, classification, score, reasons)
-    else:  # internal
+    else:
         if payload_type == "embed":
             return _internal_embed(alert, enrichment, classification, score, reasons)
         return _internal_plain(alert, enrichment, classification, score, reasons)
 
 
 def format_plain_text(payload: str | dict) -> str:
-    """
-    If payload is already a string, return it.
-    If it's an embed dict, extract the title + field values as plain text fallback.
-    """
     if isinstance(payload, str):
         return payload
-    # Flatten embed to text
     embeds = payload.get("embeds", [])
     if not embeds:
         return str(payload)
