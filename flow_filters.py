@@ -8,16 +8,19 @@ on each raw item right after fetching, before doing anything else with it.
 
 Filter criteria:
   - DTE (days to expiration) between 0 and MAX_DTE_DAYS inclusive
-  - moneyNess is ATM or OTM (never ITM)
+  - moneyNess is OTM only (never ATM, never ITM)
   - implied_Bought_Or_Sold == "BOUGHT" — proxy for "trade executed at/above
     the ask" (JarvisFlow doesn't send raw bid/ask quotes, so BOUGHT vs SOLD
     is the closest available signal: BOUGHT trades are inferred as hitting
     the ask, SOLD trades are inferred as hitting the bid).
 
-Note: this intentionally drops all SOLD-side trades (e.g. "SOLD PUT"),
-even though main.py's sentiment mapping treats some SOLD trades as
-bullish signals. That's a deliberate behavior change requested explicitly —
-the goal is to only ever consider ask-side (BOUGHT) flow at all.
+These criteria apply to every ticker identically — there is no ticker-based
+restriction anywhere in this file. Whatever symbol JarvisFlow returns, the
+same DTE/moneyness/side checks apply.
+
+is_high_conviction() is separate from the basic filter — it's used downstream
+to let JarvisFlow's own "HIGH" conviction tag bypass the score/classifier
+gates (basic filters above still apply either way).
 """
 
 from __future__ import annotations
@@ -25,8 +28,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 MAX_DTE_DAYS = 14
-ALLOWED_MONEYNESS = {"ATM", "OTM"}
+ALLOWED_MONEYNESS = {"OTM"}
 REQUIRED_SIDE = "BOUGHT"
+HIGH_CONVICTION_VALUE = "HIGH"
 
 
 def _parse_expiry(expiry_raw: str) -> datetime | None:
@@ -57,7 +61,7 @@ def compute_dte_days(expiry_raw: str, as_of: datetime | None = None) -> int | No
 def passes_basic_filters(item: dict) -> bool:
     """
     True if this raw JarvisFlow item meets all basic criteria:
-    DTE 0-14, ATM/OTM only, BOUGHT only.
+    DTE 0-14, OTM only, BOUGHT only. Applies identically to every ticker.
     """
     money_ness = (item.get("moneyNess") or "").strip().upper()
     if money_ness not in ALLOWED_MONEYNESS:
@@ -81,6 +85,20 @@ def passes_basic_filters(item: dict) -> bool:
     return True
 
 
+def is_high_conviction(item: dict) -> bool:
+    """
+    True if JarvisFlow tagged this item's interpreted_Conviction as HIGH.
+    Used to let an item bypass the score/classifier gates downstream —
+    basic filters (DTE/moneyness/side) still apply regardless.
+    """
+    conviction = (
+        item.get("interpreted_Conviction")
+        or item.get("interpretedConviction")
+        or ""
+    ).strip().upper()
+    return conviction == HIGH_CONVICTION_VALUE
+
+
 def filter_flow_items(items: list[dict]) -> tuple[list[dict], int]:
     """
     Apply passes_basic_filters to a list of raw items.
@@ -89,3 +107,4 @@ def filter_flow_items(items: list[dict]) -> tuple[list[dict], int]:
     filtered = [item for item in items if passes_basic_filters(item)]
     skipped = len(items) - len(filtered)
     return filtered, skipped
+

@@ -12,7 +12,8 @@ import asyncio
 
 from models import FlowAlert
 from scoring import auto_score_alert
-from flow_filters import filter_flow_items
+from flow_filters import filter_flow_items, is_high_conviction
+from market_hours import is_market_open, market_closed_reason
 from enrichment import enrich_alert, enrichment_summary
 from classifier import classify_alert
 from formatter import format_alert, format_plain_text
@@ -183,6 +184,13 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25):
     if not DISCORD_WEBHOOK_URL:
         return {"ok": False, "error": "DISCORD_WEBHOOK_URL is missing"}
 
+    closed_reason = market_closed_reason()
+    if closed_reason:
+        return {
+            "ok": True, "ticker": ticker, "posted": 0,
+            "skipped_market_closed": True, "reason": closed_reason,
+        }
+
     async with poll_lock:
         flow_items = await fetch_jarvis_flow(ticker)
         if not flow_items:
@@ -199,12 +207,13 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25):
             enrichment = enrich_alert(alert)
             classification = classify_alert(alert, enrichment)
             final_score, score_reasons = auto_score_alert(alert)
+            high_conviction = is_high_conviction(item)
 
-            if final_score < MIN_ALERT_SCORE:
+            if final_score < MIN_ALERT_SCORE and not high_conviction:
                 skipped += 1; skipped_score += 1
                 continue
 
-            if not classification.publish_recommended:
+            if not classification.publish_recommended and not high_conviction:
                 skipped += 1; skipped_classifier += 1
                 continue
 
@@ -243,7 +252,10 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25):
                 except Exception as e:
                     logger.warning("outcome record failed for %s %s: %s", alert.ticker, alert.contract, e)
                 posted += 1
-                previews.append({"ticker": alert.ticker, "contract": alert.contract, "score": final_score})
+                previews.append({
+                    "ticker": alert.ticker, "contract": alert.contract,
+                    "score": final_score, "high_conviction_override": high_conviction,
+                })
             else:
                 skipped += 1; skipped_post_error += 1
                 logger.warning("Discord post failed for %s %s", alert.ticker, alert.contract)
@@ -392,6 +404,13 @@ async def flow_alert(alert: FlowAlert):
             "ok": True, "posted": False, "score": final_score,
             "score_reasons": score_reasons,
             "reason": f"duplicate alert within cooldown window ({DEDUPE_WINDOW_MINUTES} min)"
+        }
+
+    closed_reason = market_closed_reason()
+    if closed_reason:
+        return {
+            "ok": True, "posted": False, "score": final_score,
+            "score_reasons": score_reasons, "reason": f"market closed — {closed_reason}",
         }
 
     message = build_discord_message(alert, final_score, score_reasons)

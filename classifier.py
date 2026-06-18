@@ -131,7 +131,7 @@ def _classify_intent(
 
     Hedges are characterised by:
     - Large OTM put blocks (not sweeps)
-    - bearish puts on broad market ETFs (SPY/QQQ/IWM)
+    - bearish puts on any underlying
     - very large premium relative to typical
     - note signals: "hedge", "protection", "collar"
     """
@@ -150,10 +150,9 @@ def _classify_intent(
             reason="note contains explicit hedge language",
         )
 
-    # Classic hedge pattern: large OTM put block on index ETF
+    # Classic hedge pattern: large OTM put block on any underlying
     if (
         pc == "put"
-        and ticker in ("SPY", "QQQ", "IWM", "DIA")
         and moneyness in ("otm", "deep_otm")
         and "block" in flow_type
         and enrichment.premium_tier in ("whale", "large")
@@ -161,20 +160,19 @@ def _classify_intent(
         return ClassificationResult(
             label="hedge",
             confidence="high",
-            reason=f"large OTM put block on {ticker} index — institutional hedge pattern",
+            reason=f"large OTM put block on {ticker} — institutional hedge pattern",
         )
 
-    # Probable hedge: big bearish put sweep on index but could be directional
+    # Probable hedge: big bearish put sweep but could be directional
     if (
         pc == "put"
-        and ticker in ("SPY", "QQQ", "IWM")
         and moneyness in ("otm", "deep_otm")
         and enrichment.premium_tier in ("whale", "large", "solid")
     ):
         return ClassificationResult(
             label="hedge",
             confidence="medium",
-            reason=f"OTM put on {ticker} index — possibly hedge, watch for stock offset",
+            reason=f"OTM put on {ticker} — possibly hedge, watch for stock offset",
         )
 
     # Clean speculative signal

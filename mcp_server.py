@@ -36,7 +36,8 @@ from fastmcp import FastMCP
 
 from models import FlowAlert
 from scoring import auto_score_alert
-from flow_filters import filter_flow_items
+from flow_filters import filter_flow_items, is_high_conviction
+from market_hours import is_market_open, market_closed_reason
 from enrichment import enrich_alert, enrichment_summary
 from classifier import classify_alert, classification_tag_line
 from formatter import format_alert, format_plain_text
@@ -420,6 +421,14 @@ async def pull_and_score_ticker(
     if format_mode not in {"subscriber", "internal"}:
         return {"ok": False, "error": "format_mode must be 'subscriber' or 'internal'"}
 
+    if not dry_run:
+        closed_reason = market_closed_reason()
+        if closed_reason:
+            return {
+                "ok": True, "ticker": ticker, "posted": False,
+                "skipped_market_closed": True, "reason": closed_reason,
+            }
+
     try:
         flow_items = await _fetch_jarvis(ticker)
     except Exception as e:
@@ -441,6 +450,7 @@ async def pull_and_score_ticker(
         enrichment = enrich_alert(alert)
         classification = classify_alert(alert, enrichment)
         score, reasons = auto_score_alert(alert)
+        high_conviction = is_high_conviction(item)
         summary["checked"] += 1
         alert_hash = _alert_hash(alert)
 
@@ -448,19 +458,19 @@ async def pull_and_score_ticker(
             "ticker": alert.ticker, "contract": alert.contract,
             "premium": alert.premium, "sentiment": alert.sentiment,
             "score": score, "passes_threshold": score >= MIN_ALERT_SCORE,
-            "score_reasons": reasons,
+            "score_reasons": reasons, "high_conviction": high_conviction,
             "enrichment_summary": enrichment_summary(enrichment),
             "classification_summary": classification.summary,
             "action": None,
         }
 
-        if score < MIN_ALERT_SCORE:
+        if score < MIN_ALERT_SCORE and not high_conviction:
             result["action"] = f"skipped — score {score} < threshold {MIN_ALERT_SCORE}"
             summary["skipped_score"] += 1
             results.append(result)
             continue
 
-        if not classification.publish_recommended:
+        if not classification.publish_recommended and not high_conviction:
             result["action"] = f"skipped — classifier: {classification.suppress_reason}"
             summary["skipped_classifier"] += 1
             results.append(result)
@@ -589,6 +599,16 @@ async def ingest_flow_alert(
         }
 
     pipeline_log.append("dedup check passed")
+
+    if not dry_run:
+        closed_reason = market_closed_reason()
+        if closed_reason:
+            return {
+                "ok": True, "posted": False, "score": score,
+                "score_reasons": reasons, "pipeline_log": pipeline_log,
+                "reason": f"market closed — {closed_reason}",
+            }
+
     message = _build_discord_message(alert, score, reasons)
 
     if dry_run:
@@ -1013,6 +1033,15 @@ async def ingest_and_enrich(
         }
     pipeline_log.append("dedup gate passed ✅")
 
+    if not dry_run:
+        closed_reason = market_closed_reason()
+        if closed_reason:
+            pipeline_log.append(f"blocked — market closed ({closed_reason})")
+            return {
+                "ok": True, "posted": False, "score": score,
+                "pipeline_log": pipeline_log, "suppress_reason": f"market closed — {closed_reason}",
+            }
+
     enrich_line = enrichment_summary(enrichment)
     tag_line = classification_tag_line(classification)
     message = _build_discord_message(alert, score, score_reasons)
@@ -1160,6 +1189,15 @@ async def ingest_and_enrich_v2(
         return {"ok": True, "posted": False, "score": score,
                 "pipeline_log": pipeline_log, "suppress_reason": suppress}
     pipeline_log.append("dedup gate ✅")
+
+    if not dry_run:
+        closed_reason = market_closed_reason()
+        if closed_reason:
+            pipeline_log.append(f"blocked — market closed ({closed_reason})")
+            return {
+                "ok": True, "posted": False, "score": score,
+                "pipeline_log": pipeline_log, "suppress_reason": f"market closed — {closed_reason}",
+            }
 
     message = format_plain_text(format_alert(
         alert, enrichment, classification, score, score_reasons,
