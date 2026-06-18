@@ -39,17 +39,27 @@ POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 AUTO_POLL_ENABLED = os.getenv("AUTO_POLL_ENABLED", "true").lower() == "true"
 DEDUPE_WINDOW_MINUTES = int(os.getenv("DEDUPE_WINDOW_MINUTES", "30"))
 ALERT_FORMAT_MODE = os.getenv("ALERT_FORMAT_MODE", "subscriber")
-AUTO_POLL_TICKERS = [
-    ticker.strip().upper()
-    for ticker in os.getenv("AUTO_POLL_TICKERS", "SPY").split(",")
-    if ticker.strip()
-]
+WATCHLIST = {
+    "DDOG","MDB","ANET","TWLO","CRM","UBER","NFLX","NVDA","AAPL","TSLA",
+    "AMZN","ZS","NOW","CRWD","BABA","QCOM","AMD","BA","CELH","DKNG",
+    "PLTR","LULU","COIN","MRNA","SNOW","AFRM","MSFT","ABNB","MRVL","QQQ",
+    "RBLX","SOFI","META","TSM","MU","GOOGL","RIVN","JNJ","SPY","INTC",
+    "MARA","CVNA","ENPH","FDX","SMCI","ARM","LRCX","PANW","BIDU","PDD",
+    "FUTU","MSTR","ORCL","HOOD","DELL","RDDT","HIMS","AVGO","GTLB","CLSK",
+    "IBM","LLY","RGTI","QUBT","TEM","OKLO","NNE","RKLB","NBIS","CEG",
+    "IONQ","QBTS","APP","CRWV","GME","UNH","CRCL","FSLR","SMR","OSCR",
+    "ACHR","ASTS","BMNR","FIG","GLXY","IREN","UUUU","POET","CIFR","BE",
+    "EOSE","ONDS","CRML","MP","SNDK","PATH","JPM","ZM","AXTI","USO","AAOI","SPCX",
+}
+
+# Semaphore limits concurrent JarvisFlow requests so we don't get rate-limited
+JARVIS_CONCURRENCY = int(os.getenv("JARVIS_CONCURRENCY", "10"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("options-discord-engine")
 
 scheduler = AsyncIOScheduler()
-poll_lock = asyncio.Lock()
+jarvis_semaphore: asyncio.Semaphore | None = None
 
 
 def make_alert_hash(alert: FlowAlert) -> str:
@@ -195,7 +205,7 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25):
             "skipped_market_closed": True, "reason": closed_reason,
         }
 
-    async with poll_lock:
+    async with jarvis_semaphore:
         flow_items = await fetch_jarvis_flow(ticker)
         if not flow_items:
             return {"ok": False, "error": "No flow items returned"}
@@ -213,11 +223,11 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25):
             final_score, score_reasons = auto_score_alert(alert)
             high_conviction = is_high_conviction(item)
 
-            if final_score < MIN_ALERT_SCORE and not (high_conviction and final_score >= 65):
+            if final_score < MIN_ALERT_SCORE:
                 skipped += 1; skipped_score += 1
                 continue
 
-            if not classification.publish_recommended and not (high_conviction and final_score >= 65):
+            if not classification.publish_recommended:
                 skipped += 1; skipped_classifier += 1
                 continue
 
@@ -277,20 +287,42 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25):
         }
 
 
+async def poll_single_ticker(ticker: str) -> dict:
+    """Poll one ticker and return its result. Errors are caught and logged."""
+    try:
+        result = await process_jarvis_ticker(ticker=ticker, limit=25)
+        if result.get("posted", 0) > 0:
+            logger.info("poll_posted ticker=%s result=%s", ticker, result)
+        return result
+    except Exception as e:
+        logger.exception("poll_failed ticker=%s error=%s", ticker, str(e))
+        return {"ok": False, "ticker": ticker, "error": str(e)}
+
+
 async def scheduled_poll_job():
-    if poll_lock.locked():
-        logger.info("scheduled_poll_skipped reason=lock_active")
+    """Poll every ticker in WATCHLIST concurrently, respecting the semaphore."""
+    closed_reason = market_closed_reason()
+    if closed_reason:
+        logger.info("scheduled_poll_skipped reason=%s", closed_reason)
         return
-    for ticker in AUTO_POLL_TICKERS:
-        try:
-            result = await process_jarvis_ticker(ticker=ticker, limit=25)
-            logger.info("scheduled_poll_result=%s", result)
-        except Exception as e:
-            logger.exception("scheduled_poll_failed ticker=%s error=%s", ticker, str(e))
+
+    logger.info("scheduled_poll_start tickers=%d", len(WATCHLIST))
+    tasks = [poll_single_ticker(ticker) for ticker in WATCHLIST]
+    results = await asyncio.gather(*tasks)
+
+    total_posted = sum(r.get("posted", 0) for r in results if isinstance(r, dict))
+    total_checked = sum(r.get("checked", 0) for r in results if isinstance(r, dict))
+    logger.info(
+        "scheduled_poll_complete tickers=%d checked=%d posted=%d",
+        len(WATCHLIST), total_checked, total_posted,
+    )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global jarvis_semaphore
+    jarvis_semaphore = asyncio.Semaphore(JARVIS_CONCURRENCY)
+
     init_all_tables()
     backend = "PostgreSQL" if is_postgres() else "SQLite"
     logger.info("db_backend=%s", backend)
@@ -303,8 +335,8 @@ async def lifespan(app: FastAPI):
         )
         scheduler.start()
         logger.info(
-            "scheduler_started tickers=%s interval=%s dedupe_window=%s",
-            AUTO_POLL_TICKERS, POLL_INTERVAL_SECONDS, DEDUPE_WINDOW_MINUTES
+            "scheduler_started watchlist=%d interval=%s dedupe_window=%s concurrency=%s",
+            len(WATCHLIST), POLL_INTERVAL_SECONDS, DEDUPE_WINDOW_MINUTES, JARVIS_CONCURRENCY,
         )
     else:
         logger.info("scheduler_disabled")
@@ -329,7 +361,8 @@ def root():
         "dedupe_window_minutes": DEDUPE_WINDOW_MINUTES,
         "auto_poll_enabled": AUTO_POLL_ENABLED,
         "poll_interval_seconds": POLL_INTERVAL_SECONDS,
-        "tickers": AUTO_POLL_TICKERS
+        "watchlist_size": len(WATCHLIST),
+        "jarvis_concurrency": JARVIS_CONCURRENCY,
     }
 
 
