@@ -6,7 +6,11 @@ Takes a FlowAlert and returns a FlowEnrichment with computed context:
 - DTE bucket (derived or confirmed)
 - Moneyness classification
 - Premium size tier label
-- Mock spot price + RVOL (real provider slot ready for Phase 4)
+- Spot price: uses the real spot_price carried on the FlowAlert when
+  available (populated from JarvisFlow's own spot_Price field for any
+  ticker), falling back to a small mock table only for manually-built
+  alerts that don't supply real market data.
+- RVOL (still mocked — real provider slot ready for Phase 4)
 
 All enrichment is additive — FlowAlert is never mutated.
 """
@@ -46,7 +50,7 @@ class FlowEnrichment(BaseModel):
     # Moneyness
     strike: float | None = None
     put_call: Literal["call", "put", "unknown"] = "unknown"
-    spot_price: float | None = None                 # mock until Phase 4
+    spot_price: float | None = None                 # real when available, else mock fallback
     moneyness_pct: float | None = None              # (strike - spot) / spot * 100
     moneyness_tier: MoneynessTier = "unknown"
 
@@ -153,8 +157,14 @@ def _moneyness(strike: float, spot: float, put_call: str) -> tuple[float, Moneyn
 
 def _mock_spot(ticker: str) -> float | None:
     """
-    Mock spot prices for common tickers.
-    Phase 4 replaces this with a real market data provider.
+    Mock spot prices — FALLBACK ONLY, used when a FlowAlert doesn't carry
+    a real spot_price (e.g. manually-built test alerts via score_alert /
+    explain_score that don't supply real market data).
+
+    Real flow pulled from JarvisFlow always carries its own real spot_Price
+    through FlowAlert.spot_price and never reaches this fallback, regardless
+    of ticker — that's what makes enrichment accurate for any symbol, not
+    just the ones listed here.
     """
     mock_prices: dict[str, float] = {
         "SPY": 545.0,
@@ -218,8 +228,10 @@ def enrich_alert(alert: FlowAlert, alert_hash: str | None = None) -> FlowEnrichm
         if dte is not None:
             dte_bucket = _dte_to_bucket(dte)
 
-    # Spot + moneyness
-    spot = _mock_spot(alert.ticker)
+    # Spot + moneyness — prefer the real spot price carried on the alert
+    # (populated from JarvisFlow's own spot_Price for any ticker). Only
+    # fall back to the mock table when no real spot price is available.
+    spot = alert.spot_price if alert.spot_price is not None else _mock_spot(alert.ticker)
     moneyness_pct: float | None = None
     moneyness_tier: MoneynessTier = "unknown"
     if spot and strike and put_call:

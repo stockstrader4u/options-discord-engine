@@ -12,6 +12,10 @@ import asyncio
 
 from models import FlowAlert
 from scoring import auto_score_alert
+from flow_filters import filter_flow_items
+from enrichment import enrich_alert, enrichment_summary
+from classifier import classify_alert
+from formatter import format_alert, format_plain_text
 from db import (
     init_all_tables,
     alert_hash_exists_in_window,
@@ -33,6 +37,7 @@ JARVIS_MCP_URL = "https://api.jarvisflow.io/.well-known/mcp"
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 AUTO_POLL_ENABLED = os.getenv("AUTO_POLL_ENABLED", "true").lower() == "true"
 DEDUPE_WINDOW_MINUTES = int(os.getenv("DEDUPE_WINDOW_MINUTES", "30"))
+ALERT_FORMAT_MODE = os.getenv("ALERT_FORMAT_MODE", "subscriber")
 AUTO_POLL_TICKERS = [
     ticker.strip().upper()
     for ticker in os.getenv("AUTO_POLL_TICKERS", "SPY").split(",")
@@ -112,6 +117,8 @@ def jarvis_item_to_flow_alert(item: dict) -> FlowAlert:
     bought_sold = item.get("implied_Bought_Or_Sold", item.get("impliedBoughtOrSold", "")).upper()
     premium = int(float(item.get("total_Option_Premium_For_Trade",
                                   item.get("totalOptionPremiumForTrade", 0)) or 0))
+    spot_price_raw = item.get("spot_Price", item.get("spotPrice"))
+    spot_price = float(spot_price_raw) if spot_price_raw is not None else None
 
     contract = (
         f"{ticker} {expiry_raw[:10]} {strike}{put_call[:1]}"
@@ -136,7 +143,8 @@ def jarvis_item_to_flow_alert(item: dict) -> FlowAlert:
     return FlowAlert(
         ticker=ticker, contract=contract, premium=premium,
         sentiment=sentiment, source="flow", dte_bucket="weeklies",
-        flow_type=sweep_block.lower() if sweep_block else None, note=note
+        flow_type=sweep_block.lower() if sweep_block else None, note=note,
+        spot_price=spot_price,
     )
 
 
@@ -180,26 +188,60 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25):
         if not flow_items:
             return {"ok": False, "error": "No flow items returned"}
 
-        posted = skipped = skipped_score = skipped_dedupe = skipped_post_error = 0
+        filtered_items, skipped_filter = filter_flow_items(flow_items)
+
+        posted = skipped = skipped_score = skipped_classifier = 0
+        skipped_dedupe = skipped_post_error = 0
         previews = []
 
-        for item in flow_items[:limit]:
+        for item in filtered_items[:limit]:
             alert = jarvis_item_to_flow_alert(item)
+            enrichment = enrich_alert(alert)
+            classification = classify_alert(alert, enrichment)
             final_score, score_reasons = auto_score_alert(alert)
 
             if final_score < MIN_ALERT_SCORE:
                 skipped += 1; skipped_score += 1
                 continue
 
+            if not classification.publish_recommended:
+                skipped += 1; skipped_classifier += 1
+                continue
+
             if alert_published_within_window(alert):
                 skipped += 1; skipped_dedupe += 1
                 continue
 
-            message = build_discord_message(alert, final_score, score_reasons)
+            message = format_plain_text(format_alert(
+                alert, enrichment, classification, final_score, score_reasons,
+                mode=ALERT_FORMAT_MODE,  # type: ignore[arg-type]
+                payload_type="plain_text",
+            ))
             posted_ok = await post_to_discord(message)
 
             if posted_ok:
+                alert_hash = make_alert_hash(alert)
                 save_alert(alert, final_score)
+                event_id = save_flow_event_row(
+                    alert_hash=alert_hash, ticker=alert.ticker, contract=alert.contract,
+                    premium=alert.premium, sentiment=alert.sentiment, source=alert.source,
+                    dte_bucket=alert.dte_bucket, flow_type=alert.flow_type,
+                    catalyst=alert.catalyst, levels=alert.levels, note=alert.note,
+                    enrichment=enrichment, score=final_score, score_reasons=score_reasons,
+                    passed_threshold=True, passed_dedup=True, was_published=True,
+                )
+                save_classification_row(event_id, alert_hash, classification)
+                try:
+                    create_outcome_row(
+                        alert_hash=alert_hash, ticker=alert.ticker, contract=alert.contract,
+                        sentiment=alert.sentiment, score=final_score, premium=alert.premium,
+                        trade_style=classification.trade_style.label,
+                        intent=classification.intent.label,
+                        setup_quality=classification.setup_quality.label,
+                        moneyness=enrichment.moneyness_tier, flow_type=alert.flow_type,
+                    )
+                except Exception as e:
+                    logger.warning("outcome record failed for %s %s: %s", alert.ticker, alert.contract, e)
                 posted += 1
                 previews.append({"ticker": alert.ticker, "contract": alert.contract, "score": final_score})
             else:
@@ -208,9 +250,13 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25):
 
         return {
             "ok": True, "ticker": ticker,
-            "checked": min(limit, len(flow_items)),
+            "flow_items_total": len(flow_items),
+            "flow_items_after_filter": len(filtered_items),
+            "skipped_filter": skipped_filter,
+            "checked": min(limit, len(filtered_items)),
             "posted": posted, "skipped": skipped,
-            "skipped_score": skipped_score, "skipped_dedupe": skipped_dedupe,
+            "skipped_score": skipped_score, "skipped_classifier": skipped_classifier,
+            "skipped_dedupe": skipped_dedupe,
             "skipped_post_error": skipped_post_error, "previews": previews
         }
 

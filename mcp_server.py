@@ -36,6 +36,7 @@ from fastmcp import FastMCP
 
 from models import FlowAlert
 from scoring import auto_score_alert
+from flow_filters import filter_flow_items
 from enrichment import enrich_alert, enrichment_summary
 from classifier import classify_alert, classification_tag_line
 from formatter import format_alert, format_plain_text
@@ -102,16 +103,6 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 
 
-def _db():
-    """Return a WAL-mode SQLite connection."""
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=30000;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
-
-
 def _alert_hash(alert: FlowAlert):
     raw = f"{alert.ticker}|{alert.contract}|{alert.source}|{alert.flow_type}|{alert.sentiment}"
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -122,18 +113,19 @@ def _is_duplicate(alert: FlowAlert, window_minutes: int = DEDUPE_WINDOW_MINUTES)
 
 
 def _save_alert(alert: FlowAlert, score: int):
-    h = _alert_hash(alert)
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    with _db() as conn:
-        conn.execute(
-            """
-            INSERT INTO published_alerts
-              (alert_hash, ticker, contract, source, score, published_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (h, alert.ticker, alert.contract, alert.source, score, ts),
-        )
-        conn.commit()
+    """
+    Save a published alert via db.py's adapter — respects Postgres/SQLite
+    automatically. (Previously this opened its own raw sqlite3 connection
+    directly to DB_PATH, which bypassed the Postgres adapter entirely and
+    would silently write to the wrong database. That helper has been removed.)
+    """
+    save_published_alert(
+        alert_hash=_alert_hash(alert),
+        ticker=alert.ticker,
+        contract=alert.contract,
+        source=alert.source,
+        score=score,
+    )
 
 
 def _build_discord_message(alert: FlowAlert, score: int, reasons):
@@ -216,6 +208,8 @@ def _jarvis_to_alert(item: dict):
     bought_sold = item.get("implied_Bought_Or_Sold", item.get("impliedBoughtOrSold", "")).upper()
     premium = int(float(item.get("total_Option_Premium_For_Trade",
                                   item.get("totalOptionPremiumForTrade", 0)) or 0))
+    spot_price_raw = item.get("spot_Price", item.get("spotPrice"))
+    spot_price = float(spot_price_raw) if spot_price_raw is not None else None
 
     contract = (
         f"{ticker} {expiry[:10]} {strike}{put_call[:1]}"
@@ -247,6 +241,7 @@ def _jarvis_to_alert(item: dict):
         dte_bucket="weeklies",
         flow_type=sweep_block.lower() if sweep_block else None,
         note=note,
+        spot_price=spot_price,
     )
 
 
@@ -406,18 +401,24 @@ async def pull_and_score_ticker(
     ticker: str = "SPY",
     limit: int = 10,
     dry_run: bool = False,
+    format_mode: str = "subscriber",
 ) -> dict[str, Any]:
     """
-    Pull live options flow for a ticker from JarvisFlow, score each event,
-    and optionally post qualifying alerts to Discord.
+    Pull live options flow for a ticker from JarvisFlow, apply the basic
+    flow filters (DTE 0-14, ATM/OTM only, BOUGHT only), then run each
+    surviving event through the full Phase 3 pipeline — enrich → classify →
+    score → gate → format → post → save — same as ingest_and_enrich_v2.
 
     Args:
         ticker: Underlying symbol to pull flow for, e.g. "SPY", "QQQ", "NVDA"
-        limit: Max number of flow items to process (default 10, max 50)
-        dry_run: If True, score everything but do NOT post to Discord.
+        limit: Max number of filtered flow items to process (default 10, max 50)
+        dry_run: If True, score/format everything but do NOT post to Discord.
+        format_mode: "subscriber" or "internal"
     """
     limit = min(limit, 50)
     ticker = ticker.upper()
+    if format_mode not in {"subscriber", "internal"}:
+        return {"ok": False, "error": "format_mode must be 'subscriber' or 'internal'"}
 
     try:
         flow_items = await _fetch_jarvis(ticker)
@@ -427,27 +428,41 @@ async def pull_and_score_ticker(
     if not flow_items:
         return {"ok": False, "ticker": ticker, "error": "No flow items returned from JarvisFlow"}
 
+    filtered_items, skipped_filter = filter_flow_items(flow_items)
+
     results = []
     summary = {
-        "checked": 0, "posted": 0, "skipped_score": 0,
+        "checked": 0, "posted": 0, "skipped_score": 0, "skipped_classifier": 0,
         "skipped_dedupe": 0, "skipped_discord_error": 0, "skipped_dry_run": 0,
     }
 
-    for item in flow_items[:limit]:
+    for item in filtered_items[:limit]:
         alert = _jarvis_to_alert(item)
+        enrichment = enrich_alert(alert)
+        classification = classify_alert(alert, enrichment)
         score, reasons = auto_score_alert(alert)
         summary["checked"] += 1
+        alert_hash = _alert_hash(alert)
 
         result: dict[str, Any] = {
             "ticker": alert.ticker, "contract": alert.contract,
             "premium": alert.premium, "sentiment": alert.sentiment,
             "score": score, "passes_threshold": score >= MIN_ALERT_SCORE,
-            "score_reasons": reasons, "action": None,
+            "score_reasons": reasons,
+            "enrichment_summary": enrichment_summary(enrichment),
+            "classification_summary": classification.summary,
+            "action": None,
         }
 
         if score < MIN_ALERT_SCORE:
             result["action"] = f"skipped — score {score} < threshold {MIN_ALERT_SCORE}"
             summary["skipped_score"] += 1
+            results.append(result)
+            continue
+
+        if not classification.publish_recommended:
+            result["action"] = f"skipped — classifier: {classification.suppress_reason}"
+            summary["skipped_classifier"] += 1
             results.append(result)
             continue
 
@@ -457,18 +472,43 @@ async def pull_and_score_ticker(
             results.append(result)
             continue
 
+        message = format_plain_text(format_alert(
+            alert, enrichment, classification, score, reasons,
+            mode=format_mode,  # type: ignore[arg-type]
+            payload_type="plain_text",
+        ))
+
         if dry_run:
             result["action"] = "dry_run — would post to Discord"
-            result["discord_preview"] = _build_discord_message(alert, score, reasons)
+            result["discord_preview"] = message
             summary["skipped_dry_run"] += 1
             results.append(result)
             continue
 
-        message = _build_discord_message(alert, score, reasons)
         posted = await _post_discord(message)
 
         if posted:
             _save_alert(alert, score)
+            event_id = save_flow_event_row(
+                alert_hash=alert_hash, ticker=alert.ticker, contract=alert.contract,
+                premium=alert.premium, sentiment=alert.sentiment, source=alert.source,
+                dte_bucket=alert.dte_bucket, flow_type=alert.flow_type,
+                catalyst=alert.catalyst, levels=alert.levels, note=alert.note,
+                enrichment=enrichment, score=score, score_reasons=reasons,
+                passed_threshold=True, passed_dedup=True, was_published=True,
+            )
+            save_classification_row(event_id, alert_hash, classification)
+            try:
+                create_outcome_row(
+                    alert_hash=alert_hash, ticker=alert.ticker, contract=alert.contract,
+                    sentiment=alert.sentiment, score=score, premium=alert.premium,
+                    trade_style=classification.trade_style.label,
+                    intent=classification.intent.label,
+                    setup_quality=classification.setup_quality.label,
+                    moneyness=enrichment.moneyness_tier, flow_type=alert.flow_type,
+                )
+            except Exception as e:
+                logger.warning("outcome record failed for %s %s: %s", alert.ticker, alert.contract, e)
             result["action"] = "posted to Discord ✅"
             summary["posted"] += 1
         else:
@@ -478,8 +518,10 @@ async def pull_and_score_ticker(
         results.append(result)
 
     return {
-        "ok": True, "ticker": ticker, "dry_run": dry_run,
+        "ok": True, "ticker": ticker, "dry_run": dry_run, "format_mode": format_mode,
         "flow_items_available": len(flow_items),
+        "flow_items_after_filter": len(filtered_items),
+        "skipped_filter": skipped_filter,
         "summary": summary, "results": results,
     }
 
