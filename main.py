@@ -120,6 +120,10 @@ def jarvis_item_to_flow_alert(item: dict) -> FlowAlert:
                                   item.get("totalOptionPremiumForTrade", 0)) or 0))
     spot_price_raw = item.get("spot_Price", item.get("spotPrice"))
     spot_price = float(spot_price_raw) if spot_price_raw is not None else None
+    volume_raw = item.get("volume_When_Traded", item.get("volumeWhenTraded"))
+    volume = int(volume_raw) if volume_raw is not None else None
+    oi_raw = item.get("open_Interest_When_Traded", item.get("openInterestWhenTraded"))
+    open_interest = int(oi_raw) if oi_raw is not None else None
 
     contract = (
         f"{ticker} {expiry_raw[:10]} {strike}{put_call[:1]}"
@@ -145,7 +149,7 @@ def jarvis_item_to_flow_alert(item: dict) -> FlowAlert:
         ticker=ticker, contract=contract, premium=premium,
         sentiment=sentiment, source="flow", dte_bucket="weeklies",
         flow_type=sweep_block.lower() if sweep_block else None, note=note,
-        spot_price=spot_price,
+        spot_price=spot_price, volume=volume, open_interest=open_interest,
     )
 
 
@@ -209,11 +213,11 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25):
             final_score, score_reasons = auto_score_alert(alert)
             high_conviction = is_high_conviction(item)
 
-            if final_score < MIN_ALERT_SCORE and not high_conviction:
+            if final_score < MIN_ALERT_SCORE and not (high_conviction and final_score >= 65):
                 skipped += 1; skipped_score += 1
                 continue
 
-            if not classification.publish_recommended and not high_conviction:
+            if not classification.publish_recommended and not (high_conviction and final_score >= 65):
                 skipped += 1; skipped_classifier += 1
                 continue
 

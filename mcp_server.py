@@ -211,6 +211,10 @@ def _jarvis_to_alert(item: dict):
                                   item.get("totalOptionPremiumForTrade", 0)) or 0))
     spot_price_raw = item.get("spot_Price", item.get("spotPrice"))
     spot_price = float(spot_price_raw) if spot_price_raw is not None else None
+    volume_raw = item.get("volume_When_Traded", item.get("volumeWhenTraded"))
+    volume = int(volume_raw) if volume_raw is not None else None
+    oi_raw = item.get("open_Interest_When_Traded", item.get("openInterestWhenTraded"))
+    open_interest = int(oi_raw) if oi_raw is not None else None
 
     contract = (
         f"{ticker} {expiry[:10]} {strike}{put_call[:1]}"
@@ -243,6 +247,8 @@ def _jarvis_to_alert(item: dict):
         flow_type=sweep_block.lower() if sweep_block else None,
         note=note,
         spot_price=spot_price,
+        volume=volume,
+        open_interest=open_interest,
     )
 
 
@@ -464,13 +470,13 @@ async def pull_and_score_ticker(
             "action": None,
         }
 
-        if score < MIN_ALERT_SCORE and not high_conviction:
+        if score < MIN_ALERT_SCORE and not (high_conviction and score >= 65):
             result["action"] = f"skipped — score {score} < threshold {MIN_ALERT_SCORE}"
             summary["skipped_score"] += 1
             results.append(result)
             continue
 
-        if not classification.publish_recommended and not high_conviction:
+        if not classification.publish_recommended and not (high_conviction and score >= 65):
             result["action"] = f"skipped — classifier: {classification.suppress_reason}"
             summary["skipped_classifier"] += 1
             results.append(result)

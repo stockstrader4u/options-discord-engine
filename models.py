@@ -20,3 +20,8 @@ class FlowAlert(BaseModel):
     # uses it directly instead of falling back to its mock spot table —
     # this is what makes enrichment/moneyness accurate for any ticker,
     # not just the handful hardcoded in the mock table.
+    volume: int | None = None
+    open_interest: int | None = None
+    # Real volume_When_Traded / open_Interest_When_Traded from JarvisFlow,
+    # when known. scoring.py uses the volume/open_interest ratio as a
+    # signal of fresh positioning vs existing open interest.

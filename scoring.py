@@ -71,6 +71,29 @@ def auto_score_alert(alert: FlowAlert) -> tuple[int, list[str]]:
             score += 4
             reasons.append("block flow")
 
+    # Volume relative to open interest — high volume vs existing OI signals
+    # fresh positioning rather than churn of existing contracts. Only scored
+    # when both real numbers are available (from JarvisFlow's volume_When_Traded
+    # and open_Interest_When_Traded).
+    if alert.volume is not None and alert.open_interest is not None:
+        vol = alert.volume
+        oi = alert.open_interest
+
+        if oi <= 0:
+            vol_oi_ratio = float("inf") if vol > 0 else 0.0
+        else:
+            vol_oi_ratio = vol / oi
+
+        if vol_oi_ratio >= 3.0:
+            score += 8
+            reasons.append("extreme volume vs open interest")
+        elif vol_oi_ratio >= 2.0:
+            score += 6
+            reasons.append("high volume vs open interest")
+        elif vol_oi_ratio >= 1.0:
+            score += 3
+            reasons.append("elevated volume vs open interest")
+
     if alert.note:
         note_lower = alert.note.lower()
         if "heavy" in note_lower:
