@@ -215,6 +215,8 @@ def _jarvis_to_alert(item: dict):
     volume = int(volume_raw) if volume_raw is not None else None
     oi_raw = item.get("open_Interest_When_Traded", item.get("openInterestWhenTraded"))
     open_interest = int(oi_raw) if oi_raw is not None else None
+    contract_price_raw = item.get("price_Of_Contract", item.get("priceOfContract"))
+    contract_price = float(contract_price_raw) if contract_price_raw is not None else None
 
     contract = (
         f"{ticker} {expiry[:10]} {strike}{put_call[:1]}"
@@ -249,6 +251,7 @@ def _jarvis_to_alert(item: dict):
         spot_price=spot_price,
         volume=volume,
         open_interest=open_interest,
+        contract_price=contract_price,
     )
 
 

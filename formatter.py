@@ -128,24 +128,41 @@ def _subscriber_plain(
     dte_str = _dte_display(enrichment)
     conviction = _conviction_label(score)
 
+    # Moneyness now folds into the header line instead of its own
+    # separate line below, e.g. "MSTR — DEEP OTM Bearish Sweep spotted
+    # at $113.08" instead of a trailing "📍 DEEP OTM · $113.08 spot" line.
+    # This was a readability fix: the old layout put the stock's spot
+    # price right next to "DEEP OTM" with no clear label tying it to the
+    # stock, which read as ambiguous (could look option-related).
+    tier = None
+    if enrichment.moneyness_tier not in ("unknown",):
+        tier = enrichment.moneyness_tier.replace("_", " ").upper()
+    header_tier = f"{tier} " if tier else ""
+
+    spot_str = f"${enrichment.spot_price:,.2f}" if enrichment.spot_price else "—"
     catalyst_suffix = f" into {alert.catalyst}" if alert.catalyst else ""
-    header = f"{emoji} **{alert.ticker} — {direction} {flow}{catalyst_suffix}**"
+
+    header = (
+        f"{emoji} **{alert.ticker} — {header_tier}{direction} {flow}"
+        f"{catalyst_suffix} spotted at {spot_str}**"
+    )
+
+    # Contract line: strike/expiry/DTE, with contract price appended
+    # when known (JarvisFlow's price_Of_Contract, surfaced via the new
+    # alert.contract_price field). Display-only addition — does not
+    # affect scoring, gating, or any upstream logic.
+    contract_line = f"📋 `{contract_short} · {dte_str}"
+    if alert.contract_price is not None:
+        contract_line += f" · ${alert.contract_price:,.2f}"
+    contract_line += "`"
 
     lines = [
         ALERT_DIVIDER,
         header,
         "",
-        f"📋 `{contract_short}` · {dte_str}",
+        contract_line,
         f"💰 {premium_str} premium · {flow}",
     ]
-
-    # Moneyness + real spot price
-    if enrichment.moneyness_tier not in ("unknown",):
-        tier = enrichment.moneyness_tier.replace("_", " ").upper()
-        if enrichment.spot_price:
-            lines.append(f"📍 {tier} · ${enrichment.spot_price:,.2f} spot")
-        else:
-            lines.append(f"📍 {tier}")
 
     # Real volume and open interest — replaces vague RVOL/classification tags
     vol_oi = _vol_oi_line(alert)
