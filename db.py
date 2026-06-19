@@ -787,3 +787,46 @@ def get_outcome_stats(days_back: int = 30, min_score: int = 0, ticker: str | Non
     with db_cursor() as (conn, cur):
         cur.execute(f"SELECT * FROM alert_outcomes WHERE {where} ORDER BY created_at DESC", params)
         return [dict(r) for r in cur.fetchall()]
+
+
+def get_flow_events_in_range(start_date: str, end_date: str) -> list[dict]:
+    """
+    Fetch all flow_events rows with ingested_at between start_date and
+    end_date, inclusive, regardless of outcome/resolution status.
+
+    Used by the weekly recap — unlike get_unresolved_alerts(), this does
+    NOT join against alert_outcomes or exclude anything; "resolved" has
+    no meaning for this feature, every published alert in the window is
+    relevant to the recap.
+
+    Args:
+        start_date: ISO date string "YYYY-MM-DD" (inclusive, start of day)
+        end_date: ISO date string "YYYY-MM-DD" (inclusive, end of day)
+    """
+    p = "%s" if _POSTGRES else "?"
+    if _POSTGRES:
+        sql = f"""
+            SELECT alert_hash, ticker, contract, premium, sentiment,
+                   put_call, strike, expiry_date, dte, spot_price,
+                   moneyness_tier, score, ingested_at
+            FROM flow_events
+            WHERE ingested_at >= {p}::date
+              AND ingested_at < ({p}::date + INTERVAL '1 day')
+            ORDER BY ingested_at ASC
+        """
+        params = (start_date, end_date)
+    else:
+        sql = f"""
+            SELECT alert_hash, ticker, contract, premium, sentiment,
+                   put_call, strike, expiry_date, dte, spot_price,
+                   moneyness_tier, score, ingested_at
+            FROM flow_events
+            WHERE date(ingested_at) >= date({p})
+              AND date(ingested_at) <= date({p})
+            ORDER BY ingested_at ASC
+        """
+        params = (start_date, end_date)
+
+    with db_cursor() as (conn, cur):
+        cur.execute(sql, params)
+        return [dict(r) for r in cur.fetchall()]

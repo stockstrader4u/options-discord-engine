@@ -20,6 +20,10 @@ Requires the IANA timezone database to be available for zoneinfo. On Linux
 zoneinfo needs the `tzdata` package installed (pip install tzdata) — this is
 listed in requirements.txt for that reason. If tzdata isn't available, this
 raises clearly rather than silently falling back to the wrong timezone.
+
+Trading-day helpers (trading_days_before, most_recent_trading_day) reuse
+nyse_holidays() directly rather than duplicating the holiday rule set —
+added to support the weekly recap's "trailing 5 trading days" window.
 """
 
 from __future__ import annotations
@@ -108,7 +112,7 @@ def nyse_holidays(year: int) -> set[date]:
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Public API — session gate
 # ---------------------------------------------------------------------------
 
 def _to_eastern(dt: datetime | None) -> datetime:
@@ -144,3 +148,54 @@ def market_closed_reason(dt: datetime | None = None) -> str | None:
     if not (MARKET_OPEN <= dt_et.time() < MARKET_CLOSE):
         return f"outside regular session hours ({dt_et.strftime('%H:%M')} ET)"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Public API — trading-day math
+#
+# Added for the weekly recap feature: it needs to compute "the date 5
+# trading days before this Friday" and "if this Friday is a holiday, what's
+# the last real trading day to use instead". Both reuse nyse_holidays()
+# above rather than re-deriving holiday rules a second time.
+# ---------------------------------------------------------------------------
+
+def is_trading_day(d: date) -> bool:
+    """True if d is a weekday and not an NYSE holiday. Pure date check —
+    does not consider time of day, unlike is_market_open()."""
+    if d.weekday() >= 5:
+        return False
+    if d in nyse_holidays(d.year):
+        return False
+    return True
+
+
+def most_recent_trading_day(d: date) -> date:
+    """
+    The most recent date on or before d that is a real trading day.
+
+    Used when a scheduled job's target day (e.g. Friday for the weekly
+    recap) happens to fall on a market holiday — rather than skip the
+    recap entirely, callers resolve the correct 'as of' date through this
+    function first, then use that for the close reference and as the
+    end-point for trading_days_before().
+    """
+    cursor = d
+    while not is_trading_day(cursor):
+        cursor -= timedelta(days=1)
+    return cursor
+
+
+def trading_days_before(end_date: date, n: int) -> date:
+    """
+    The date that is n trading days before end_date.
+
+    end_date is assumed to already be a valid trading day — pass it
+    through most_recent_trading_day() first if that's not guaranteed.
+    """
+    cursor = end_date
+    counted = 0
+    while counted < n:
+        cursor -= timedelta(days=1)
+        if is_trading_day(cursor):
+            counted += 1
+    return cursor

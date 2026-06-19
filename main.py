@@ -14,6 +14,7 @@ from models import FlowAlert
 from scoring import auto_score_alert
 from flow_filters import filter_flow_items, is_high_conviction
 from market_hours import is_market_open, market_closed_reason
+from weekly_recap import build_weekly_recap, post_weekly_recap
 from enrichment import enrich_alert, enrichment_summary
 from classifier import classify_alert
 from formatter import format_alert, format_plain_text
@@ -34,6 +35,7 @@ load_dotenv()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 MIN_ALERT_SCORE = int(os.getenv("MIN_ALERT_SCORE", "70"))
 JARVIS_API_KEY = os.getenv("JARVIS_API_KEY")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 JARVIS_MCP_URL = "https://api.jarvisflow.io/.well-known/mcp"
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 AUTO_POLL_ENABLED = os.getenv("AUTO_POLL_ENABLED", "true").lower() == "true"
@@ -321,6 +323,50 @@ async def scheduled_poll_job():
     )
 
 
+async def weekly_recap_job():
+    """
+    Friday end-of-week recap. Runs on the same scheduler as the daily
+    poll, gated separately so it only actually builds/posts on Fridays
+    (or, if Friday is a market holiday, this still won't fire on a non-
+    Friday day — the schedule itself only triggers Fridays; the holiday
+    handling lives inside resolve_recap_window(), which rolls the "as of"
+    date back to the last real trading day for the close reference).
+    """
+    if not DISCORD_WEBHOOK_URL:
+        logger.warning("weekly_recap_skipped reason=DISCORD_WEBHOOK_URL_missing")
+        return
+    if not FINNHUB_API_KEY:
+        logger.warning("weekly_recap_skipped reason=FINNHUB_API_KEY_missing")
+        return
+
+    try:
+        recap = build_weekly_recap(api_key=FINNHUB_API_KEY)
+    except Exception as e:
+        logger.exception("weekly_recap_build_failed error=%s", str(e))
+        return
+
+    logger.info(
+        "weekly_recap_built window=%s_to_%s total=%d resolved=%d failed=%d",
+        recap["start_date"], recap["end_date"],
+        recap["total_alerts"], recap["resolved_count"], recap["failed_count"],
+    )
+
+    if recap["total_alerts"] == 0:
+        logger.info("weekly_recap_skipped reason=no_alerts_in_window")
+        return
+
+    try:
+        posted = await post_weekly_recap(DISCORD_WEBHOOK_URL, recap["message"])
+    except Exception as e:
+        logger.exception("weekly_recap_post_failed error=%s", str(e))
+        return
+
+    if posted:
+        logger.info("weekly_recap_posted ok")
+    else:
+        logger.warning("weekly_recap_post_failed reason=non_2xx_response")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global jarvis_semaphore
@@ -336,11 +382,17 @@ async def lifespan(app: FastAPI):
             seconds=POLL_INTERVAL_SECONDS,
             id="jarvis_auto_poll", replace_existing=True, max_instances=1
         )
+        scheduler.add_job(
+            weekly_recap_job, "cron",
+            day_of_week="fri", hour=16, minute=30, timezone="America/New_York",
+            id="weekly_recap", replace_existing=True, max_instances=1
+        )
         scheduler.start()
         logger.info(
             "scheduler_started watchlist=%d interval=%s dedupe_window=%s concurrency=%s",
             len(WATCHLIST), POLL_INTERVAL_SECONDS, DEDUPE_WINDOW_MINUTES, JARVIS_CONCURRENCY,
         )
+        logger.info("weekly_recap_job_registered fri_16:30_ET finnhub_configured=%s", bool(FINNHUB_API_KEY))
     else:
         logger.info("scheduler_disabled")
 
