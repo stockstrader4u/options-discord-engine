@@ -15,6 +15,7 @@ from scoring import auto_score_alert
 from flow_filters import filter_flow_items, is_high_conviction
 from market_hours import is_market_open, market_closed_reason
 from weekly_recap import build_weekly_recap, post_weekly_recap
+from flow_heatmap import heatmap_job
 from enrichment import enrich_alert, enrichment_summary
 from classifier import classify_alert
 from formatter import format_alert, format_plain_text
@@ -36,6 +37,7 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 MIN_ALERT_SCORE = int(os.getenv("MIN_ALERT_SCORE", "70"))
 JARVIS_API_KEY = os.getenv("JARVIS_API_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+HEATMAP_WEBHOOK_URL = os.getenv("HEATMAP_WEBHOOK_URL") or os.getenv("CHART_WEBHOOK_URL")
 JARVIS_MCP_URL = "https://api.jarvisflow.io/.well-known/mcp"
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 AUTO_POLL_ENABLED = os.getenv("AUTO_POLL_ENABLED", "true").lower() == "true"
@@ -387,12 +389,18 @@ async def lifespan(app: FastAPI):
             day_of_week="fri", hour=16, minute=30, timezone="America/New_York",
             id="weekly_recap", replace_existing=True, max_instances=1
         )
+        scheduler.add_job(
+            heatmap_job, "cron",
+            day_of_week="mon-fri", hour=16, minute=30, timezone="America/New_York",
+            id="flow_heatmap", replace_existing=True, max_instances=1
+        )
         scheduler.start()
         logger.info(
             "scheduler_started watchlist=%d interval=%s dedupe_window=%s concurrency=%s",
             len(WATCHLIST), POLL_INTERVAL_SECONDS, DEDUPE_WINDOW_MINUTES, JARVIS_CONCURRENCY,
         )
         logger.info("weekly_recap_job_registered fri_16:30_ET finnhub_configured=%s", bool(FINNHUB_API_KEY))
+        logger.info("heatmap_job_registered mon-fri_16:30_ET webhook_configured=%s", bool(HEATMAP_WEBHOOK_URL))
     else:
         logger.info("scheduler_disabled")
 
