@@ -16,8 +16,7 @@ from flow_filters import filter_flow_items, is_high_conviction
 from market_hours import is_market_open, market_closed_reason
 from weekly_recap import build_weekly_recap, post_weekly_recap
 from flow_heatmap import heatmap_job
-from enrichment import enrich_alert
-from enrichment import enrich_alert, enrichment_summary
+from enrichment import enrich_alert, enrichment_summary, compute_levels
 from classifier import classify_alert
 from formatter import format_alert, format_plain_text
 from db import (
@@ -227,6 +226,12 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25):
         for item in filtered_items[:limit]:
             alert = jarvis_item_to_flow_alert(item)
             enrichment = enrich_alert(alert)
+            # Direction-aware target/stop levels from Bollinger/Keltner
+            # bands, computed here (not inside enrich_alert, which
+            # deliberately never mutates FlowAlert) so the mutation is
+            # explicit at the call site. Set before classification/
+            # scoring/formatting so all three see the real levels.
+            alert.levels = compute_levels(alert.ticker, alert.sentiment)
             classification = classify_alert(alert, enrichment)
             final_score, score_reasons = auto_score_alert(alert)
             high_conviction = is_high_conviction(item)
@@ -447,10 +452,12 @@ async def jarvis_preview(ticker: str = "SPY"):
             return {"ok": False, "error": "No flow items returned"}
         alert = jarvis_item_to_flow_alert(flow_items[0])
         final_score, score_reasons = auto_score_alert(alert)
-        # TEMPORARY: enrichment added here only to verify the real RVOL
-        # fix against live JarvisFlow data without posting to Discord.
-        # Safe to remove once confirmed working — read-only, no side effects.
+        # TEMPORARY: enrichment + levels added here only to verify the
+        # real RVOL and Bollinger/Keltner levels fixes against live
+        # JarvisFlow data without posting to Discord. Safe to remove
+        # once confirmed working — read-only, no side effects.
         enrichment = enrich_alert(alert)
+        alert.levels = compute_levels(alert.ticker, alert.sentiment)
         return {
             "ok": True, "ticker": ticker,
             "raw_item": flow_items[0], "mapped_alert": alert.model_dump(),

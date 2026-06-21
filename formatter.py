@@ -109,6 +109,51 @@ def _vol_oi_line(alert: FlowAlert) -> str | None:
     return f"📊 Vol {vol:,} · OI {oi_str} · Vol/OI {ratio:.1f}x"
 
 
+def _setup_tag(classification: FlowClassification) -> str:
+    """
+    One concise tag describing what kind of setup this is — uses the
+    classifier's own trade_style label directly (lotto/swing/unknown),
+    since that's already the engine's real conclusion. No re-derivation
+    from enrichment fields.
+    """
+    label = classification.trade_style.label
+    if label == "lotto":
+        return "Lotto"
+    if label == "swing":
+        return "Swing"
+    return "Standard"
+
+
+def _entry_thesis_line(
+    alert: FlowAlert,
+    enrichment: FlowEnrichment,
+    classification: FlowClassification,
+) -> str:
+    """
+    One-sentence plain-English thesis built only from real classifier
+    label values (intent: speculative/hedge, setup_quality: actionable/
+    chase) — branches explicitly on each real value rather than gluing
+    labels into a fixed template, since "chase" doesn't read as a
+    quality tier and needs its own phrasing.
+    """
+    intent_label = classification.intent.label
+    quality_label = classification.setup_quality.label
+
+    if intent_label == "hedge":
+        intent_phrase = "Hedge-style flow"
+    else:
+        intent_phrase = "Speculative setup"
+
+    if quality_label == "actionable":
+        quality_phrase = "clean, actionable structure"
+    elif quality_label == "chase":
+        quality_phrase = "late/reactive — chase risk"
+    else:
+        quality_phrase = "structure unclear"
+
+    return f"📝 {intent_phrase} · {quality_phrase}"
+
+
 # ---------------------------------------------------------------------------
 # Subscriber format — plain text
 # ---------------------------------------------------------------------------
@@ -127,6 +172,7 @@ def _subscriber_plain(
     premium_str = _premium_display(alert.premium)
     dte_str = _dte_display(enrichment)
     conviction = _conviction_label(score)
+    setup_tag = _setup_tag(classification)
 
     # Moneyness now folds into the header line instead of its own
     # separate line below, e.g. "MSTR — DEEP OTM Bearish Sweep spotted
@@ -159,6 +205,7 @@ def _subscriber_plain(
     lines = [
         ALERT_DIVIDER,
         header,
+        f"🏷️ **{setup_tag}**",
         "",
         contract_line,
         f"💰 {premium_str} premium · {flow}",
@@ -169,10 +216,14 @@ def _subscriber_plain(
     if vol_oi:
         lines.append(vol_oi)
 
-    # Key levels if set
+    # Key levels if set — alert.levels is already a fully-formatted line
+    # (when set by compute_levels(), it starts with its own 🛑/🎯 emoji),
+    # so this is appended as-is, not wrapped with an additional emoji.
     if alert.levels:
-        lines.append(f"🎯 {alert.levels}")
+        lines.append(alert.levels)
 
+    lines.append("")
+    lines.append(_entry_thesis_line(alert, enrichment, classification))
     lines.append("")
 
     # Conviction + score — the one meaningful summary line

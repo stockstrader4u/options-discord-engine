@@ -385,6 +385,48 @@ def enrich_alert(alert: FlowAlert, alert_hash: str | None = None) -> FlowEnrichm
     )
 
 
+def compute_levels(ticker: str, sentiment: str) -> str | None:
+    """
+    Direction-aware target/stop levels derived from Bollinger and Keltner
+    bands on the most recent daily candle — reuses the same candle fetch
+    built for RVOL (_fetch_latest_candle), no separate API call needed.
+
+    Bullish: targets above spot (Keltner Top, Bollinger Mid, Bollinger
+    Top, ascending), stop below (Keltner Bottom).
+    Bearish: mirrored — targets below spot (Keltner Bottom, Bollinger
+    Mid, Bollinger Bottom, descending), stop above (Keltner Top).
+
+    Returns a formatted string, or None if candle data isn't available
+    for this ticker (e.g. SPY/QQQ — confirmed no candle coverage) or
+    sentiment is neutral (no clear direction to anchor levels against).
+    """
+    if sentiment not in ("bullish", "bearish"):
+        return None
+
+    candle = _fetch_latest_candle(ticker)
+    if candle is None:
+        return None
+
+    try:
+        boll_top = float(candle.get("bollingerTop"))
+        boll_mid = float(candle.get("bollingerMiddle"))
+        boll_bot = float(candle.get("bollingerBottom"))
+        kelt_top = float(candle.get("keltnerTop"))
+        kelt_bot = float(candle.get("keltnerBottom"))
+    except (TypeError, ValueError):
+        return None
+
+    if sentiment == "bullish":
+        stop = kelt_bot
+        targets = sorted([kelt_top, boll_mid, boll_top])
+    else:  # bearish
+        stop = kelt_top
+        targets = sorted([kelt_bot, boll_mid, boll_bot], reverse=True)
+
+    target_str = " / ".join(f"${t:,.2f}" for t in targets)
+    return f"🛑 ${stop:,.2f} stop · 🎯 {target_str}"
+
+
 def enrichment_summary(e: FlowEnrichment) -> str:
     """
     Return a one-line human-readable enrichment summary for Discord or logs.
