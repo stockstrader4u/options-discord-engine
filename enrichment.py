@@ -10,20 +10,33 @@ Takes a FlowAlert and returns a FlowEnrichment with computed context:
   available (populated from JarvisFlow's own spot_Price field for any
   ticker), falling back to a small mock table only for manually-built
   alerts that don't supply real market data.
-- RVOL (still mocked — real provider slot ready for Phase 4)
+- RVOL (real — computed from JarvisFlow candle data's volume/avgVolume)
 
 All enrichment is additive — FlowAlert is never mutated.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from datetime import date, datetime
 from typing import Literal
 
+import httpx
 from pydantic import BaseModel
 
 from models import FlowAlert
+
+JARVIS_API_KEY = os.getenv("JARVIS_API_KEY")
+JARVIS_MCP_URL = "https://api.jarvisflow.io/.well-known/mcp"
+
+# Tickers confirmed (via direct API check) to return no candle data from
+# JarvisFlow's get_candle_stick_data_for_ticker — likely ETF tickers
+# aren't covered by this tool even though individual stocks are, and even
+# though SPY/QQQ ARE covered by the options-flow tool. Checked first to
+# skip a guaranteed-empty network call rather than wait on it.
+_NO_CANDLE_COVERAGE: set[str] = {"SPY", "QQQ"}
 
 
 # ---------------------------------------------------------------------------
@@ -184,14 +197,94 @@ def _mock_spot(ticker: str) -> float | None:
     return mock_prices.get(ticker.upper())
 
 
-def _mock_rvol(ticker: str) -> tuple[float, str]:
+def _fetch_latest_candle(ticker: str) -> dict | None:
     """
-    Mock relative volume. Phase 4 replaces with real provider.
-    Returns (rvol_float, label).
+    Fetch the most recent daily candle for ticker from JarvisFlow.
+    candles[0] is confirmed (via direct API check against NVDA/TSLA/AAPL)
+    to always be the most recent candle, descending from there — no
+    reversal needed for this purpose.
+
+    Returns None on ANY failure — missing API key, network error, timeout,
+    malformed response, or ticker not covered (confirmed: SPY and QQQ
+    return an empty toolResult — "ticker not monitored" — likely because
+    they're ETFs rather than individual equities; this tool's coverage
+    does not match the options-flow tool's coverage). Every caller must
+    treat None as "real data unavailable right now" and fall back to
+    "unknown" — this must never be the reason a real-time alert fails to
+    post, since it runs inside the live 60-second polling loop.
     """
-    import random
-    random.seed(hash(ticker) % 1000)
-    rvol = round(random.uniform(0.8, 3.5), 2)
+    if ticker.upper() in _NO_CANDLE_COVERAGE:
+        return None
+    if not JARVIS_API_KEY:
+        return None
+
+    payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "tools/call",
+        "params": {"name": "get_candle_stick_data_for_ticker", "arguments": {"ticker": ticker}},
+    }
+    try:
+        # Short timeout — this call happens inside the live polling loop
+        # and must not stall alert processing if JarvisFlow is slow.
+        resp = httpx.post(
+            JARVIS_MCP_URL,
+            headers={"Authorization": f"Bearer {JARVIS_API_KEY}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=5.0,
+        )
+        if resp.status_code != 200:
+            return None
+
+        for line in resp.text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            data = json.loads(line[5:].strip())
+            content = data.get("result", {}).get("content", [])
+            if not content or content[0].get("type") != "text":
+                continue
+            inner = json.loads(content[0]["text"])
+            result = inner.get("toolResult", inner)
+            if isinstance(result, list) and result:
+                return result[0]  # most recent candle, confirmed by direct check
+        return None
+    except (httpx.TimeoutException, httpx.HTTPError, json.JSONDecodeError, KeyError, IndexError, TypeError):
+        # Any network/parsing failure -> "no data", never raise. RVOL is
+        # a non-critical enrichment field; the alert must still post even
+        # if this lookup fails.
+        return None
+    except Exception:
+        # Belt-and-suspenders: truly unexpected errors also degrade
+        # gracefully instead of bubbling up and breaking alert processing.
+        return None
+
+
+def _real_rvol(ticker: str) -> tuple[float | None, str]:
+    """
+    Real relative volume: today's volume / JarvisFlow's own rolling
+    average volume, from the most recent daily candle.
+
+    Returns (None, "unknown") whenever real data isn't available for any
+    reason — never fabricates a number. "unknown" is already a valid
+    rvol_label value on FlowEnrichment, so no schema change is needed.
+    """
+    candle = _fetch_latest_candle(ticker)
+    if candle is None:
+        return None, "unknown"
+
+    volume = candle.get("volume")
+    avg_volume = candle.get("avgVolume")
+
+    if not volume or not avg_volume:
+        return None, "unknown"
+
+    try:
+        avg_volume_f = float(avg_volume)
+        if avg_volume_f <= 0:
+            return None, "unknown"
+        rvol = round(float(volume) / avg_volume_f, 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None, "unknown"
+
     if rvol >= 3.0:
         label = "extreme"
     elif rvol >= 2.0:
@@ -200,6 +293,7 @@ def _mock_rvol(ticker: str) -> tuple[float, str]:
         label = "normal"
     else:
         label = "low"
+
     return rvol, label
 
 
@@ -237,8 +331,10 @@ def enrich_alert(alert: FlowAlert, alert_hash: str | None = None) -> FlowEnrichm
     if spot and strike and put_call:
         moneyness_pct, moneyness_tier = _moneyness(strike, spot, put_call)
 
-    # RVOL
-    rvol, rvol_label = _mock_rvol(alert.ticker)
+    # RVOL — real, computed from JarvisFlow candle data. Falls back to
+    # (None, "unknown") for any failure or uncovered ticker (e.g. SPY/QQQ);
+    # never fabricates a number.
+    rvol, rvol_label = _real_rvol(alert.ticker)
 
     # Premium tier
     premium_tier = _premium_tier(alert.premium)
@@ -261,7 +357,7 @@ def enrich_alert(alert: FlowAlert, alert_hash: str | None = None) -> FlowEnrichm
     if moneyness_tier == "atm":
         structure_notes.append("ATM — high gamma")
 
-    if rvol_label in ("extreme", "high"):
+    if rvol_label in ("extreme", "high") and rvol is not None:
         structure_notes.append(f"elevated RVOL ({rvol}x)")
 
     if premium_tier == "whale":

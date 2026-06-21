@@ -25,3 +25,7 @@ class FlowAlert(BaseModel):
     # Real volume_When_Traded / open_Interest_When_Traded from JarvisFlow,
     # when known. scoring.py uses the volume/open_interest ratio as a
     # signal of fresh positioning vs existing open interest.
+    contract_price: float | None = None
+    # Real per-contract premium at time of trade, from JarvisFlow's own
+    # price_Of_Contract field, when known. Used for display only — does
+    # not affect scoring or gating.
