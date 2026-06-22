@@ -21,8 +21,11 @@ from classifier import classify_alert
 from formatter import format_alert, format_plain_text
 from db import (
     init_all_tables,
+    add_premium_column_migration,
     alert_hash_exists_in_window,
+    get_same_day_published_premium,
     save_published_alert,
+    save_published_alert_with_premium,
     get_recent_published_alerts,
     get_published_alert_count,
     save_flow_event_row,
@@ -42,6 +45,10 @@ JARVIS_MCP_URL = "https://api.jarvisflow.io/.well-known/mcp"
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 AUTO_POLL_ENABLED = os.getenv("AUTO_POLL_ENABLED", "true").lower() == "true"
 DEDUPE_WINDOW_MINUTES = int(os.getenv("DEDUPE_WINDOW_MINUTES", "30"))
+# How much bigger same-day premium must be on a repeat contract+sentiment
+# for it to be treated as materially new information rather than a
+# duplicate. 2.0 = must be at least double the prior same-day premium.
+DEDUPE_PREMIUM_MULTIPLIER = float(os.getenv("DEDUPE_PREMIUM_MULTIPLIER", "2.0"))
 ALERT_FORMAT_MODE = os.getenv("ALERT_FORMAT_MODE", "subscriber")
 WATCHLIST = {
     "DDOG","MDB","ANET","TWLO","CRM","UBER","NFLX","NVDA","AAPL","TSLA",
@@ -72,16 +79,49 @@ def make_alert_hash(alert: FlowAlert) -> str:
 
 
 def alert_published_within_window(alert: FlowAlert) -> bool:
-    return alert_hash_exists_in_window(make_alert_hash(alert), DEDUPE_WINDOW_MINUTES)
+    """
+    Same-day dedup check with a material-change override — replaces the
+    old rolling-30-minute-window check.
+
+    PROBLEM THIS FIXES: the old check only blocked a repost within
+    DEDUPE_WINDOW_MINUTES (30 min) of the first post. JarvisFlow's feed
+    can resurface the exact same sweep/block hours later — confirmed in
+    production on 2026-06-22, where APP, QCOM, TSM, and TSLA all posted
+    twice, roughly 4 hours apart, with near-identical premium each time.
+    Since 4 hours is far outside any 30-minute window, the old check let
+    every one of these duplicates straight through.
+
+    NEW BEHAVIOR: blocks any repost of the same contract+sentiment on
+    the SAME CALENDAR DAY, unless the new premium is at least
+    DEDUPE_PREMIUM_MULTIPLIER times (default 2x) the most recent
+    same-day premium for that exact contract+sentiment — in which case
+    it's treated as materially new information (a genuinely bigger new
+    sweep/block on the same contract) and allowed through.
+    """
+    alert_hash = make_alert_hash(alert)
+    prior_premium = get_same_day_published_premium(alert_hash)
+
+    if prior_premium is None:
+        return False  # hasn't posted today at all -> not a duplicate
+
+    if alert.premium >= prior_premium * DEDUPE_PREMIUM_MULTIPLIER:
+        logger.info(
+            "dedupe_override ticker=%s contract=%s prior_premium=%s new_premium=%s multiplier=%s",
+            alert.ticker, alert.contract, prior_premium, alert.premium, DEDUPE_PREMIUM_MULTIPLIER,
+        )
+        return False  # material change -> allow the repost
+
+    return True  # same-day duplicate, premium didn't materially change -> block
 
 
 def save_alert(alert: FlowAlert, score: int) -> None:
-    save_published_alert(
+    save_published_alert_with_premium(
         alert_hash=make_alert_hash(alert),
         ticker=alert.ticker,
         contract=alert.contract,
         source=alert.source,
         score=score,
+        premium=alert.premium,
     )
 
 
@@ -381,6 +421,7 @@ async def lifespan(app: FastAPI):
     jarvis_semaphore = asyncio.Semaphore(JARVIS_CONCURRENCY)
 
     init_all_tables()
+    add_premium_column_migration()
     backend = "PostgreSQL" if is_postgres() else "SQLite"
     logger.info("db_backend=%s", backend)
 
@@ -402,8 +443,8 @@ async def lifespan(app: FastAPI):
         )
         scheduler.start()
         logger.info(
-            "scheduler_started watchlist=%d interval=%s dedupe_window=%s concurrency=%s",
-            len(WATCHLIST), POLL_INTERVAL_SECONDS, DEDUPE_WINDOW_MINUTES, JARVIS_CONCURRENCY,
+            "scheduler_started watchlist=%d interval=%s dedupe_window=%s concurrency=%s dedupe_premium_multiplier=%s",
+            len(WATCHLIST), POLL_INTERVAL_SECONDS, DEDUPE_WINDOW_MINUTES, JARVIS_CONCURRENCY, DEDUPE_PREMIUM_MULTIPLIER,
         )
         logger.info("weekly_recap_job_registered fri_16:30_ET finnhub_configured=%s", bool(FINNHUB_API_KEY))
         logger.info("heatmap_job_registered mon-fri_16:30_ET webhook_configured=%s", bool(HEATMAP_WEBHOOK_URL))
@@ -428,6 +469,7 @@ def root():
         "db_backend": "postgresql" if is_postgres() else "sqlite",
         "min_alert_score": MIN_ALERT_SCORE,
         "dedupe_window_minutes": DEDUPE_WINDOW_MINUTES,
+        "dedupe_premium_multiplier": DEDUPE_PREMIUM_MULTIPLIER,
         "auto_poll_enabled": AUTO_POLL_ENABLED,
         "poll_interval_seconds": POLL_INTERVAL_SECONDS,
         "watchlist_size": len(WATCHLIST),
@@ -516,7 +558,7 @@ async def flow_alert(alert: FlowAlert):
         return {
             "ok": True, "posted": False, "score": final_score,
             "score_reasons": score_reasons,
-            "reason": f"duplicate alert within cooldown window ({DEDUPE_WINDOW_MINUTES} min)"
+            "reason": "duplicate alert already published today (no material premium increase)"
         }
 
     closed_reason = market_closed_reason()

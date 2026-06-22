@@ -50,9 +50,6 @@ def placeholder(n: int = 1) -> str:
     """
     Return the right parameter placeholder for the active DB.
     SQLite uses ?, PostgreSQL uses %s.
-
-    For multi-param queries, pass n:
-        placeholder(3) → "?, ?, ?" or "%s, %s, %s"
     """
     p = "%s" if _POSTGRES else "?"
     return ", ".join([p] * n)
@@ -395,10 +392,35 @@ def init_all_tables() -> None:
             try:
                 cur.execute(idx_sql)
             except Exception as e:
-                # Index may already exist under a different name — non-fatal
                 logger.debug("index skipped: %s", e)
 
     logger.info("db_init complete all tables ready")
+
+
+def add_premium_column_migration() -> None:
+    """
+    published_alerts was originally created WITHOUT a premium column.
+    This adds it if it doesn't already exist.
+
+    NEW — added as part of the duplicate-alert fix. The fix needs to
+    compare today's new premium against the premium of the most recent
+    same-day post for that same contract+sentiment (see
+    get_same_day_published_premium below), but published_alerts never
+    stored premium at all before now — only flow_events did. This
+    migration adds the missing column.
+
+    Safe to call on every startup. After the first successful run, every
+    later call will hit a "column already exists" error from the
+    database, which is caught and logged at debug level — that's the
+    expected, harmless case confirming the migration already ran.
+    """
+    sql = "ALTER TABLE published_alerts ADD COLUMN premium INTEGER"
+    with db_cursor() as (conn, cur):
+        try:
+            cur.execute(sql)
+            logger.info("migration_applied: published_alerts.premium column added")
+        except Exception as e:
+            logger.debug("migration_skipped (likely already applied): %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +428,15 @@ def init_all_tables() -> None:
 # ---------------------------------------------------------------------------
 
 def alert_hash_exists_in_window(alert_hash: str, window_minutes: int) -> bool:
-    """Dedup check — True if this hash was published within window_minutes."""
+    """
+    ORIGINAL time-window dedup check — True if this hash was published
+    within window_minutes. Kept for backward compatibility with any
+    other callers, but main.py's live posting path no longer calls this
+    directly for its dedup decision — see get_same_day_published_premium()
+    below, which replaced it as part of the duplicate-alert fix (same-day
+    check instead of a rolling 30-minute window, since JarvisFlow can
+    resurface the same contract hours later, well outside 30 minutes).
+    """
     if _POSTGRES:
         sql = """
             SELECT 1 FROM published_alerts
@@ -429,6 +459,50 @@ def alert_hash_exists_in_window(alert_hash: str, window_minutes: int) -> bool:
         return cur.fetchone() is not None
 
 
+def get_same_day_published_premium(alert_hash: str) -> int | None:
+    """
+    NEW — added as part of the duplicate-alert fix.
+
+    Returns the premium of the most recent published_alerts row matching
+    this alert_hash, posted TODAY (calendar day, not a rolling time
+    window) — or None if this contract+sentiment hasn't posted today at
+    all.
+
+    This is the core of the fix. The old check only blocked a repost
+    within 30 minutes of the first post. JarvisFlow's feed can resurface
+    the exact same sweep/block hours later, still within the same
+    trading day — so the same contract was getting reposted as if brand
+    new, once 30 minutes had passed. This checks "posted today at all",
+    not "posted recently".
+    """
+    if _POSTGRES:
+        sql = """
+            SELECT premium FROM published_alerts
+            WHERE alert_hash = %s
+              AND published_at >= date_trunc('day', NOW())
+            ORDER BY published_at DESC
+            LIMIT 1
+        """
+        params = (alert_hash,)
+    else:
+        sql = """
+            SELECT premium FROM published_alerts
+            WHERE alert_hash = ?
+              AND date(published_at) = date('now')
+            ORDER BY published_at DESC
+            LIMIT 1
+        """
+        params = (alert_hash,)
+
+    with db_cursor() as (conn, cur):
+        cur.execute(sql, params)
+        row = cur.fetchone()
+
+    if row is None:
+        return None
+    return row["premium"] if _POSTGRES else row[0]
+
+
 def save_published_alert(
     alert_hash: str,
     ticker: str,
@@ -436,7 +510,13 @@ def save_published_alert(
     source: str,
     score: int,
 ) -> None:
-    """Insert a row into published_alerts."""
+    """
+    ORIGINAL save function — does NOT store premium. Kept for backward
+    compatibility with any other callers, but main.py's live posting
+    path now uses save_published_alert_with_premium() below instead,
+    since the duplicate-alert fix needs premium stored to compare
+    against on a future same-day repost attempt.
+    """
     now = utc_now_str()
     if _POSTGRES:
         sql = """
@@ -450,6 +530,40 @@ def save_published_alert(
             VALUES (?, ?, ?, ?, ?, ?)
         """
         params = (alert_hash, ticker, contract, source, score, now)
+
+    with db_cursor() as (conn, cur):
+        cur.execute(sql, params)
+
+
+def save_published_alert_with_premium(
+    alert_hash: str,
+    ticker: str,
+    contract: str,
+    source: str,
+    score: int,
+    premium: int,
+) -> None:
+    """
+    NEW — added as part of the duplicate-alert fix.
+
+    Same as save_published_alert(), but also stores premium — required
+    by get_same_day_published_premium() to compare against on a future
+    same-day repost attempt. Requires the premium column added by
+    add_premium_column_migration().
+    """
+    now = utc_now_str()
+    if _POSTGRES:
+        sql = """
+            INSERT INTO published_alerts (alert_hash, ticker, contract, source, score, premium, published_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+        """
+        params = (alert_hash, ticker, contract, source, score, premium)
+    else:
+        sql = """
+            INSERT INTO published_alerts (alert_hash, ticker, contract, source, score, premium, published_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+        params = (alert_hash, ticker, contract, source, score, premium, now)
 
     with db_cursor() as (conn, cur):
         cur.execute(sql, params)
@@ -793,11 +907,6 @@ def get_flow_events_in_range(start_date: str, end_date: str) -> list[dict]:
     """
     Fetch all flow_events rows with ingested_at between start_date and
     end_date, inclusive, regardless of outcome/resolution status.
-
-    Used by the weekly recap — unlike get_unresolved_alerts(), this does
-    NOT join against alert_outcomes or exclude anything; "resolved" has
-    no meaning for this feature, every published alert in the window is
-    relevant to the recap.
 
     Args:
         start_date: ISO date string "YYYY-MM-DD" (inclusive, start of day)
