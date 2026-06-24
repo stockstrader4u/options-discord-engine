@@ -402,12 +402,11 @@ def add_premium_column_migration() -> None:
     published_alerts was originally created WITHOUT a premium column.
     This adds it if it doesn't already exist.
 
-    NEW — added as part of the duplicate-alert fix. The fix needs to
-    compare today's new premium against the premium of the most recent
-    same-day post for that same contract+sentiment (see
-    get_same_day_published_premium below), but published_alerts never
-    stored premium at all before now — only flow_events did. This
-    migration adds the missing column.
+    Added as part of the duplicate-alert fix. The fix needs to compare
+    today's new premium against the premium of the most recent same-day
+    post for that same contract+sentiment (see get_same_day_published_premium
+    below), but published_alerts never stored premium at all before now —
+    only flow_events did. This migration adds the missing column.
 
     Safe to call on every startup. After the first successful run, every
     later call will hit a "column already exists" error from the
@@ -421,6 +420,46 @@ def add_premium_column_migration() -> None:
             logger.info("migration_applied: published_alerts.premium column added")
         except Exception as e:
             logger.debug("migration_skipped (likely already applied): %s", e)
+
+
+def add_vol_oi_columns_migration() -> None:
+    """
+    NEW — added to support the daily flow summary job ("Today's Flow at
+    a Glance").
+
+    flow_events was originally created WITHOUT volume, open_interest, or
+    a precomputed vol_oi_ratio column. Those numbers exist transiently on
+    FlowAlert at alert-time (alert.volume, alert.open_interest — used to
+    build the "📊 Vol X · OI Y · Vol/OI Zx" line in the Discord message
+    itself) but were never persisted to flow_events, so there was no way
+    to query "which alerts had unusually high Vol/OI today" after the
+    fact — the only record was the formatted text already posted to
+    Discord, which isn't a queryable data source for a recurring job.
+
+    This migration adds all three columns so save_flow_event_row() can
+    persist them going forward. Existing historical rows will simply
+    have NULL in these columns — there's no way to backfill Vol/OI for
+    alerts that already posted before this migration ran, since the raw
+    volume/open_interest values were never stored anywhere. The daily
+    summary job should treat NULL vol_oi_ratio as "unknown", not zero.
+
+    Safe to call on every startup — same pattern as
+    add_premium_column_migration(). After the first successful run,
+    later calls hit "column already exists" and are caught/logged at
+    debug level.
+    """
+    columns = [
+        ("volume", "INTEGER"),
+        ("open_interest", "INTEGER"),
+        ("vol_oi_ratio", "REAL"),
+    ]
+    with db_cursor() as (conn, cur):
+        for col_name, col_type in columns:
+            try:
+                cur.execute(f"ALTER TABLE flow_events ADD COLUMN {col_name} {col_type}")
+                logger.info("migration_applied: flow_events.%s column added", col_name)
+            except Exception as e:
+                logger.debug("migration_skipped for flow_events.%s (likely already applied): %s", col_name, e)
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +500,7 @@ def alert_hash_exists_in_window(alert_hash: str, window_minutes: int) -> bool:
 
 def get_same_day_published_premium(alert_hash: str) -> int | None:
     """
-    NEW — added as part of the duplicate-alert fix.
+    Added as part of the duplicate-alert fix.
 
     Returns the premium of the most recent published_alerts row matching
     this alert_hash, posted TODAY (calendar day, not a rolling time
@@ -544,7 +583,7 @@ def save_published_alert_with_premium(
     premium: int,
 ) -> None:
     """
-    NEW — added as part of the duplicate-alert fix.
+    Added as part of the duplicate-alert fix.
 
     Same as save_published_alert(), but also stores premium — required
     by get_same_day_published_premium() to compare against on a future
@@ -626,8 +665,23 @@ def save_flow_event_row(
     passed_dedup: bool = False,
     was_published: bool = False,
     suppress_reason: str | None = None,
+    volume: int | None = None,
+    open_interest: int | None = None,
 ) -> int:
-    """Insert a flow_events row. Returns new row id."""
+    """
+    Insert a flow_events row. Returns new row id.
+
+    volume / open_interest — NEW params added to support the daily flow
+    summary job. These are the raw options-contract-level numbers from
+    JarvisFlow's flow feed (alert.volume / alert.open_interest — the
+    same values already shown in every alert's "📊 Vol X · OI Y · Vol/OI
+    Zx" line), distinct from enrichment.rvol (which is a different,
+    stock-level relative-volume number). vol_oi_ratio is computed here,
+    once, at write time, rather than recomputed by every future reader —
+    same ratio formula already used in scoring.py, kept consistent.
+    Both params are optional and default to None for any caller that
+    doesn't have this data (e.g. manually-built test alerts).
+    """
     structure_notes: list = []
     enrich: dict = {}
 
@@ -648,8 +702,12 @@ def save_flow_event_row(
             "is_near_expiry": enrichment.is_near_expiry,
         }
 
+    vol_oi_ratio: float | None = None
+    if volume is not None and open_interest is not None and open_interest > 0:
+        vol_oi_ratio = round(volume / open_interest, 2)
+
     p = "%s" if _POSTGRES else "?"
-    plist = ", ".join([p] * 31)
+    plist = ", ".join([p] * 34)
     now = utc_now_str()
 
     sql = f"""
@@ -661,6 +719,7 @@ def save_flow_event_row(
             rvol, rvol_label, is_lotto, is_near_expiry, structure_notes,
             score, score_reasons,
             passed_threshold, passed_dedup, was_published, suppress_reason,
+            volume, open_interest, vol_oi_ratio,
             ingested_at
         ) VALUES ({plist})
         {'RETURNING id' if _POSTGRES else ''}
@@ -678,7 +737,9 @@ def save_flow_event_row(
         json.dumps(structure_notes),
         score, json.dumps(score_reasons or []),
         bool_val(passed_threshold), bool_val(passed_dedup), bool_val(was_published),
-        suppress_reason, now,
+        suppress_reason,
+        volume, open_interest, vol_oi_ratio,
+        now,
     )
 
     with db_cursor() as (conn, cur):
@@ -935,6 +996,75 @@ def get_flow_events_in_range(start_date: str, end_date: str) -> list[dict]:
             ORDER BY ingested_at ASC
         """
         params = (start_date, end_date)
+
+    with db_cursor() as (conn, cur):
+        cur.execute(sql, params)
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_flow_events_for_day(date_str: str | None = None) -> list[dict]:
+    """
+    NEW — data source for the daily flow summary job ("Today's Flow at a
+    Glance"), posted standalone at 4:35pm ET (right after the existing
+    4:30pm heatmap job).
+
+    Returns all PUBLISHED flow_events (was_published=True) for a single
+    calendar day, in the local server date sense matching now_sql()'s
+    "today" — same convention already used by get_same_day_published_premium().
+    Unpublished/skipped alerts are deliberately excluded — the summary
+    should reflect what subscribers actually saw, not the full pre-filter
+    funnel (that's a separate concern from get_outcome_stats()).
+
+    Args:
+        date_str: ISO date string "YYYY-MM-DD". If None, uses today
+            (server's current date, same convention as the rest of this
+            module — NOW()/date('now')).
+    """
+    p = "%s" if _POSTGRES else "?"
+
+    if _POSTGRES:
+        if date_str:
+            sql = f"""
+                SELECT ticker, contract, sentiment, score, flow_type,
+                       volume, open_interest, vol_oi_ratio, ingested_at
+                FROM flow_events
+                WHERE was_published = TRUE
+                  AND ingested_at >= {p}::date
+                  AND ingested_at < ({p}::date + INTERVAL '1 day')
+                ORDER BY ingested_at ASC
+            """
+            params = (date_str, date_str)
+        else:
+            sql = """
+                SELECT ticker, contract, sentiment, score, flow_type,
+                       volume, open_interest, vol_oi_ratio, ingested_at
+                FROM flow_events
+                WHERE was_published = TRUE
+                  AND ingested_at >= date_trunc('day', NOW())
+                ORDER BY ingested_at ASC
+            """
+            params = ()
+    else:
+        if date_str:
+            sql = f"""
+                SELECT ticker, contract, sentiment, score, flow_type,
+                       volume, open_interest, vol_oi_ratio, ingested_at
+                FROM flow_events
+                WHERE was_published = 1
+                  AND date(ingested_at) = date({p})
+                ORDER BY ingested_at ASC
+            """
+            params = (date_str,)
+        else:
+            sql = """
+                SELECT ticker, contract, sentiment, score, flow_type,
+                       volume, open_interest, vol_oi_ratio, ingested_at
+                FROM flow_events
+                WHERE was_published = 1
+                  AND date(ingested_at) = date('now')
+                ORDER BY ingested_at ASC
+            """
+            params = ()
 
     with db_cursor() as (conn, cur):
         cur.execute(sql, params)

@@ -19,9 +19,11 @@ from flow_heatmap import heatmap_job
 from enrichment import enrich_alert, enrichment_summary, compute_levels
 from classifier import classify_alert
 from formatter import format_alert, format_plain_text
+from daily_flow_summary import build_daily_flow_summary, post_daily_flow_summary
 from db import (
     init_all_tables,
     add_premium_column_migration,
+    add_vol_oi_columns_migration,
     alert_hash_exists_in_window,
     get_same_day_published_premium,
     save_published_alert,
@@ -314,6 +316,7 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25):
                     catalyst=alert.catalyst, levels=alert.levels, note=alert.note,
                     enrichment=enrichment, score=final_score, score_reasons=score_reasons,
                     passed_threshold=True, passed_dedup=True, was_published=True,
+                    volume=alert.volume, open_interest=alert.open_interest,
                 )
                 save_classification_row(event_id, alert_hash, classification)
                 try:
@@ -424,6 +427,49 @@ async def weekly_recap_job():
         logger.warning("weekly_recap_post_failed reason=non_2xx_response")
 
 
+async def daily_flow_summary_job():
+    """
+    "Today's Flow at a Glance" — standalone end-of-day recap, posted at
+    4:35pm ET (right after the existing 4:30pm heatmap job). Synthesizes
+    the day's published alerts into same-ticker clustering, genuine
+    Vol/OI outliers, and the day's highest-conviction calls. See
+    daily_flow_summary.py for the full design rationale.
+
+    Skips posting entirely on a zero-alert day (e.g. market holiday) —
+    build_daily_flow_summary() returns message=None in that case, and
+    there's nothing useful to tell subscribers.
+    """
+    if not DISCORD_WEBHOOK_URL:
+        logger.warning("daily_flow_summary_skipped reason=DISCORD_WEBHOOK_URL_missing")
+        return
+
+    try:
+        result = build_daily_flow_summary()
+    except Exception as e:
+        logger.exception("daily_flow_summary_build_failed error=%s", str(e))
+        return
+
+    logger.info(
+        "daily_flow_summary_built date=%s total=%d bullish=%d bearish=%d",
+        result["date_str"], result["total_alerts"], result["bullish_count"], result["bearish_count"],
+    )
+
+    if result["message"] is None:
+        logger.info("daily_flow_summary_skipped reason=no_alerts_today")
+        return
+
+    try:
+        posted = await post_daily_flow_summary(DISCORD_WEBHOOK_URL, result["message"])
+    except Exception as e:
+        logger.exception("daily_flow_summary_post_failed error=%s", str(e))
+        return
+
+    if posted:
+        logger.info("daily_flow_summary_posted ok")
+    else:
+        logger.warning("daily_flow_summary_post_failed reason=non_2xx_response")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global jarvis_semaphore
@@ -431,6 +477,7 @@ async def lifespan(app: FastAPI):
 
     init_all_tables()
     add_premium_column_migration()
+    add_vol_oi_columns_migration()
     backend = "PostgreSQL" if is_postgres() else "SQLite"
     logger.info("db_backend=%s", backend)
 
@@ -450,6 +497,11 @@ async def lifespan(app: FastAPI):
             day_of_week="mon-fri", hour=16, minute=30, timezone="America/New_York",
             id="flow_heatmap", replace_existing=True, max_instances=1
         )
+        scheduler.add_job(
+            daily_flow_summary_job, "cron",
+            day_of_week="mon-fri", hour=16, minute=35, timezone="America/New_York",
+            id="daily_flow_summary", replace_existing=True, max_instances=1
+        )
         scheduler.start()
         logger.info(
             "scheduler_started watchlist=%d interval=%s dedupe_window=%s concurrency=%s dedupe_premium_multiplier=%s",
@@ -457,6 +509,7 @@ async def lifespan(app: FastAPI):
         )
         logger.info("weekly_recap_job_registered fri_16:30_ET finnhub_configured=%s", bool(FINNHUB_API_KEY))
         logger.info("heatmap_job_registered mon-fri_16:30_ET webhook_configured=%s", bool(HEATMAP_WEBHOOK_URL))
+        logger.info("daily_flow_summary_job_registered mon-fri_16:35_ET")
     else:
         logger.info("scheduler_disabled")
 
