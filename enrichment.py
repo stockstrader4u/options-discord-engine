@@ -385,22 +385,41 @@ def enrich_alert(alert: FlowAlert, alert_hash: str | None = None) -> FlowEnrichm
     )
 
 
-def compute_levels(ticker: str, sentiment: str) -> str | None:
+def compute_levels(ticker: str, sentiment: str, spot: float | None = None) -> str | None:
     """
     Direction-aware target/stop levels derived from Bollinger and Keltner
     bands on the most recent daily candle — reuses the same candle fetch
     built for RVOL (_fetch_latest_candle), no separate API call needed.
 
-    Bullish: targets above spot (Keltner Top, Bollinger Mid, Bollinger
-    Top, ascending), stop below (Keltner Bottom).
-    Bearish: mirrored — targets below spot (Keltner Bottom, Bollinger
-    Mid, Bollinger Bottom, descending), stop above (Keltner Top).
+    Bullish: targets above spot (nearest first), stop below.
+    Bearish: targets below spot (nearest first), stop above.
+
+    BUGFIX (2026-06-24): the original version sorted the three band
+    values [keltner, bollinger-mid, bollinger-outer] purely by numeric
+    magnitude, assuming they'd always land in a fixed order relative to
+    spot (e.g. for bearish: kelt_bot < boll_mid < boll_bot). That
+    assumption is false — Keltner bands are ATR-based and Bollinger bands
+    are std-dev-based, so depending on current volatility either one can
+    end up on the WRONG side of spot entirely (e.g. kelt_bot landing
+    above spot on a bearish setup, which happened in production for
+    CRWV: a "target" of $107.96 was published above the $99.96 spot on a
+    bearish put play). Fixed by requiring spot as an explicit input and
+    filtering each candidate band against spot BEFORE sorting — only
+    bands genuinely on the correct side of spot for the given direction
+    are kept as targets. If filtering leaves zero valid targets (the
+    bands are all on the wrong side — rare, but possible in unusual
+    volatility regimes), this returns None rather than publish a partial
+    or misleading level line.
 
     Returns a formatted string, or None if candle data isn't available
-    for this ticker (e.g. SPY/QQQ — confirmed no candle coverage) or
-    sentiment is neutral (no clear direction to anchor levels against).
+    for this ticker (e.g. SPY/QQQ — confirmed no candle coverage), spot
+    isn't available, sentiment is neutral, or no valid targets survive
+    the spot-side filter.
     """
     if sentiment not in ("bullish", "bearish"):
+        return None
+
+    if spot is None:
         return None
 
     candle = _fetch_latest_candle(ticker)
@@ -418,10 +437,19 @@ def compute_levels(ticker: str, sentiment: str) -> str | None:
 
     if sentiment == "bullish":
         stop = kelt_bot
-        targets = sorted([kelt_top, boll_mid, boll_top])
+        candidates = [kelt_top, boll_mid, boll_top]
+        # Only keep bands genuinely above spot — a band can land below
+        # spot depending on current volatility, and must not be placed
+        # into a target slot if so.
+        targets = sorted(t for t in candidates if t > spot)
     else:  # bearish
         stop = kelt_top
-        targets = sorted([kelt_bot, boll_mid, boll_bot], reverse=True)
+        candidates = [kelt_bot, boll_mid, boll_bot]
+        # Only keep bands genuinely below spot, nearest-first.
+        targets = sorted((t for t in candidates if t < spot), reverse=True)
+
+    if not targets:
+        return None
 
     target_str = " / ".join(f"${t:,.2f}" for t in targets)
     return f"🛑 ${stop:,.2f} stop · 🎯 {target_str}"

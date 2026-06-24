@@ -271,7 +271,16 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25):
             # deliberately never mutates FlowAlert) so the mutation is
             # explicit at the call site. Set before classification/
             # scoring/formatting so all three see the real levels.
-            alert.levels = compute_levels(alert.ticker, alert.sentiment)
+            #
+            # BUGFIX (2026-06-24): now passes alert.spot_price through so
+            # compute_levels() can filter candidate band levels against
+            # the real spot price before assigning them to target slots.
+            # Previously this only sorted the raw band values by
+            # magnitude, which could place a band on the wrong side of
+            # spot into a target slot (confirmed in production on CRWV:
+            # a bearish alert published a "target" above spot). See
+            # enrichment.py for the full fix writeup.
+            alert.levels = compute_levels(alert.ticker, alert.sentiment, alert.spot_price)
             classification = classify_alert(alert, enrichment)
             final_score, score_reasons = auto_score_alert(alert)
             high_conviction = is_high_conviction(item)
@@ -498,8 +507,12 @@ async def jarvis_preview(ticker: str = "SPY"):
         # real RVOL and Bollinger/Keltner levels fixes against live
         # JarvisFlow data without posting to Discord. Safe to remove
         # once confirmed working — read-only, no side effects.
+        #
+        # BUGFIX (2026-06-24): passes alert.spot_price through, same as
+        # the live posting path in process_jarvis_ticker — see that
+        # function's comment and enrichment.py for the full writeup.
         enrichment = enrich_alert(alert)
-        alert.levels = compute_levels(alert.ticker, alert.sentiment)
+        alert.levels = compute_levels(alert.ticker, alert.sentiment, alert.spot_price)
         return {
             "ok": True, "ticker": ticker,
             "raw_item": flow_items[0], "mapped_alert": alert.model_dump(),
