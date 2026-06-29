@@ -56,13 +56,13 @@ WATCHLIST = {
     "DDOG","MDB","ANET","TWLO","CRM","UBER","NFLX","NVDA","AAPL","TSLA",
     "AMZN","ZS","NOW","CRWD","BABA","QCOM","AMD","BA","CELH","DKNG",
     "PLTR","LULU","COIN","MRNA","SNOW","AFRM","MSFT","ABNB","MRVL","QQQ",
-    "RBLX","SOFI","META","TSM","MU","GOOGL","RIVN","JNJ","SPY","INTC",
+    "RBLX","SOFI","META","TSM","GOOGL","RIVN","JNJ","SPY","INTC",
     "MARA","CVNA","ENPH","FDX","SMCI","ARM","LRCX","PANW","BIDU","PDD",
     "FUTU","MSTR","ORCL","HOOD","DELL","RDDT","HIMS","AVGO","GTLB","CLSK",
     "IBM","LLY","RGTI","QUBT","TEM","OKLO","NNE","RKLB","NBIS","CEG",
     "IONQ","QBTS","APP","CRWV","GME","UNH","CRCL","FSLR","SMR","OSCR",
     "ACHR","ASTS","BMNR","FIG","GLXY","IREN","UUUU","POET","CIFR","BE",
-    "EOSE","ONDS","CRML","MP","SNDK","PATH","JPM","ZM","AXTI","USO","AAOI","SPCX",
+    "EOSE","ONDS","CRML","MP","PATH","JPM","ZM","AXTI","USO","AAOI","SPCX",
 }
 
 # Semaphore limits concurrent JarvisFlow requests so we don't get rate-limited
