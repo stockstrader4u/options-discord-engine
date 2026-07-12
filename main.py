@@ -489,25 +489,28 @@ async def lifespan(app: FastAPI):
         )
         scheduler.add_job(
             weekly_recap_job, "cron",
-            day_of_week="fri", hour=16, minute=30, timezone="America/New_York",
-            id="weekly_recap", replace_existing=True, max_instances=1
+            day_of_week="fri", hour=16, minute=32, timezone="America/New_York",
+            id="weekly_recap", replace_existing=True, max_instances=1,
+            misfire_grace_time=300,
         )
         scheduler.add_job(
             heatmap_job, "cron",
             day_of_week="mon-fri", hour=16, minute=30, timezone="America/New_York",
-            id="flow_heatmap", replace_existing=True, max_instances=1
+            id="flow_heatmap", replace_existing=True, max_instances=1,
+            misfire_grace_time=300,
         )
         scheduler.add_job(
             daily_flow_summary_job, "cron",
             day_of_week="mon-fri", hour=16, minute=35, timezone="America/New_York",
-            id="daily_flow_summary", replace_existing=True, max_instances=1
+            id="daily_flow_summary", replace_existing=True, max_instances=1,
+            misfire_grace_time=300,
         )
         scheduler.start()
         logger.info(
             "scheduler_started watchlist=%d interval=%s dedupe_window=%s concurrency=%s dedupe_premium_multiplier=%s",
             len(WATCHLIST), POLL_INTERVAL_SECONDS, DEDUPE_WINDOW_MINUTES, JARVIS_CONCURRENCY, DEDUPE_PREMIUM_MULTIPLIER,
         )
-        logger.info("weekly_recap_job_registered fri_16:30_ET finnhub_configured=%s", bool(FINNHUB_API_KEY))
+        logger.info("weekly_recap_job_registered fri_16:32_ET finnhub_configured=%s", bool(FINNHUB_API_KEY))
         logger.info("heatmap_job_registered mon-fri_16:30_ET webhook_configured=%s", bool(HEATMAP_WEBHOOK_URL))
         logger.info("daily_flow_summary_job_registered mon-fri_16:35_ET")
     else:
