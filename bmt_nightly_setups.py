@@ -68,24 +68,21 @@ TOP_N       = 5
 
 # ── Universe (BMT's real MASTER SCAN watchlist) ────────────────────────────
 FULL_WATCHLIST = [
-    "TDOC","DDOG","DOCU","MDB","ANET","TWLO","ETSY","CRM","UBER","ROKU",
-    "NFLX","NVDA","OKTA","SBUX","FTNT","SHOP","AAPL","Z","TSLA","MA",
-    "AMZN","ZS","DIS","SE","NOW","CRWD","SNAP","BABA","UPST","QRVO",
-    "QCOM","AMD","BA","PINS","CELH","DKNG","PLTR","CHWY","LULU","COIN",
-    "MRNA","SNOW","AFRM","MSFT","ABNB","ADSK","MRVL","IWM","QQQ","UVXY",
-    "RBLX","SOFI","SQQQ","TQQQ","SPOT","META","WMT","TGT","HD","TSM",
-    "AI","MU","NET","U","GOOGL","RIVN","JNJ","SPY","INTC","MARA",
-    "RIOT","XOM","OXY","CVX","NUGT","CVNA","ENPH","FDX","SMCI","ARM",
-    "LRCX","PANW","BIDU","JD","NIO","LI","XPEV","PDD","FUTU","BILI",
-    "MSTR","ORCL","HOOD","CMG","DJT","UPS","DELL","LMT","CAT","CAVA",
-    "RDDT","CART","DASH","HIMS","NVDL","AVGO","ADBE","MMM","NKE","GS",
-    "RTX","GTLB","CLSK","IBM","TEAM","LLY","RGTI","QUBT","IBIT","TEM",
-    "VST","UAL","OKLO","NNE","RKLB","NBIS","CEG","IONQ","XYZ","PYPL",
+    "DDOG","MDB","ANET","TWLO","ETSY","CRM","UBER","NFLX","NVDA","OKTA",
+    "FTNT","SHOP","AAPL","TSLA","AMZN","ZS","DIS","SE","NOW","CRWD","SNAP",
+    "BABA","UPST","QCOM","AMD","BA","PINS","CELH","DKNG","PLTR","COIN",
+    "MRNA","SNOW","AFRM","MSFT","MRVL","IWM","QQQ","RBLX","SOFI","SPOT",
+    "META","WMT","TGT","HD","TSM","MU","NET","U","GOOGL","RIVN","JNJ","SPY",
+    "INTC","MARA","RIOT","XOM","OXY","CVX","CVNA","ENPH","FDX","SMCI","ARM",
+    "LRCX","PANW","BIDU","JD","PDD","FUTU","MSTR","ORCL","HOOD","CMG",
+    "UPS","DELL","LMT","CAT","CAVA","RDDT","CART","DASH","HIMS","AVGO",
+    "ADBE","MMM","NKE","GS","RTX","GTLB","CLSK","IBM","TEAM","LLY","RGTI",
+    "QUBT","TEM","VST","UAL","OKLO","NNE","RKLB","NBIS","CEG","IONQ","XYZ","PYPL",
     "QBTS","APP","CRWV","GME","UNH","CRCL","FSLR","SMR","OSCR","ACHR",
     "ASTS","BMNR","FIG","GLXY","SBET","VKTX","IREN","UUUU","BLSH","SNPS",
     "FLY","POET","CIFR","BE","EOSE","ONDS","CRML","MP","SNDK","PATH",
-    "LMND","JPM","ZM","AMAT","SLV","RKT","NVO","DUOL","AXTI","USO",
-    "FIGR","RBRK","ALAB","CAR","QS","CSCO","AAOI","SPCX","AEHR","SKHY",
+    "LMND","JPM","ZM","AMAT","NVO","AXTI","FIGR","RBRK","ALAB","CAR",
+    "QS","CSCO","AAOI","SPCX","AEHR","SKHY",
 ]
 
 # ETFs, leveraged products, and non-equity symbols — excluded from the
