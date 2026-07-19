@@ -13,3 +13,4 @@ requests
 
 # Phase 1: MCP server layer
 fastmcp==2.2.10
+yfinance
