@@ -4,6 +4,8 @@ bmt_nightly_setups.py — Nightly top-5 trade-ideas digest.
 Reuses ONLY proven, already-working pieces from the BMT stack:
   - JarvisFlow options flow: same call_jarvis() pattern as er_lotto_scanner.py
   - Daily OHLC: same yfinance pattern as get_historical_er_move()/get_options_skew()
+  - Earnings calendar: same Finnhub /calendar/earnings forward-window shape
+    already proven in er_lotto_scanner.py's get_earnings_calendar()
   - Ranking/reasoning: Grok via OpenRouter, same model already running the
     ER lotto pipeline — no new model to validate
   - Card image: matplotlib dark theme, same family as the ER lotto recap card
@@ -11,9 +13,11 @@ Reuses ONLY proven, already-working pieces from the BMT stack:
 
 No new data sources, no new AI models, no new validation needed.
 
-UNIVERSE: BMT's MASTER SCAN watchlist, with ETFs/leveraged products/crypto
-pairs excluded from the tradeable candidate pool (kept only for the
-SPY/QQQ/IWM market-context strip, matching BMT's own manual prompt rule).
+UNIVERSE (SYNCED 2026-07-21): BMT's single MASTER SCAN watchlist — the
+same 167-ticker curated list now used by er_lotto_scanner.py, so both
+products scan one list instead of drifting apart. ETFs/leveraged
+products/crypto pairs are excluded from the tradeable candidate pool
+(SPY/QQQ/IWM are fetched separately for the market-context strip only).
 
 FLOW NOTE: uses the SAME aggregate bullish/bearish flow summary already
 proven in er_lotto_scanner.py's get_flow_for_ticker() — NOT individual
@@ -30,8 +34,9 @@ needing a hardcoded date.
 Run locally:
     C:\\Python314\\python.exe bmt_nightly_setups.py
 
-Requires: JARVIS_API_KEY, OPENROUTER_API_KEY, DISCORD_WEBHOOK (set to the
-TEST webhook for this run) in your environment.
+Requires: JARVIS_API_KEY, OPENROUTER_API_KEY, FINNHUB_API_KEY,
+NIGHTLY_SETUPS_DISCORD_WEBHOOK (set to the TEST webhook for this run)
+in your environment.
 """
 
 import os
@@ -52,6 +57,11 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # ── Config ────────────────────────────────────────────────────────────────
 JARVIS_API_KEY     = os.environ["JARVIS_API_KEY"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+# NEW (2026-07-21): needed for the upcoming-earnings exclusion filter —
+# same Finnhub forward-window calendar shape already proven working in
+# er_lotto_scanner.py. Must be added to the bmt-trade-ideas Railway
+# service's Variables before deploying this version.
+FINNHUB_API_KEY    = os.environ["FINNHUB_API_KEY"]
 # NAMED DELIBERATELY (not "DISCORD_WEBHOOK") — if this script is deployed
 # into a Railway service/repo that already runs other Discord-posting
 # jobs (e.g. options-discord-engine's own flow alerts), a generically-
@@ -60,34 +70,47 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 DISCORD_WEBHOOK    = os.environ["NIGHTLY_SETUPS_DISCORD_WEBHOOK"]
 JARVIS_MCP_URL      = "https://api.jarvisflow.io/.well-known/mcp"
 OPENROUTER_BASE    = "https://openrouter.ai/api/v1"
+FINNHUB_BASE       = "https://finnhub.io/api/v1"
 ET                 = ZoneInfo("America/New_York")
 HEADERS            = {"User-Agent": "Mozilla/5.0"}
 
 MIN_PREMIUM = 50_000   # matches BMT's manual "min $50K premium" filter
 TOP_N       = 5
 
-# ── Universe (BMT's real MASTER SCAN watchlist) ────────────────────────────
+# ── Universe (SYNCED 2026-07-21 to the single BMT MASTER SCAN list) ────────
+# This is now the SAME 167-ticker curated list deployed to
+# er_lotto_scanner.py on 2026-07-21 — one master list for both products,
+# no more drift. Changes vs the old copy of this list: added TDOC, ROKU,
+# Z, MA, CHWY, XPEV, IBIT, SPOT-adjacent adds, plus the big_mover_screen-
+# validated FISV / AKAM / LUV / PYPL; dropped CRML and MP (removed from
+# the master list); SPY/QQQ/IWM removed from the list itself since they
+# are fetched separately for the market-context strip and were never
+# tradeable candidates anyway.
 FULL_WATCHLIST = [
-    "DDOG","MDB","ANET","TWLO","ETSY","CRM","UBER","NFLX","NVDA","OKTA",
-    "FTNT","SHOP","AAPL","TSLA","AMZN","ZS","DIS","SE","NOW","CRWD","SNAP",
-    "BABA","UPST","QCOM","AMD","BA","PINS","CELH","DKNG","PLTR","COIN",
-    "MRNA","SNOW","AFRM","MSFT","MRVL","IWM","QQQ","RBLX","SOFI","SPOT",
-    "META","WMT","TGT","HD","TSM","MU","NET","U","GOOGL","RIVN","JNJ","SPY",
-    "INTC","MARA","RIOT","XOM","OXY","CVX","CVNA","ENPH","FDX","SMCI","ARM",
-    "LRCX","PANW","BIDU","JD","PDD","FUTU","MSTR","ORCL","HOOD","CMG",
-    "UPS","DELL","LMT","CAT","CAVA","RDDT","CART","DASH","HIMS","AVGO",
-    "ADBE","MMM","NKE","GS","RTX","GTLB","CLSK","IBM","TEAM","LLY","RGTI",
-    "QUBT","TEM","VST","UAL","OKLO","NNE","RKLB","NBIS","CEG","IONQ","XYZ","PYPL",
-    "QBTS","APP","CRWV","GME","UNH","CRCL","FSLR","SMR","OSCR","ACHR",
-    "ASTS","BMNR","FIG","GLXY","SBET","VKTX","IREN","UUUU","BLSH","SNPS",
-    "FLY","POET","CIFR","BE","EOSE","ONDS","CRML","MP","SNDK","PATH",
-    "LMND","JPM","ZM","AMAT","NVO","AXTI","FIGR","RBRK","ALAB","CAR",
-    "QS","CSCO","AAOI","SPCX","AEHR","SKHY",
+    "TDOC","DDOG","DOCU","MDB","ANET","TWLO","ETSY","CRM","UBER","ROKU",
+    "NFLX","NVDA","OKTA","SBUX","FTNT","SHOP","AAPL","Z","TSLA","MA",
+    "AMZN","ZS","DIS","SE","NOW","CRWD","SNAP","BABA","UPST","QRVO",
+    "QCOM","AMD","BA","PINS","CELH","DKNG","PLTR","CHWY","LULU","COIN",
+    "MRNA","SNOW","AFRM","MSFT","ABNB","ADSK","MRVL","RBLX","SOFI","SPOT",
+    "META","WMT","TGT","HD","TSM","AI","MU","NET","U","GOOGL",
+    "RIVN","JNJ","INTC","MARA","RIOT","XOM","OXY","CVX","CVNA","ENPH",
+    "FDX","SMCI","ARM","LRCX","PANW","BIDU","JD","XPEV","PDD","FUTU",
+    "MSTR","ORCL","HOOD","CMG","UPS","DELL","LMT","CAT","CAVA","RDDT",
+    "CART","DASH","HIMS","AVGO","ADBE","MMM","NKE","GS","RTX","GTLB",
+    "CLSK","IBM","TEAM","LLY","RGTI","QUBT","IBIT","TEM","VST","UAL",
+    "OKLO","NNE","RKLB","NBIS","CEG","IONQ","XYZ","PYPL","QBTS","APP",
+    "CRWV","GME","UNH","CRCL","FSLR","SMR","OSCR","ACHR","ASTS","BMNR",
+    "FIG","GLXY","SBET","VKTX","IREN","UUUU","BLSH","SNPS","FLY","POET",
+    "CIFR","BE","EOSE","ONDS","SNDK","PATH","LMND","JPM","ZM","AMAT",
+    "RKT","NVO","DUOL","AXTI","FIGR","RBRK","ALAB","CAR","QS","CSCO",
+    "AAOI","SPCX","AEHR","SKHY","AKAM","FISV","LUV",
 ]
 
 # ETFs, leveraged products, and non-equity symbols — excluded from the
 # tradeable candidate pool per BMT's own manual prompt rule. SPY/QQQ/IWM
-# are kept, but ONLY for the market-context strip, not as candidates.
+# are fetched separately for the market-context strip; IBIT is on the
+# master list (it reports nothing and trends like BTC) but is an ETF and
+# therefore stays out of the single-name setup pool.
 EXCLUDE_FROM_CANDIDATES = {
     "IWM", "QQQ", "SPY", "UVXY", "SQQQ", "TQQQ", "NUGT", "SLV", "USO",
     "IBIT", "NVDL", "OKEX:ETHUSD", "COINBASE:^BTCUSD",
@@ -95,6 +118,113 @@ EXCLUDE_FROM_CANDIDATES = {
 MARKET_CONTEXT_TICKERS = ["SPY", "QQQ", "IWM"]
 
 CANDIDATE_UNIVERSE = [t for t in FULL_WATCHLIST if t not in EXCLUDE_FROM_CANDIDATES]
+
+
+# ── Upcoming-earnings exclusion (NEW 2026-07-21) ───────────────────────────
+# GAP FIX: this digest previously had zero earnings-date awareness. During
+# earnings season that's dangerous — a "clean lower highs" chart on a
+# ticker reporting within the trade's expiry window is a fundamentally
+# different trade: the structure gets vaporized by the print, the stop is
+# meaningless through a gap, and IV crush hits the option even when the
+# direction is right. Earnings plays are the ER lotto product's job, not
+# this digest's. Any candidate whose confirmed upcoming earnings date
+# falls ON OR BEFORE its suggested expiry is excluded outright (and named
+# in the rejected list so Grok's risk notes can reference it).
+#
+# PRIMARY SOURCE — yfinance get_earnings_dates() per ticker (see the
+# full dead-end history in get_upcoming_earnings_date()'s docstring:
+# Finnhub's calendar is capped at 1,500 rows on the free tier, and
+# Yahoo's chart-meta earningsTimestamp fields are confirmed empty).
+#
+# PLACEMENT — the check runs AFTER ranking, walking the ranked list
+# top-down and skipping blocked tickers until TOP_N clean setups are
+# found. Rationale: get_earnings_dates() is the same endpoint that
+# triggered a real YFRateLimitError during big_mover_screen.py's heavy
+# usage, so checking all ~100-130 flow-qualifiers per night (on top of
+# the OHLC pulls already hitting Yahoo) invites rate limiting. Checking
+# in rank order needs only ~5-10 calls per night and produces the
+# identical outcome — an excluded ticker simply lets the next-ranked
+# one slide in, and still gets named in the rejected list.
+#
+# SECONDARY NET — the Finnhub forward-window map is still loaded and
+# consulted (its confirmed-working shape: short forward window, no
+# symbol filter). If EITHER source reports an earnings date on or before
+# expiry, the candidate is excluded. A ticker absent from both sources
+# is treated as "no earnings in window."
+#
+# FAIL-OPEN BY DESIGN, LOUDLY: if a source fails, the run proceeds with
+# whatever earnings data IS available (with loud warnings) rather than
+# skipping the whole digest — a weakened safety net for one night is
+# preferable to silently never posting.
+EARNINGS_LOOKAHEAD_DAYS = 14  # comfortably covers any weekly-expiry window
+
+def get_upcoming_earnings_map() -> dict:
+    """Returns {ticker: 'YYYY-MM-DD' earliest upcoming earnings date} for
+    the next EARNINGS_LOOKAHEAD_DAYS, or {} on total failure (logged)."""
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    end = (datetime.now(ET) + timedelta(days=EARNINGS_LOOKAHEAD_DAYS)).strftime("%Y-%m-%d")
+    for attempt in range(3):
+        try:
+            resp = requests.get(
+                f"{FINNHUB_BASE}/calendar/earnings",
+                params={"from": today, "to": end, "token": FINNHUB_API_KEY},
+                timeout=20,
+            )
+            calendar = resp.json().get("earningsCalendar", [])
+            er_map = {}
+            for e in calendar:
+                sym = e.get("symbol", "").upper()
+                d = e.get("date", "")
+                if not sym or not d:
+                    continue
+                if sym not in er_map or d < er_map[sym]:
+                    er_map[sym] = d
+            print(f"  [ER FILTER] Loaded {len(er_map)} upcoming earnings dates "
+                  f"({today} to {end})")
+            return er_map
+        except Exception as e:
+            print(f"  [ER FILTER WARN] Finnhub calendar attempt {attempt+1}: {e}")
+    print("  [ER FILTER WARN] Could not load Finnhub earnings calendar after 3 attempts — "
+          "falling back to Yahoo per-ticker checks only for tonight's run.")
+    return {}
+
+
+def get_upcoming_earnings_date(ticker: str) -> str:
+    """
+    PRIMARY earnings-date source (REVISED 2026-07-21, same night, after
+    TWO confirmed-dead cheap sources — see comment block above):
+      1. Finnhub forward calendar: capped at 1,500 rows on the free
+         tier, silently missing TSLA/GOOGL/IBM/INTC/NOW/CRM/MMM during
+         a peak-season window (confirmed via live diagnostic query).
+      2. Yahoo chart-meta earningsTimestamp fields: confirmed live to
+         be None across the board (TSLA/GOOGL/IBM/MMM/AAPL all empty) —
+         consistent with the same morning's ER lotto run needing the
+         Grok fallback for every single date verification.
+    FINAL: yfinance's get_earnings_dates() — the SAME function already
+    extensively validated in production for get_historical_er_move()'s
+    fix, which returns FUTURE scheduled dates in the same dataframe as
+    past ones. Confirmed live before adopting: TSLA/GOOGL/IBM all
+    correctly showed 2026-07-22, BE/CAR showed 2026-07-28. Requires
+    lxml (added to this repo's requirements.txt — it was previously
+    only in -bmt-market-mcp's, per the different-repos-different-
+    packages convention).
+    Returns the EARLIEST future 'YYYY-MM-DD' date, or None.
+    """
+    try:
+        import yfinance as yf
+        edf = yf.Ticker(ticker).get_earnings_dates(limit=8)
+        if edf is None or edf.empty:
+            return None
+        now = datetime.now(ET).replace(tzinfo=None)
+        future = sorted(
+            idx.strftime("%Y-%m-%d") for idx in edf.index
+            if idx.replace(tzinfo=None) > now
+        )
+        return future[0] if future else None
+    except Exception as e:
+        print(f"  [ER FILTER WARN] {ticker}: yfinance earnings-date check failed "
+              f"({type(e).__name__}: {e}) — relying on Finnhub map alone for this ticker")
+        return None
 
 
 # ── JarvisFlow (EXACT same pattern as er_lotto_scanner.py) ─────────────────
@@ -160,9 +290,10 @@ def get_flow_for_ticker(ticker: str) -> dict:
 
 # ── Daily OHLC (same yfinance pattern proven elsewhere in the stack) ───────
 def get_daily_ohlc(ticker: str, sessions: int = 15) -> list:
-    """Returns structured daily bars: [{date, open, high, low, close}, ...]
-    oldest-to-newest. Needed for deterministic swing high/low calculation,
-    not just the formatted text summary."""
+    """Returns structured daily bars: [{date, open, high, low, close,
+    volume}, ...] oldest-to-newest. Needed for deterministic swing
+    high/low calculation, not just the formatted text summary. Volume
+    added 2026-07-21 for the flow-intensity ranking (see main())."""
     try:
         import yfinance as yf
         stock = yf.Ticker(ticker)
@@ -172,12 +303,24 @@ def get_daily_ohlc(ticker: str, sessions: int = 15) -> list:
         hist = hist.tail(sessions)
         return [
             {"date": date, "open": row["Open"], "high": row["High"],
-             "low": row["Low"], "close": row["Close"]}
+             "low": row["Low"], "close": row["Close"],
+             "volume": row.get("Volume", 0) or 0}
             for date, row in hist.iterrows()
         ]
     except Exception as e:
         print(f"  [OHLC WARN] {ticker}: {e}")
         return []
+
+
+def compute_avg_dollar_volume(bars: list) -> float:
+    """Average daily dollar volume (close x share volume) across the
+    supplied bars. Used to normalize flow premium into a size-relative
+    'intensity' — computed entirely from bars already fetched, zero
+    extra network calls."""
+    vals = [b["close"] * b["volume"] for b in bars if b.get("close") and b.get("volume")]
+    if not vals:
+        return 0.0
+    return sum(vals) / len(vals)
 
 
 def format_ohlc_summary(bars: list) -> str:
@@ -220,15 +363,15 @@ def compute_trade_levels(direction: str, bars: list, current_price: float) -> di
     """
     Entry: tight range around current price.
     Stop: just beyond the real recent swing low (calls) / swing high
-    (puts) — deliberately a SHORT lookback (last 3 sessions, not 5+),
-    since including the origin of a multi-day move produces unrealistic
-    stops for a short-DTE options play. Confirmed via testing: a 5-
-    session lookback on a real AMD breakdown (peak $548 four days back,
-    current $495.76) produced a 55-point/~11% stop distance — nothing
-    like the 2-4.5% stop distances seen on BMT's real sample cards
-    (BE: entry $214.50/stop $224 = 4.4%, SNOW: $268.80/$275 = 2.3%,
-    DDOG: $258.60/$265 = 2.5%). A 3-session window captures the most
-    recent, structurally relevant swing point instead of a stale origin.
+    (puts) — deliberately a SHORT lookback (the last 2 sessions), since
+    including the origin of a multi-day move produces unrealistic stops
+    for a short-DTE options play. Confirmed via testing: a 5-session
+    lookback on a real AMD breakdown (peak $548 four days back, current
+    $495.76) produced a 55-point/~11% stop distance — nothing like the
+    2-4.5% stop distances seen on BMT's real sample cards (BE: entry
+    $214.50/stop $224 = 4.4%, SNOW: $268.80/$275 = 2.3%, DDOG:
+    $258.60/$265 = 2.5%). A 2-session window captures the most recent,
+    structurally relevant swing point instead of a stale origin.
     Targets: fixed R-multiples (1.5R / 2.5R) off the real entry-to-stop
     risk distance, so R/R is mathematically guaranteed consistent rather
     than something the model has to get right on its own.
@@ -457,20 +600,24 @@ def get_tone_phrase(m: dict) -> str:
     return "Flat, inside day"
 
 
-def get_next_expiry(ticker: str) -> str:
+def get_next_expiry(ticker: str) -> dict:
+    """Returns {"label": "Jul 24", "iso": "2026-07-24"} for the nearest
+    available expiry, or {"label": "N/A", "iso": None}. ISO date added
+    2026-07-21 so the earnings-exclusion filter can compare the real
+    expiry date against a ticker's confirmed upcoming earnings date."""
     try:
         import yfinance as yf
         expirations = yf.Ticker(ticker).options
         if not expirations:
-            return "N/A"
+            return {"label": "N/A", "iso": None}
         today = datetime.now(ET).strftime("%Y-%m-%d")
         for exp in expirations:
             if exp >= today:
                 dt = datetime.strptime(exp, "%Y-%m-%d")
-                return dt.strftime("%b %d")
-        return "N/A"
+                return {"label": dt.strftime("%b %d"), "iso": exp}
+        return {"label": "N/A", "iso": None}
     except Exception:
-        return "N/A"
+        return {"label": "N/A", "iso": None}
 
 
 # ── Grok narrative call (ONE call per night, same model as the ER lotto
@@ -980,6 +1127,11 @@ def main():
 
     print(f"Universe: {len(CANDIDATE_UNIVERSE)} candidate tickers (ETFs/leveraged/crypto excluded)")
 
+    # ── Upcoming-earnings map (NEW 2026-07-21 — see comment at the
+    # get_upcoming_earnings_map() definition for the full rationale) ──
+    print("\nLoading upcoming earnings calendar for the exclusion filter...")
+    earnings_map = get_upcoming_earnings_map()
+
     print("\nPulling market context (SPY/QQQ/IWM)...")
     market_context = {t: get_quote_change(t) for t in MARKET_CONTEXT_TICKERS}
     for t, m in market_context.items():
@@ -1000,29 +1152,29 @@ def main():
 
     print("Pulling daily OHLC + next expiry for qualifying candidates...")
     candidates = []
+    rejected_summary = []
     for q in qualifying:
         bars = get_daily_ohlc(q["ticker"])
         if not bars:
             print(f"  [SKIP] {q['ticker']}: no price history")
             continue
-        next_expiry = get_next_expiry(q["ticker"])
+        expiry = get_next_expiry(q["ticker"])
+        avg_dollar_vol = compute_avg_dollar_volume(bars)
         candidates.append({
             "ticker": q["ticker"], "flow": q["flow"], "bars": bars,
-            "ohlc_text": format_ohlc_summary(bars), "next_expiry": next_expiry,
+            "ohlc_text": format_ohlc_summary(bars),
+            "next_expiry": expiry["label"], "expiry_iso": expiry["iso"],
+            "avg_dollar_vol": avg_dollar_vol,
         })
 
     # ── DETERMINISTIC chart-pattern filter + ranking (NEW 2026-07-18) ──
     # This is the actual fix for the non-determinism confirmed in
     # production: chart-quality accept/reject and ranking now happen
     # entirely in Python via check_chart_pattern() (real swing-point
-    # analysis), BEFORE Grok is ever called. Ranking is by real flow
-    # premium (bigger = more institutional conviction) — simple,
-    # deterministic, and consistent with the $50K premium filter that
-    # already screens the universe. Grok's only remaining job is writing
-    # narrative prose for whatever Python has already selected.
+    # analysis), BEFORE Grok is ever called. Grok's only remaining job is
+    # writing narrative prose for whatever Python has already selected.
     print(f"\nApplying deterministic chart-pattern filter to {len(candidates)} candidate(s)...")
     pattern_matched = []
-    rejected_summary = []
     for c in candidates:
         pattern = check_chart_pattern(c["flow"]["bias"], c["bars"])
         if pattern["clean"]:
@@ -1035,11 +1187,69 @@ def main():
                       if c["flow"]["bias"] != "Neutral" else "neutral flow, no clear direction")
             rejected_summary.append(f"{c['ticker']} ({reason})")
 
-    pattern_matched.sort(key=lambda c: c["flow"]["premium"], reverse=True)
-    selected = pattern_matched[:TOP_N]
+    # ── RANKING BY FLOW INTENSITY (CHANGED 2026-07-21) ─────────────────
+    # Was: rank by raw flow premium. Confirmed bias in production: raw
+    # premium structurally favors the same mega-cap names night after
+    # night (a $9M AVGO flow always outranks a $2M flow on a mid-cap,
+    # even when the mid-cap flow is far more unusual relative to how
+    # that name normally trades). Fixed: rank by flow INTENSITY —
+    # premium normalized by the ticker's own average daily dollar volume
+    # (computed from the same daily bars already fetched, zero extra
+    # network calls). A $2M flow on a name that trades $200M/day (1.0%
+    # intensity) now correctly outranks a $9M flow on a name trading
+    # $9B/day (0.1%). Still 100% deterministic. Raw premium remains the
+    # tiebreaker, and any ticker whose volume data is missing falls back
+    # to intensity 0 with a loud log (never silently mis-ranked).
+    for c in pattern_matched:
+        if c["avg_dollar_vol"] > 0:
+            c["flow_intensity"] = c["flow"]["premium"] / c["avg_dollar_vol"]
+        else:
+            c["flow_intensity"] = 0.0
+            print(f"  [RANK WARN] {c['ticker']}: no volume data — flow intensity set to 0, "
+                  f"will rank below all tickers with real volume data")
+    pattern_matched.sort(key=lambda c: (c["flow_intensity"], c["flow"]["premium"]), reverse=True)
+
+    # ── EARNINGS EXCLUSION, applied in rank order (REVISED 2026-07-21) ─
+    # Walk the ranked list top-down, checking each ticker's upcoming
+    # earnings date (yfinance primary, Finnhub map secondary — see the
+    # source comment block above get_upcoming_earnings_map() for the
+    # full two-dead-sources history). A ticker reporting ON OR BEFORE
+    # its expiry is an earnings play, not a swing setup — the chart
+    # structure won't survive the print and the stop is meaningless
+    # through a gap. Blocked tickers are skipped (and named in the
+    # rejected list) and the next-ranked ticker slides in, until TOP_N
+    # clean setups are selected. Checking in rank order keeps this to
+    # ~5-10 yfinance calls per night instead of ~100+ (that endpoint
+    # has a confirmed real rate limit under heavy same-session use).
+    selected = []
+    for c in pattern_matched:
+        if len(selected) >= TOP_N:
+            break
+        yf_er = get_upcoming_earnings_date(c["ticker"])
+        finnhub_er = earnings_map.get(c["ticker"])
+        er_dates = [d for d in (yf_er, finnhub_er) if d]
+        er_date = min(er_dates) if er_dates else None
+        if er_date:
+            if c.get("expiry_iso"):
+                blocks = er_date <= c["expiry_iso"]
+            else:
+                cutoff = (datetime.now(ET) + timedelta(days=7)).strftime("%Y-%m-%d")
+                blocks = er_date <= cutoff
+            if blocks:
+                src = "yfinance" if er_date == yf_er else "Finnhub"
+                print(f"  [ER EXCLUDE] {c['ticker']}: reports earnings {er_date} (per {src}, "
+                      f"expiry {c.get('expiry_iso') or 'unknown'}) — earnings play, not a swing setup")
+                rejected_summary.append(
+                    f"{c['ticker']} (reports earnings {er_date}, before expiry — excluded as an earnings play)"
+                )
+                continue
+        selected.append(c)
 
     print(f"\n{len(pattern_matched)} of {len(candidates)} passed the deterministic pattern filter; "
-          f"taking top {len(selected)} by flow premium.")
+          f"taking top {len(selected)} by flow intensity (premium / avg daily $ volume).")
+    for c in pattern_matched[:10]:
+        print(f"  [RANK] {c['ticker']}: intensity={c['flow_intensity']*100:.2f}% "
+              f"(${c['flow']['premium']:,.0f} premium / ${c['avg_dollar_vol']:,.0f} avg daily $ vol)")
 
     if not selected:
         print("Nothing passed the deterministic chart-pattern filter tonight — no digest to post.")
@@ -1056,10 +1266,13 @@ def main():
         c["current_price"] = current_price
         c["strike"] = compute_strike(c["direction"], current_price)
         c.update(compute_trade_levels(c["direction"], c["bars"], current_price))
-        try:
-            exp_dt = datetime.strptime(f"{c['next_expiry']} {datetime.now(ET).year}", "%b %d %Y")
-            c["dte"] = max((exp_dt - datetime.now(ET).replace(tzinfo=None)).days, 0)
-        except Exception:
+        if c.get("expiry_iso"):
+            try:
+                exp_dt = datetime.strptime(c["expiry_iso"], "%Y-%m-%d")
+                c["dte"] = max((exp_dt - datetime.now(ET).replace(tzinfo=None)).days, 0)
+            except Exception:
+                c["dte"] = "?"
+        else:
             c["dte"] = "?"
     selected = [c for c in selected if "strike" in c]
 
@@ -1080,9 +1293,10 @@ def main():
 
     print(f"\n=== MARKET THEME ===\n{market_theme}\n")
     print(f"=== RISK NOTES ===\n{risk_notes}\n")
-    print(f"=== SELECTED ({len(accepted)}) — deterministic pattern + ranking, Grok wrote narrative only ===")
+    print(f"=== SELECTED ({len(accepted)}) — deterministic pattern + intensity ranking, Grok wrote narrative only ===")
     for s in accepted:
         print(f"  {s['ticker']} {s['direction']} ${s['strike']} [{s['pattern']}] "
+              f"intensity {s['flow_intensity']*100:.2f}% "
               f"entry ${s['entry_low']}-${s['entry_high']} stop ${s['stop']} T1 ${s['target1']} T2 ${s['target2']}")
     print(f"\n=== DETERMINISTICALLY REJECTED ({len(rejected_summary)}) ===")
     for r in rejected_summary:
