@@ -344,7 +344,7 @@ def format_ohlc_summary(bars: list) -> str:
 # narrative) — every price number (strike, entry, stop, targets) is
 # computed here in Python from the real swing high/low in the actual
 # daily OHLC data, so the same input always produces the same output.
-def get_strike_increment(price: float) -> float:
+def get_strike_increment(price):
     if price < 50:
         return 1.0
     elif price < 200:
@@ -352,47 +352,149 @@ def get_strike_increment(price: float) -> float:
     else:
         return 5.0
 
-def compute_strike(direction: str, current_price: float) -> float:
-    inc = get_strike_increment(current_price)
-    if direction.upper() == "CALL":
-        return round((current_price // inc + 1) * inc, 2)
-    else:
-        return round((current_price // inc) * inc, 2)
 
-def compute_trade_levels(direction: str, bars: list, current_price: float) -> dict:
+def compute_daily_atr(bars, period=10):
+    """Average high-low range over the last N bars."""
+    recent = bars[-period:] if len(bars) >= period else bars
+    if not recent:
+        return 0.0
+    return sum(b["high"] - b["low"] for b in recent) / len(recent)
+
+
+def get_option_premium(ticker, direction, strike, expiry_iso):
+    """Fetches real mid-price of a specific option contract."""
+    try:
+        import yfinance as yf
+        chain = yf.Ticker(ticker).option_chain(expiry_iso)
+        df = chain.calls if direction.upper() == "CALL" else chain.puts
+        row = df[df["strike"] == strike]
+        if row.empty:
+            row = df.iloc[(df["strike"] - strike).abs().argsort()[:1]]
+        if row.empty:
+            return None
+        r = row.iloc[0]
+        bid  = r.get("bid", 0) or 0
+        ask  = r.get("ask", 0) or 0
+        last = r.get("lastPrice", 0) or 0
+        mid  = (bid + ask) / 2 if (bid > 0 and ask > 0) else last
+        return round(mid, 2) if mid > 0 else None
+    except Exception as e:
+        print(f"  [OPTION PREMIUM WARN] {ticker}: {e}")
+        return None
+
+
+def select_strike(ticker: str, direction: str, current_price: float,
+                  expiry_iso: str, target1: float) -> tuple:
     """
-    Entry: tight range around current price.
-    Stop: just beyond the real recent swing low (calls) / swing high
-    (puts) — deliberately a SHORT lookback (the last 2 sessions), since
-    including the origin of a multi-day move produces unrealistic stops
-    for a short-DTE options play. Confirmed via testing: a 5-session
-    lookback on a real AMD breakdown (peak $548 four days back, current
-    $495.76) produced a 55-point/~11% stop distance — nothing like the
-    2-4.5% stop distances seen on BMT's real sample cards (BE: entry
-    $214.50/stop $224 = 4.4%, SNOW: $268.80/$275 = 2.3%, DDOG:
-    $258.60/$265 = 2.5%). A 2-session window captures the most recent,
-    structurally relevant swing point instead of a stale origin.
-    Targets: fixed R-multiples (1.5R / 2.5R) off the real entry-to-stop
-    risk distance, so R/R is mathematically guaranteed consistent rather
-    than something the model has to get right on its own.
+    Returns (strike, premium_or_None).
+
+    Picks the best LIQUID OTM strike anchored to Target 1 — not blindly
+    ATM, and not just closest-to-T1 without checking liquidity.
+
+    Logic (tiered, always returns something):
+      1. Pull the full OTM side of the chain (above price for calls,
+         below for puts — no ATM).
+      2. Primary filter: OI >= 100. These are genuinely liquid contracts
+         with real open interest — fills are realistic.
+      3. Among primary-liquid OTM strikes, pick the one CLOSEST to T1.
+         T1 is the directional anchor (the strike makes sense if the
+         stock reaches its first target) but liquidity is the gate.
+      4. If no strike passes OI >= 100, retry with OI >= 25 (soft
+         fallback — some OTM liquidity is better than none).
+      5. If still nothing, take any OTM strike (last resort before ATM).
+      6. Final fallback: ATM if no OTM strikes exist at all.
+
+    Prints a [STRIKE] log line showing which tier fired, the chosen
+    strike, OI, volume, and premium so every selection is auditable.
     """
-    recent = bars[-2:] if len(bars) >= 2 else bars
-    entry_mid = current_price
-    entry_low = round(current_price * 0.995, 2)
+    try:
+        import yfinance as yf
+        chain = yf.Ticker(ticker).option_chain(expiry_iso)
+        df = chain.calls if direction.upper() == "CALL" else chain.puts
+        if df.empty:
+            raise ValueError("empty chain")
+
+        # OTM only — strictly beyond current price
+        if direction.upper() == "CALL":
+            otm = df[df["strike"] > current_price].copy()
+        else:
+            otm = df[df["strike"] < current_price].copy()
+
+        def _pick_from(candidates, tier_label):
+            if candidates.empty:
+                return None
+            candidates = candidates.copy()
+            candidates["dist"] = (candidates["strike"] - target1).abs()
+            best = candidates.sort_values("dist").iloc[0]
+            strike  = float(best["strike"])
+            oi      = int(best.get("openInterest", 0) or 0)
+            vol     = int(best.get("volume", 0) or 0)
+            bid     = best.get("bid", 0) or 0
+            ask     = best.get("ask", 0) or 0
+            last    = best.get("lastPrice", 0) or 0
+            mid     = (bid + ask) / 2 if (bid > 0 and ask > 0) else last
+            premium = round(mid, 2) if mid > 0 else None
+            pct_str = f"{premium / current_price * 100:.1f}%" if premium else "N/A"
+            print(f"  [STRIKE] {ticker}: ${strike} ({tier_label}) "
+                  f"OI={oi} vol={vol} premium=${premium} ({pct_str} of price) "
+                  f"closest to T1 ${target1}")
+            return strike, premium
+
+        # Tier 1: OI >= 100
+        result = _pick_from(otm[otm["openInterest"].fillna(0) >= 100], "OI>=100")
+        if result:
+            return result
+
+        # Tier 2: OI >= 25
+        result = _pick_from(otm[otm["openInterest"].fillna(0) >= 25], "OI>=25 fallback")
+        if result:
+            return result
+
+        # Tier 3: any OTM
+        result = _pick_from(otm, "any OTM, no liquidity")
+        if result:
+            return result
+
+        raise ValueError("no OTM strikes available")
+
+    except Exception as e:
+        # Final fallback: ATM
+        inc = get_strike_increment(current_price)
+        if direction.upper() == "CALL":
+            atm = round((current_price // inc + 1) * inc, 2)
+        else:
+            atm = round((current_price // inc) * inc, 2)
+        premium = get_option_premium(ticker, direction, atm, expiry_iso)
+        print(f"  [STRIKE] {ticker}: ATM ${atm} fallback (OTM selection failed: {e})")
+        return atm, premium
+
+
+def compute_trade_levels(direction, bars, current_price, dte=9):
+    """
+    DTE-aware stock-level entry/stop/target levels.
+    REWRITTEN 2026-07-21: anchored to real ATR, scaled by sqrt(DTE/5).
+    Stop = 0.75x ATR against entry.
+    T1 = 1x (ATR * sqrt(DTE/5)), T2 = 2x.
+    BE ($226, ATR~$6, 9 DTE): stop~$221.50, T1~$234, T2~$242.
+    """
+    atr = compute_daily_atr(bars)
+    if atr <= 0:
+        atr = current_price * 0.02
+
+    entry_low  = round(current_price * 0.995, 2)
     entry_high = round(current_price * 1.005, 2)
 
+    dte_factor = max(1.0, (max(dte, 1) / 5) ** 0.5)
+    move = round(atr * dte_factor, 2)
+
     if direction.upper() == "CALL":
-        swing_low = min(b["low"] for b in recent)
-        stop = round(min(swing_low * 0.995, entry_low * 0.98), 2)
-        risk = entry_mid - stop
-        target1 = round(entry_mid + risk * 1.5, 2)
-        target2 = round(entry_mid + risk * 2.5, 2)
+        stop    = round(current_price - atr * 0.75, 2)
+        target1 = round(current_price + move, 2)
+        target2 = round(current_price + move * 2, 2)
     else:
-        swing_high = max(b["high"] for b in recent)
-        stop = round(max(swing_high * 1.005, entry_high * 1.02), 2)
-        risk = stop - entry_mid
-        target1 = round(entry_mid - risk * 1.5, 2)
-        target2 = round(entry_mid - risk * 2.5, 2)
+        stop    = round(current_price + atr * 0.75, 2)
+        target1 = round(current_price - move, 2)
+        target2 = round(current_price - move * 2, 2)
 
     return {
         "entry_low": entry_low, "entry_high": entry_high,
@@ -400,27 +502,14 @@ def compute_trade_levels(direction: str, bars: list, current_price: float) -> di
     }
 
 
-# ── Deterministic chart-pattern detection (NEW 2026-07-18) ────────────────
-# BUGFIX CONTEXT: the price-level fix above solved HALF the problem —
-# confirmed via a real back-to-back test that Grok, even at temperature=0,
-# produced different accept/reject decisions AND different top-5 picks on
-# byte-identical flow data (e.g. AMD/TWLO/OKTA vs AMD/TWLO/DKNG across two
-# runs with nothing else changed). The price-level determinism fix never
-# touched THIS — Grok was still the one deciding which tickers "have a
-# clean chart," and that judgment call was exactly what varied.
-#
-# Fixed the same way as the price levels: real swing-point analysis on the
-# actual daily bars, computed in Python, not eyeballed by an LLM reading
-# formatted OHLC text. Grok's role now narrows to writing narrative prose
-# for tickers Python has ALREADY selected — it no longer decides accept/
-# reject or ranking at all, which removes the actual source of the
-# non-determinism rather than just its downstream price-number symptoms.
+
+
+# ── Deterministic chart-pattern detection ────────────────────────────────────
 def find_swing_points(bars: list) -> tuple:
     """Returns (swing_highs, swing_lows) as lists of (index, price) for
-    local extremes — a bar whose high/low exceeds both immediate
-    neighbors. Standard, deterministic technical-analysis definition."""
+    local extremes — a bar whose high/low exceeds both immediate neighbors."""
     highs = [b["high"] for b in bars]
-    lows = [b["low"] for b in bars]
+    lows  = [b["low"]  for b in bars]
     swing_highs, swing_lows = [], []
     for i in range(1, len(bars) - 1):
         if highs[i] > highs[i - 1] and highs[i] > highs[i + 1]:
@@ -431,19 +520,10 @@ def find_swing_points(bars: list) -> tuple:
 
 
 def is_clean_uptrend(bars: list) -> dict:
-    """
-    Returns {"clean": bool, "pattern": str or None}. Checks for CALLS,
-    in order:
-    (a) a smooth monotonic rise in daily lows — the cleanest possible
-        structure, but one with ZERO interior swing points by
-        definition (a pure rise has no local minima to detect), so this
-        has to be checked directly rather than via swing-point analysis
-    (b) a genuine higher-lows sequence across real swing points (for
-        trends with minor pullbacks along the way)
-    (c) a clean V-recovery (a real prior low, followed by recovery with
-        no subsequent lower low)
-    Fails closed on insufficient data — never guesses a chart is clean.
-    """
+    """Returns {"clean": bool, "pattern": str or None}. Checks for CALLS:
+    (a) smooth monotonic rise in daily lows,
+    (b) genuine higher-lows swing sequence,
+    (c) clean V-recovery."""
     window = bars[-10:] if len(bars) >= 10 else bars
     if len(window) < 5:
         return {"clean": False, "pattern": None}
@@ -453,7 +533,6 @@ def is_clean_uptrend(bars: list) -> dict:
         return {"clean": True, "pattern": "higher lows"}
 
     swing_highs, swing_lows = find_swing_points(window)
-
     if len(swing_lows) >= 2:
         lows_seq = [v for _, v in swing_lows]
         if all(lows_seq[i] < lows_seq[i + 1] for i in range(len(lows_seq) - 1)):
@@ -472,8 +551,7 @@ def is_clean_uptrend(bars: list) -> dict:
 
 
 def is_clean_downtrend(bars: list) -> dict:
-    """Mirror of is_clean_uptrend() for PUTS: smooth monotonic fall in
-    daily highs, a lower-highs swing sequence, or a clean breakdown."""
+    """Mirror of is_clean_uptrend() for PUTS: lower-highs or clean breakdown."""
     window = bars[-10:] if len(bars) >= 10 else bars
     if len(window) < 5:
         return {"clean": False, "pattern": None}
@@ -483,7 +561,6 @@ def is_clean_downtrend(bars: list) -> dict:
         return {"clean": True, "pattern": "lower highs"}
 
     swing_highs, swing_lows = find_swing_points(window)
-
     if len(swing_highs) >= 2:
         highs_seq = [v for _, v in swing_highs]
         if all(highs_seq[i] > highs_seq[i + 1] for i in range(len(highs_seq) - 1)):
@@ -600,21 +677,43 @@ def get_tone_phrase(m: dict) -> str:
     return "Flat, inside day"
 
 
-def get_next_expiry(ticker: str) -> dict:
-    """Returns {"label": "Jul 24", "iso": "2026-07-24"} for the nearest
-    available expiry, or {"label": "N/A", "iso": None}. ISO date added
-    2026-07-21 so the earnings-exclusion filter can compare the real
-    expiry date against a ticker's confirmed upcoming earnings date."""
+MIN_DTE = 7  # minimum calendar days to expiry for a swing setup.
+             # Confirmed necessary (2026-07-21): a 2-DTE option on BE
+             # produced a card with targets requiring a 21% stock move in
+             # 2 days — theta decay kills the option before the stock can
+             # reach the target, and the stop becomes irrelevant since
+             # the contract approaches zero regardless of stock price.
+             # 7 DTE gives the setup enough time to breathe while keeping
+             # it within a weekly-options trading timeframe.
+
+
+def get_next_expiry(ticker: str, min_dte: int = MIN_DTE) -> dict:
+    """Returns {"label": "Jul 31", "iso": "2026-07-31"} for the nearest
+    available expiry with at least min_dte calendar days remaining, or
+    {"label": "N/A", "iso": None}.
+
+    BUGFIX (2026-07-21): the original version blindly returned the nearest
+    expiry regardless of DTE. Confirmed in production: BE with a Jul 24
+    expiry (2 DTE) produced a CALL $230 card with Target 1 at $274 —
+    a 21% move required in 2 days on a non-earnings setup. Theta decay
+    makes such a card actively misleading — the option approaches zero
+    before the stock has any chance to reach the targets, and the stop
+    loss is meaningless since the contract will be near-worthless anyway.
+    Fixed: skip any expiry with fewer than min_dte calendar days out."""
     try:
         import yfinance as yf
         expirations = yf.Ticker(ticker).options
         if not expirations:
             return {"label": "N/A", "iso": None}
-        today = datetime.now(ET).strftime("%Y-%m-%d")
+        today = datetime.now(ET)
+        today_str = today.strftime("%Y-%m-%d")
         for exp in expirations:
-            if exp >= today:
-                dt = datetime.strptime(exp, "%Y-%m-%d")
-                return {"label": dt.strftime("%b %d"), "iso": exp}
+            if exp < today_str:
+                continue
+            exp_dt = datetime.strptime(exp, "%Y-%m-%d")
+            dte = (exp_dt - today.replace(tzinfo=None)).days
+            if dte >= min_dte:
+                return {"label": exp_dt.strftime("%b %d"), "iso": exp}
         return {"label": "N/A", "iso": None}
     except Exception:
         return {"label": "N/A", "iso": None}
@@ -918,18 +1017,18 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
         yy += (max_narrative_lines - len(s["_narrative_lines"])) * NARRATIVE_LINE_H
         yy += GAP3
 
-        # Trade levels as a clean stat-table — thin vertical dividers,
-        # no bordered box, color reserved for the stop/target values only.
-        # BUGFIX (2026-07-18): fixed equal-width columns with fixed font
-        # sizes overlapped once prices got wide (confirmed on SNDK:
-        # $1348.05-1361.50 entry running into its $1559.39 stop, plus
-        # similar collisions on BE/AVGO/TSM/MU). Fixed with (a) weighted
-        # column widths — ENTRY gets 30% more room since its range format
-        # is inherently wider than a single number — and (b) per-value
-        # auto-fit font sizing via fit_value_fontsize(), so any value
-        # shrinks just enough to physically fit its column regardless of
-        # how large the price gets, instead of a fixed size that
-        # eventually breaks.
+        # Trade levels — Option B (option-premium-based P&L management).
+        # PREMIUM / STOP -50% / T1 +100% / T2 +150% — the numbers a trader
+        # actually uses to manage a lotto position, not stock-level swing
+        # targets that assume weeks of time the option doesn't have.
+        # Confirmed necessary (2026-07-21): BE Jul 24 $230C (2 DTE) had a
+        # Target 1 of $274 — a 21% stock move in 2 days. The option hits
+        # zero from theta before the stock has any chance of getting there.
+        # Stock-level levels (entry_low/entry_high/stop/target1/target2) are
+        # still computed and stored on the setup dict for Option A testing
+        # — they just don't appear on this card in Option B mode.
+        # Falls back to stock-level display if option premium is unavailable.
+        # Trade levels -- stock-level ENTRY/STOP/TARGET (DTE-aware, ATR-scaled).
         total_w = card_w - 2 * (PAD_L - 0.1)
         col_weights = [1.3, 0.9, 0.9, 0.9]
         col_widths = [total_w * w / sum(col_weights) for w in col_weights]
@@ -1255,25 +1354,40 @@ def main():
         print("Nothing passed the deterministic chart-pattern filter tonight — no digest to post.")
         return
 
-    # Compute DETERMINISTIC price levels — strike, entry, stop, both
-    # targets — from the real swing high/low in the actual daily bars,
-    # never left to Grok's own arithmetic (see compute_trade_levels()).
+    # Compute DTE-aware levels first (to get T1), then select the best
+    # liquid OTM strike anchored to T1. Order matters: T1 must exist
+    # before select_strike() can use it as an anchor.
+    print("\nComputing trade levels and selecting strikes...")
     for c in selected:
         current_price = get_quote_change(c["ticker"]).get("price")
         if not current_price:
-            print(f"  [WARN] {c['ticker']}: no current price — dropping from selected")
+            print(f"  [WARN] {c['ticker']}: no current price -- dropping from selected")
             continue
         c["current_price"] = current_price
-        c["strike"] = compute_strike(c["direction"], current_price)
-        c.update(compute_trade_levels(c["direction"], c["bars"], current_price))
+
+        # DTE — needed before compute_trade_levels so levels scale correctly
+        dte = 9  # fallback if expiry unknown
         if c.get("expiry_iso"):
             try:
                 exp_dt = datetime.strptime(c["expiry_iso"], "%Y-%m-%d")
-                c["dte"] = max((exp_dt - datetime.now(ET).replace(tzinfo=None)).days, 0)
+                dte = max((exp_dt - datetime.now(ET).replace(tzinfo=None)).days, 0)
             except Exception:
-                c["dte"] = "?"
-        else:
-            c["dte"] = "?"
+                pass
+        c["dte"] = dte
+
+        # Step 1: DTE-aware stock-level entry/stop/targets (ATR-scaled).
+        # Must run BEFORE select_strike so T1 is available as the anchor.
+        c.update(compute_trade_levels(c["direction"], c["bars"], current_price, dte=dte))
+
+        # Step 2: Strike selection — liquid OTM closest to T1.
+        # Liquidity (OI >= 100) is the gate; T1 picks which liquid
+        # strike to prefer. See select_strike() for the full tier logic.
+        strike, premium = select_strike(
+            c["ticker"], c["direction"], current_price,
+            c.get("expiry_iso", ""), c["target1"]
+        )
+        c["strike"] = strike
+        c["premium"] = premium
     selected = [c for c in selected if "strike" in c]
 
     print(f"\nSending {len(selected)} pre-selected setup(s) to Grok for narrative only...")
@@ -1295,9 +1409,11 @@ def main():
     print(f"=== RISK NOTES ===\n{risk_notes}\n")
     print(f"=== SELECTED ({len(accepted)}) — deterministic pattern + intensity ranking, Grok wrote narrative only ===")
     for s in accepted:
+        prem_str = f" premium=${s['premium']}" if s.get("premium") else ""
         print(f"  {s['ticker']} {s['direction']} ${s['strike']} [{s['pattern']}] "
-              f"intensity {s['flow_intensity']*100:.2f}% "
-              f"entry ${s['entry_low']}-${s['entry_high']} stop ${s['stop']} T1 ${s['target1']} T2 ${s['target2']}")
+              f"intensity {s['flow_intensity']*100:.2f}% {s.get('dte','?')} DTE{prem_str} "
+              f"entry ${s['entry_low']}-${s['entry_high']} "
+              f"stop ${s['stop']} T1 ${s['target1']} T2 ${s['target2']}")
     print(f"\n=== DETERMINISTICALLY REJECTED ({len(rejected_summary)}) ===")
     for r in rejected_summary:
         print(f"  {r}")
