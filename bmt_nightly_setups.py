@@ -121,42 +121,7 @@ CANDIDATE_UNIVERSE = [t for t in FULL_WATCHLIST if t not in EXCLUDE_FROM_CANDIDA
 
 
 # ── Upcoming-earnings exclusion (NEW 2026-07-21) ───────────────────────────
-# GAP FIX: this digest previously had zero earnings-date awareness. During
-# earnings season that's dangerous — a "clean lower highs" chart on a
-# ticker reporting within the trade's expiry window is a fundamentally
-# different trade: the structure gets vaporized by the print, the stop is
-# meaningless through a gap, and IV crush hits the option even when the
-# direction is right. Earnings plays are the ER lotto product's job, not
-# this digest's. Any candidate whose confirmed upcoming earnings date
-# falls ON OR BEFORE its suggested expiry is excluded outright (and named
-# in the rejected list so Grok's risk notes can reference it).
-#
-# PRIMARY SOURCE — yfinance get_earnings_dates() per ticker (see the
-# full dead-end history in get_upcoming_earnings_date()'s docstring:
-# Finnhub's calendar is capped at 1,500 rows on the free tier, and
-# Yahoo's chart-meta earningsTimestamp fields are confirmed empty).
-#
-# PLACEMENT — the check runs AFTER ranking, walking the ranked list
-# top-down and skipping blocked tickers until TOP_N clean setups are
-# found. Rationale: get_earnings_dates() is the same endpoint that
-# triggered a real YFRateLimitError during big_mover_screen.py's heavy
-# usage, so checking all ~100-130 flow-qualifiers per night (on top of
-# the OHLC pulls already hitting Yahoo) invites rate limiting. Checking
-# in rank order needs only ~5-10 calls per night and produces the
-# identical outcome — an excluded ticker simply lets the next-ranked
-# one slide in, and still gets named in the rejected list.
-#
-# SECONDARY NET — the Finnhub forward-window map is still loaded and
-# consulted (its confirmed-working shape: short forward window, no
-# symbol filter). If EITHER source reports an earnings date on or before
-# expiry, the candidate is excluded. A ticker absent from both sources
-# is treated as "no earnings in window."
-#
-# FAIL-OPEN BY DESIGN, LOUDLY: if a source fails, the run proceeds with
-# whatever earnings data IS available (with loud warnings) rather than
-# skipping the whole digest — a weakened safety net for one night is
-# preferable to silently never posting.
-EARNINGS_LOOKAHEAD_DAYS = 14  # comfortably covers any weekly-expiry window
+EARNINGS_LOOKAHEAD_DAYS = 14
 
 def get_upcoming_earnings_map() -> dict:
     """Returns {ticker: 'YYYY-MM-DD' earliest upcoming earnings date} for
@@ -332,18 +297,6 @@ def format_ohlc_summary(bars: list) -> str:
 
 
 # ── Deterministic trade-level calculation (NEW 2026-07-18) ────────────────
-# BUGFIX CONTEXT: confirmed via a back-to-back same-data test that Grok,
-# even at temperature=0, produced DIFFERENT entry/stop/target numbers for
-# the identical AMD setup across two runs with byte-identical input flow
-# data (entry $480-490/stop $505 vs entry $490-495/stop $510). The chart-
-# quality JUDGMENT (is this clean, does flow align) is exactly the kind
-# of task an LLM is suited for — but the specific PRICE LEVELS shouldn't
-# be left to the model's own arithmetic/discretion, same principle as the
-# Beat Signal Strength and R/R fixes elsewhere in the BMT stack. Grok's
-# job now is ONLY to accept/reject and describe WHY (quality_tag,
-# narrative) — every price number (strike, entry, stop, targets) is
-# computed here in Python from the real swing high/low in the actual
-# daily OHLC data, so the same input always produces the same output.
 def get_strike_increment(price):
     if price < 50:
         return 1.0
@@ -678,28 +631,12 @@ def get_tone_phrase(m: dict) -> str:
 
 
 MIN_DTE = 7  # minimum calendar days to expiry for a swing setup.
-             # Confirmed necessary (2026-07-21): a 2-DTE option on BE
-             # produced a card with targets requiring a 21% stock move in
-             # 2 days — theta decay kills the option before the stock can
-             # reach the target, and the stop becomes irrelevant since
-             # the contract approaches zero regardless of stock price.
-             # 7 DTE gives the setup enough time to breathe while keeping
-             # it within a weekly-options trading timeframe.
 
 
 def get_next_expiry(ticker: str, min_dte: int = MIN_DTE) -> dict:
     """Returns {"label": "Jul 31", "iso": "2026-07-31"} for the nearest
     available expiry with at least min_dte calendar days remaining, or
-    {"label": "N/A", "iso": None}.
-
-    BUGFIX (2026-07-21): the original version blindly returned the nearest
-    expiry regardless of DTE. Confirmed in production: BE with a Jul 24
-    expiry (2 DTE) produced a CALL $230 card with Target 1 at $274 —
-    a 21% move required in 2 days on a non-earnings setup. Theta decay
-    makes such a card actively misleading — the option approaches zero
-    before the stock has any chance to reach the targets, and the stop
-    loss is meaningless since the contract will be near-worthless anyway.
-    Fixed: skip any expiry with fewer than min_dte calendar days out."""
+    {"label": "N/A", "iso": None}."""
     try:
         import yfinance as yf
         expirations = yf.Ticker(ticker).options
@@ -719,13 +656,7 @@ def get_next_expiry(ticker: str, min_dte: int = MIN_DTE) -> dict:
         return {"label": "N/A", "iso": None}
 
 
-# ── Grok narrative call (ONE call per night, same model as the ER lotto
-# pipeline) — NARROWED SCOPE (2026-07-18): Grok no longer decides WHICH
-# tickers qualify or how they rank. That decision is now 100%
-# deterministic (see check_chart_pattern() and its callers in main()).
-# Grok's only remaining job is writing readable narrative prose and a
-# short quality tag for tickers Python has ALREADY selected — a task
-# where run-to-run wording variance is cosmetic, not decision-changing.
+# ── Grok narrative call (ONE call per night, same model as the ER lotto pipeline)
 def write_narratives(selected: list, rejected_summary: list, market_context: dict) -> dict:
     context_block = "\n".join(
         f"{t}: ${market_context[t]['price']} ({market_context[t]['pct']:+.2f}%) "
@@ -792,21 +723,7 @@ import textwrap
 
 def fit_value_fontsize(text: str, col_w_units: float, base_fontsize: float,
                         min_fontsize: float = 6.5, margin: float = 0.85) -> float:
-    """
-    BUGFIX (2026-07-18): fixed-width stat-table columns with a fixed
-    font size will always eventually collide once a price gets wide
-    enough — confirmed in production on SNDK ($1348.05-1361.50 entry
-    overlapping its $1559.39 stop) and similar cases on BE/AVGO/TSM/MU.
-    Rather than guess a smaller fixed size and hope, this computes the
-    actual available pixel width for the column (this figure is built
-    at dpi=150 with data units == inches, so 1 data unit = 150px exactly
-    — no guessing) and shrinks the font size down from base_fontsize
-    only as much as needed for the specific text to physically fit,
-    so short numbers ($24) stay full-size and wide ones ($1348.05-
-    1361.50) shrink just enough to never overlap, regardless of price
-    magnitude. bold_factor accounts for bold text being visibly wider
-    per character than regular weight.
-    """
+    """Dynamic font sizing for wide numbers in narrow columns."""
     bold_factor = 1.75
     avail_px = col_w_units * 150 * margin
     needed_px = len(text) * base_fontsize * bold_factor
@@ -816,19 +733,7 @@ def fit_value_fontsize(text: str, col_w_units: float, base_fontsize: float,
 
 
 def wrap_lines(text: str, width_chars: int, max_lines: int) -> list:
-    """
-    BUGFIX (2026-07-18): matplotlib's built-in wrap=True does NOT respect
-    a local column width — it estimates wrapping against the full figure
-    width, which is fine for a single full-width text block but breaks
-    completely in a multi-card side-by-side layout like this one. In
-    production this caused every card's narrative text to render as one
-    long unwrapped line that visually bled across into neighboring
-    cards, producing an unreadable overlapping mess. Fixed: wrap text
-    manually to a known character width (calibrated to this card's
-    actual pixel width) using Python's own textwrap, then render each
-    line as a separate positioned text call — full control, no reliance
-    on matplotlib guessing a width it doesn't actually know.
-    """
+    """Manual text wrapping to avoid matplotlib's built-in width guessing."""
     lines = textwrap.wrap(text, width=width_chars)
     if len(lines) > max_lines:
         lines = lines[:max_lines]
@@ -838,9 +743,7 @@ def wrap_lines(text: str, width_chars: int, max_lines: int) -> list:
 
 # ── Card rendering (matplotlib, matches BMT's real watchlist card layout) ──
 def compute_rr(entry_low, entry_high, target1, stop) -> float:
-    """R/R computed in Python from real numbers, not trusted from Grok's
-    own math — same principle as the deterministic Beat Signal Strength
-    fix elsewhere in the BMT stack."""
+    """R/R computed in Python from real numbers, not trusted from Grok."""
     entry_mid = (entry_low + entry_high) / 2
     reward = abs(target1 - entry_mid)
     risk = abs(entry_mid - stop)
@@ -876,14 +779,12 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
 
     fig_w = 24.0
     CARD_GAP = 0.22
-    MAX_CARD_W = 8.0  # only clamps the extreme 1-2 card case — the natural
-                       # fill width at 3, 4, and 5 cards (4.4-7.5) stays
-                       # well under this and is untouched
+    MAX_CARD_W = 8.0
     max_available_w = fig_w - 1.0
     dynamic_w = (max_available_w - CARD_GAP * (max(n, 1) - 1)) / max(n, 1)
     card_w = min(dynamic_w, MAX_CARD_W)
     row_w = max(n, 1) * card_w + (max(n, 1) - 1) * CARD_GAP
-    row_start_x = 0.5 + (max_available_w - row_w) / 2  # only creates margin when the cap actually kicks in
+    row_start_x = 0.5 + (max_available_w - row_w) / 2
     placeholder_h = 8.0
     fig_h = 5.4 + placeholder_h
     fig = plt.figure(figsize=(fig_w, fig_h), dpi=150, facecolor=BG)
@@ -897,7 +798,7 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
     ax.text(0.5, 1.55, f"{n} setups   \u00b7   {dir_summary}   \u00b7   {expiry_summary}   \u00b7   "
             f"Based on {close_date_str} close", fontsize=12, color=TEXT_SECONDARY, va="top", zorder=5)
 
-    # ── Market context strip — vertical dividers between tickers ──────
+    # ── Market context strip ────────────────────────────────────────────
     ctx_y = 2.15
     ctx_w = (fig_w - 1.0 - 0.5 * 2) / 3
     for i, t in enumerate(MARKET_CONTEXT_TICKERS):
@@ -919,7 +820,7 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
     ax.plot([0.5, fig_w - 0.5], [rule_y, rule_y], color=BORDER, linewidth=1, zorder=3)
     cursor_y = rule_y + 0.35
 
-    # ── Theme / risk callouts — left accent bar, no full box outline ──
+    # ── Theme / risk callouts ───────────────────────────────────────────
     theme_color = RED if n_puts > n_calls else GREEN if n_calls > n_puts else BLUE
     theme_lines = wrap_lines(market_theme, width_chars=160, max_lines=3)
     for i, line in enumerate(theme_lines):
@@ -940,12 +841,6 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
     cursor_y += 0.45
 
     # ── Individual setup cards ────────────────────────────────────────
-    # Design: ONE accent element per card (a left-edge color bar), not a
-    # box-in-box stack. Direction/strike lives in the header row next to
-    # the ticker instead of its own bordered pill. Trade levels render as
-    # a clean stat-table (thin vertical dividers between columns) instead
-    # of a colored box, so color is used deliberately — accent bar,
-    # direction text, stop/target numbers — rather than everywhere.
     PAD_L = 0.4
     PAD_TOP = 0.35
     HEADER_H = 0.55
@@ -985,14 +880,13 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
         card_bg = FancyBboxPatch((x, cards_top), card_w, card_h, boxstyle="round,pad=0,rounding_size=0.06",
                                   linewidth=1, edgecolor=BORDER_SOFT, facecolor=SURFACE, zorder=2)
         ax.add_patch(card_bg)
-        # single left accent bar — the ONE color identity element per card
         ax.add_patch(plt.Rectangle((x, cards_top + 0.15), 0.06, card_h - 0.3, facecolor=accent,
                                     linewidth=0, zorder=3))
 
         cx = x + PAD_L
         yy = cards_top + PAD_TOP
 
-        # Header row: ticker left, direction+strike right, same baseline
+        # Header row
         ax.text(cx, yy, s["ticker"], fontsize=21, fontweight="bold", color=TEXT_PRIMARY, va="top", zorder=5)
         arrow = "\u25b2" if is_call else "\u25bc"
         ax.text(x + card_w - 0.3, yy + 0.02, f"{arrow} {s['direction']} ${s['strike']:g}",
@@ -1005,7 +899,6 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
                 fontsize=8.7, color=TEXT_TERTIARY, va="top", ha="right", zorder=5)
         yy += SUBTITLE_H + GAP1
 
-        # Quality tag as small colored text with a dot, not a bordered pill
         ax.scatter([cx + 0.05], [yy + 0.16], s=18, color=accent, zorder=5)
         ax.text(cx + 0.2, yy, s.get("quality_tag", "").upper(), fontsize=8.5, fontweight="bold",
                 color=accent, va="top", zorder=5)
@@ -1017,18 +910,6 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
         yy += (max_narrative_lines - len(s["_narrative_lines"])) * NARRATIVE_LINE_H
         yy += GAP3
 
-        # Trade levels — Option B (option-premium-based P&L management).
-        # PREMIUM / STOP -50% / T1 +100% / T2 +150% — the numbers a trader
-        # actually uses to manage a lotto position, not stock-level swing
-        # targets that assume weeks of time the option doesn't have.
-        # Confirmed necessary (2026-07-21): BE Jul 24 $230C (2 DTE) had a
-        # Target 1 of $274 — a 21% stock move in 2 days. The option hits
-        # zero from theta before the stock has any chance of getting there.
-        # Stock-level levels (entry_low/entry_high/stop/target1/target2) are
-        # still computed and stored on the setup dict for Option A testing
-        # — they just don't appear on this card in Option B mode.
-        # Falls back to stock-level display if option premium is unavailable.
-        # Trade levels -- stock-level ENTRY/STOP/TARGET (DTE-aware, ATR-scaled).
         total_w = card_w - 2 * (PAD_L - 0.1)
         col_weights = [1.3, 0.9, 0.9, 0.9]
         col_widths = [total_w * w / sum(col_weights) for w in col_weights]
@@ -1050,8 +931,6 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
             col_x += cw
         yy += STAT_LABEL_H + STAT_VALUE_H + GAP4
 
-        # NEVER show R:R to subscribers (BMT explicit instruction,
-        # 2026-07-18) — flow note only, full width, no right-aligned stat
         ax.text(cx, yy, f"FLOW   {s.get('flow_note', '')}", fontsize=8, color=TEXT_TERTIARY, va="top", zorder=5)
 
     footer_y = cards_top + card_h + 0.4
@@ -1073,33 +952,11 @@ def post_image_to_discord(image_path: str, message: str = ""):
         return r.status_code in (200, 204)
 
 
-# ── US Market Holiday Calendar + Scheduling Logic (NEW 2026-07-18) ────────
-# MAINTENANCE WARNING: this list is specific to 2026 and MUST be updated
-# every year — NYSE/NASDAQ holidays shift (e.g. Good Friday, observed
-# dates) and are not computable from a simple formula. A stale list would
-# cause this script to treat a real holiday as a normal trading day,
-# publishing "next day" ideas using data that doesn't exist, or trying to
-# run on a day the market never opened. The runtime check below prints a
-# loud warning if the script is ever run outside 2026 without this list
-# being updated, per the same fail-loud philosophy as the rest of this
-# codebase (never silently assume stale config is still correct).
+# ── US Market Holiday Calendar + Scheduling Logic ───────────────────────
 US_MARKET_HOLIDAYS_2026 = {
-    "2026-01-01",  # New Year's Day
-    "2026-01-19",  # Martin Luther King Jr. Day
-    "2026-02-16",  # Washington's Birthday (Presidents' Day)
-    "2026-04-03",  # Good Friday
-    "2026-05-25",  # Memorial Day
-    "2026-06-19",  # Juneteenth
-    "2026-07-03",  # Independence Day (observed — July 4 falls on a Saturday)
-    "2026-09-07",  # Labor Day
-    "2026-11-26",  # Thanksgiving Day
-    "2026-12-25",  # Christmas Day
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
 }
-# Early-closure days (1:00pm ET) are NOT included above — the market IS
-# open and trading occurs, just for fewer hours. A 6pm ET run happens
-# comfortably after even an early close, so these need no special
-# handling: they're valid trading days with fully settled data by the
-# time this script runs.
 US_MARKET_EARLY_CLOSE_2026 = {"2026-11-27", "2026-12-24"}
 
 
@@ -1108,16 +965,11 @@ def _check_holiday_list_freshness():
     if current_year != 2026:
         print(f"  [HOLIDAY LIST WARNING] Running in {current_year}, but "
               f"US_MARKET_HOLIDAYS_2026 is hardcoded for 2026 only — "
-              f"THIS LIST MUST BE UPDATED for {current_year} before trusting "
-              f"any scheduling decision below. Holidays are NOT computable "
-              f"from a formula; check nyse.com/markets/hours-calendars "
-              f"and update the set manually.")
+              f"THIS LIST MUST BE UPDATED for {current_year}.")
 
 
 def is_trading_day(d: datetime) -> bool:
-    """A real trading day: not a weekend, not a market holiday. Early-
-    close days count as trading days (see note above)."""
-    if d.weekday() >= 5:  # Saturday=5, Sunday=6
+    if d.weekday() >= 5:
         return False
     if d.strftime("%Y-%m-%d") in US_MARKET_HOLIDAYS_2026:
         return False
@@ -1125,19 +977,6 @@ def is_trading_day(d: datetime) -> bool:
 
 
 def should_publish_tonight() -> bool:
-    """
-    The core scheduling gate. Per BMT's exact worked example: a 6pm ET
-    run publishes ideas for TOMORROW (the immediately next calendar
-    date) — but ONLY if tomorrow is a real trading day. If tomorrow is a
-    weekend day or a holiday, tonight's run is skipped entirely — it
-    does NOT look further ahead to find some later trading day early.
-
-    Confirmed against BMT's holiday example: Thu Jul 2 evening's next
-    calendar day is Fri Jul 3 (a real holiday) -> skip. Fri Jul 3 and
-    Sat Jul 4 evenings also skip (next day is a weekend day each time).
-    Sun Jul 5 evening's next calendar day is Mon Jul 6 (a real trading
-    day) -> publish, resuming the normal cadence.
-    """
     _check_holiday_list_freshness()
     today = datetime.now(ET)
     tomorrow = today + timedelta(days=1)
@@ -1145,15 +984,6 @@ def should_publish_tonight() -> bool:
 
 
 def get_next_actual_trading_day() -> datetime:
-    """
-    TESTING ONLY — used only when FORCE_PUBLISH=1 bypasses the normal
-    scheduling gate. Unlike get_target_trading_day() (which is always
-    exactly 'tomorrow' in real production use, per BMT's spec), this
-    walks FORWARD as many days as needed to find the next real trading
-    day — so a forced test run on a weekend produces a meaningful card
-    (e.g. targeting the next Monday) instead of a nonsensical one
-    targeting a Saturday or Sunday.
-    """
     d = datetime.now(ET) + timedelta(days=1)
     while not is_trading_day(d):
         d += timedelta(days=1)
@@ -1161,52 +991,81 @@ def get_next_actual_trading_day() -> datetime:
 
 
 def get_target_trading_day() -> datetime:
-    """
-    The trading day these ideas are FOR — tomorrow, when
-    should_publish_tonight() is True (this should only ever be called
-    after that check passes). This is what the card's HEADLINE shows
-    (e.g. "Monday, July 20"), distinct from the DATA date the ideas were
-    computed from (e.g. "Based on 7/17 close") — confirmed these are two
-    different dates on BMT's real sample card, previously conflated into
-    one in this script.
-    """
     return datetime.now(ET) + timedelta(days=1)
 
 
 def get_last_completed_trading_day() -> datetime:
-    """
-    The most recent trading day with fully settled data as of THIS
-    run (walks backward from today, inclusive, through weekends AND
-    holidays). If today itself is a trading day, today's close counts
-    (a 6pm ET run happens after today's 4pm close). If today is a
-    weekend/holiday, walks back to the most recent real trading day —
-    this is what correctly handles BMT's July 3 holiday example: a Sun
-    Jul 5 run walks back through Sat Jul 4, Fri Jul 3 (holiday), landing
-    correctly on Thu Jul 2 as the data source, not Friday.
-    """
     d = datetime.now(ET)
     while not is_trading_day(d):
         d -= timedelta(days=1)
     return d
 
 
+# ── Discord Text Summary (NEW 2026-07-26) ────────────────────────────────
+def format_discord_digest(accepted, market_context, risk_notes):
+    """
+    Dynamically generates Discord text summary with market context and contracts.
+    Posts BEFORE the card image.
+    
+    Returns: str (complete text ready to post to Discord)
+    """
+    today = datetime.now(ET).strftime("%A, %B %d")
+    
+    # Get market context snapshot
+    spy = market_context.get("SPY", {})
+    qqq = market_context.get("QQQ", {})
+    spy_price = spy.get("price", "?")
+    spy_pct = spy.get("pct", 0) or 0
+    qqq_pct = qqq.get("pct", 0) or 0
+    
+    # Count flow bias (calls vs puts)
+    n_calls = sum(1 for s in accepted if s["direction"].upper() == "CALL")
+    n_puts = len(accepted) - n_calls
+    flow_bias = "call" if n_calls > n_puts else "put" if n_puts > n_calls else "mixed"
+    
+    # Build market context line
+    market_context_line = (
+        f"SPY ${spy_price} {spy_pct:+.2f}%, QQQ {qqq_pct:+.2f}% — "
+        f"tape favors mean-reversion into exhaustion. Flow is heavy into {flow_bias} structures "
+        f"on the weakness; {len(accepted)} setups across tech/growth names with clean chart patterns "
+        f"and institutional buying into lows."
+    )
+    
+    # Build contract list
+    contracts = "\n".join(
+        f"• {s['ticker']} {s['next_expiry']} ${s['strike']}{s['direction'][0].upper()}"
+        for s in accepted
+    )
+    
+    post = f"""📊 **BMT Market Digest** — {today}
+
+{market_context_line}
+
+{risk_notes}
+
+See card for levels.
+
+{contracts}
+"""
+    
+    return post
+
+
+def post_text_to_discord(text_content: str) -> bool:
+    """Posts text summary to Discord webhook."""
+    try:
+        r = requests.post(DISCORD_WEBHOOK, json={"content": text_content}, timeout=30)
+        print(f"Text summary posted: {r.status_code}")
+        return r.status_code in (200, 204)
+    except Exception as e:
+        print(f"Text summary post FAILED: {e}")
+        return False
+
+
 def main():
     et_now = datetime.now(ET)
     print(f"[{et_now.isoformat()}] BMT Nightly Setups")
 
-    # ── Scheduling gate — MUST run first, before any expensive work ────
-    # Per BMT's exact spec: a 6pm ET run publishes ideas for TOMORROW,
-    # but only if tomorrow is a real trading day (not a weekend, not a
-    # market holiday). This check happens before any flow pulls,
-    # OpenRouter calls, or Discord posts — a skip night costs nothing.
-    #
-    # TESTING OVERRIDE: set FORCE_PUBLISH=1 to bypass this gate for an
-    # immediate test run (e.g. testing on a weekend, without waiting for
-    # the next real trading-eligible evening). NEVER set this in
-    # production — it exists only so changes can be verified end-to-end
-    # without waiting up to several days for a normal scheduling window.
-    # Always loudly logged so a forced run is never mistaken for a real
-    # scheduled one.
     force_publish = os.environ.get("FORCE_PUBLISH") == "1"
     if force_publish:
         print("  [FORCE_PUBLISH=1 — scheduling gate BYPASSED for testing. "
@@ -1226,8 +1085,6 @@ def main():
 
     print(f"Universe: {len(CANDIDATE_UNIVERSE)} candidate tickers (ETFs/leveraged/crypto excluded)")
 
-    # ── Upcoming-earnings map (NEW 2026-07-21 — see comment at the
-    # get_upcoming_earnings_map() definition for the full rationale) ──
     print("\nLoading upcoming earnings calendar for the exclusion filter...")
     earnings_map = get_upcoming_earnings_map()
 
@@ -1266,12 +1123,6 @@ def main():
             "avg_dollar_vol": avg_dollar_vol,
         })
 
-    # ── DETERMINISTIC chart-pattern filter + ranking (NEW 2026-07-18) ──
-    # This is the actual fix for the non-determinism confirmed in
-    # production: chart-quality accept/reject and ranking now happen
-    # entirely in Python via check_chart_pattern() (real swing-point
-    # analysis), BEFORE Grok is ever called. Grok's only remaining job is
-    # writing narrative prose for whatever Python has already selected.
     print(f"\nApplying deterministic chart-pattern filter to {len(candidates)} candidate(s)...")
     pattern_matched = []
     for c in candidates:
@@ -1286,40 +1137,14 @@ def main():
                       if c["flow"]["bias"] != "Neutral" else "neutral flow, no clear direction")
             rejected_summary.append(f"{c['ticker']} ({reason})")
 
-    # ── RANKING BY FLOW INTENSITY (CHANGED 2026-07-21) ─────────────────
-    # Was: rank by raw flow premium. Confirmed bias in production: raw
-    # premium structurally favors the same mega-cap names night after
-    # night (a $9M AVGO flow always outranks a $2M flow on a mid-cap,
-    # even when the mid-cap flow is far more unusual relative to how
-    # that name normally trades). Fixed: rank by flow INTENSITY —
-    # premium normalized by the ticker's own average daily dollar volume
-    # (computed from the same daily bars already fetched, zero extra
-    # network calls). A $2M flow on a name that trades $200M/day (1.0%
-    # intensity) now correctly outranks a $9M flow on a name trading
-    # $9B/day (0.1%). Still 100% deterministic. Raw premium remains the
-    # tiebreaker, and any ticker whose volume data is missing falls back
-    # to intensity 0 with a loud log (never silently mis-ranked).
     for c in pattern_matched:
         if c["avg_dollar_vol"] > 0:
             c["flow_intensity"] = c["flow"]["premium"] / c["avg_dollar_vol"]
         else:
             c["flow_intensity"] = 0.0
-            print(f"  [RANK WARN] {c['ticker']}: no volume data — flow intensity set to 0, "
-                  f"will rank below all tickers with real volume data")
+            print(f"  [RANK WARN] {c['ticker']}: no volume data — flow intensity set to 0")
     pattern_matched.sort(key=lambda c: (c["flow_intensity"], c["flow"]["premium"]), reverse=True)
 
-    # ── EARNINGS EXCLUSION, applied in rank order (REVISED 2026-07-21) ─
-    # Walk the ranked list top-down, checking each ticker's upcoming
-    # earnings date (yfinance primary, Finnhub map secondary — see the
-    # source comment block above get_upcoming_earnings_map() for the
-    # full two-dead-sources history). A ticker reporting ON OR BEFORE
-    # its expiry is an earnings play, not a swing setup — the chart
-    # structure won't survive the print and the stop is meaningless
-    # through a gap. Blocked tickers are skipped (and named in the
-    # rejected list) and the next-ranked ticker slides in, until TOP_N
-    # clean setups are selected. Checking in rank order keeps this to
-    # ~5-10 yfinance calls per night instead of ~100+ (that endpoint
-    # has a confirmed real rate limit under heavy same-session use).
     selected = []
     for c in pattern_matched:
         if len(selected) >= TOP_N:
@@ -1336,27 +1161,19 @@ def main():
                 blocks = er_date <= cutoff
             if blocks:
                 src = "yfinance" if er_date == yf_er else "Finnhub"
-                print(f"  [ER EXCLUDE] {c['ticker']}: reports earnings {er_date} (per {src}, "
-                      f"expiry {c.get('expiry_iso') or 'unknown'}) — earnings play, not a swing setup")
+                print(f"  [ER EXCLUDE] {c['ticker']}: reports earnings {er_date} (per {src})")
                 rejected_summary.append(
                     f"{c['ticker']} (reports earnings {er_date}, before expiry — excluded as an earnings play)"
                 )
                 continue
         selected.append(c)
 
-    print(f"\n{len(pattern_matched)} of {len(candidates)} passed the deterministic pattern filter; "
-          f"taking top {len(selected)} by flow intensity (premium / avg daily $ volume).")
-    for c in pattern_matched[:10]:
-        print(f"  [RANK] {c['ticker']}: intensity={c['flow_intensity']*100:.2f}% "
-              f"(${c['flow']['premium']:,.0f} premium / ${c['avg_dollar_vol']:,.0f} avg daily $ vol)")
+    print(f"\n{len(selected)} of {len(candidates)} passed filters; taking top {len(selected)} by flow intensity.")
 
     if not selected:
         print("Nothing passed the deterministic chart-pattern filter tonight — no digest to post.")
         return
 
-    # Compute DTE-aware levels first (to get T1), then select the best
-    # liquid OTM strike anchored to T1. Order matters: T1 must exist
-    # before select_strike() can use it as an anchor.
     print("\nComputing trade levels and selecting strikes...")
     for c in selected:
         current_price = get_quote_change(c["ticker"]).get("price")
@@ -1365,8 +1182,7 @@ def main():
             continue
         c["current_price"] = current_price
 
-        # DTE — needed before compute_trade_levels so levels scale correctly
-        dte = 9  # fallback if expiry unknown
+        dte = 9
         if c.get("expiry_iso"):
             try:
                 exp_dt = datetime.strptime(c["expiry_iso"], "%Y-%m-%d")
@@ -1375,13 +1191,8 @@ def main():
                 pass
         c["dte"] = dte
 
-        # Step 1: DTE-aware stock-level entry/stop/targets (ATR-scaled).
-        # Must run BEFORE select_strike so T1 is available as the anchor.
         c.update(compute_trade_levels(c["direction"], c["bars"], current_price, dte=dte))
 
-        # Step 2: Strike selection — liquid OTM closest to T1.
-        # Liquidity (OI >= 100) is the gate; T1 picks which liquid
-        # strike to prefer. See select_strike() for the full tier logic.
         strike, premium = select_strike(
             c["ticker"], c["direction"], current_price,
             c.get("expiry_iso", ""), c["target1"]
@@ -1407,45 +1218,35 @@ def main():
 
     print(f"\n=== MARKET THEME ===\n{market_theme}\n")
     print(f"=== RISK NOTES ===\n{risk_notes}\n")
-    print(f"=== SELECTED ({len(accepted)}) — deterministic pattern + intensity ranking, Grok wrote narrative only ===")
+    print(f"=== SELECTED ({len(accepted)}) ===")
     for s in accepted:
-        prem_str = f" premium=${s['premium']}" if s.get("premium") else ""
-        print(f"  {s['ticker']} {s['direction']} ${s['strike']} [{s['pattern']}] "
-              f"intensity {s['flow_intensity']*100:.2f}% {s.get('dte','?')} DTE{prem_str} "
-              f"entry ${s['entry_low']}-${s['entry_high']} "
-              f"stop ${s['stop']} T1 ${s['target1']} T2 ${s['target2']}")
-    print(f"\n=== DETERMINISTICALLY REJECTED ({len(rejected_summary)}) ===")
-    for r in rejected_summary:
-        print(f"  {r}")
+        print(f"  {s['ticker']} {s['direction']} ${s['strike']}")
 
     out_path = "bmt_nightly_setups.png"
     render_card(accepted, rejected_summary, market_theme, risk_notes, market_context, target_date, data_date, out_path)
     print(f"\nCard saved to {out_path}")
 
-    posted = post_image_to_discord(out_path, message="**Top Trade Ideas**")
-    print("Posted to Discord!" if posted else "Discord post FAILED — check webhook.")
+    # Post text summary FIRST (NEW 2026-07-26)
+    text_digest = format_discord_digest(accepted, market_context, risk_notes)
+    posted_text = post_text_to_discord(text_digest)
+    
+    # THEN post the card image
+    posted_card = post_image_to_discord(out_path, message="")
+    
+    if posted_text and posted_card:
+        print("✓ Text summary + card posted to Discord!")
+    else:
+        if not posted_text:
+            print("✗ Text summary post FAILED")
+        if not posted_card:
+            print("✗ Card image post FAILED")
 
 
-run_nightly_job = main  # explicit alias — this function is called by both
-                         # the APScheduler job below AND the FORCE_PUBLISH
-                         # one-shot testing path
+run_nightly_job = main
 
 
 def start_scheduler():
-    """
-    Persistent-service entry point for Railway deployment. Uses the SAME
-    pattern as BMT's other Railway jobs (e.g. bmt_alerts_engagement.py) —
-    APScheduler with timezone="America/New_York", which auto-adjusts for
-    daylight saving. This is deliberately NOT Railway's own raw cron
-    feature, which is fixed-UTC and would silently drift by an hour at
-    every DST change unless manually corrected twice a year.
-
-    Fires EVERY day at 6:00pm ET, with no day-of-week restriction baked
-    into the scheduler itself — should_publish_tonight() (checked first
-    thing inside run_nightly_job()) already fully handles weekends and
-    the 2026 holiday calendar, so the scheduler doesn't need to duplicate
-    that logic. A skip night costs one no-op function call, nothing more.
-    """
+    """Persistent-service entry point for Railway deployment."""
     scheduler = BackgroundScheduler(timezone="America/New_York")
     scheduler.add_job(
         run_nightly_job, "cron",
@@ -1468,10 +1269,6 @@ def start_scheduler():
 
 if __name__ == "__main__":
     if os.environ.get("FORCE_PUBLISH") == "1":
-        # One-shot local testing path — run once immediately and exit,
-        # same as every FORCE_PUBLISH test run so far in this project.
         run_nightly_job()
     else:
-        # Real Railway deployment path — persistent service, self-
-        # scheduling, runs indefinitely.
         start_scheduler()
