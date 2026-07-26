@@ -1230,7 +1230,7 @@ def main():
     text_digest = format_discord_digest(accepted, market_context, risk_notes)
     posted_text = post_text_to_discord(text_digest)
     
-    # THEN post the card image
+    # THEN post the card images
     posted_card = post_image_to_discord(out_path, message="")
     
     if posted_text and posted_card:
