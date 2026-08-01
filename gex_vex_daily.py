@@ -28,6 +28,18 @@ PRODUCTION HARDENING vs. the test script (test_gex_vex_live.py):
     success/failure summary, formatted for Railway's log viewer.
   - Exits with a non-zero code on any failure, so Railway's own
     monitoring can flag a bad run.
+
+IMPORT SAFETY (added 2026-07-31): a corrupted/duplicated gex_vex.py
+(confirmed in production — the file had gotten pasted twice back-to-
+back during a repo update, producing a SyntaxError at the seam) caused
+this container to crash immediately at "import gex_vex" with nothing
+more than a bare traceback pointing at this line — no indication of
+WHY the import failed unless you already knew to go read gex_vex.py's
+own error. The import is now wrapped so a future import failure of any
+kind (syntax error, missing dependency, etc.) logs a clear, loud
+diagnostic via this module's own log() format BEFORE the traceback,
+so it's immediately visible in Railway's log viewer without having to
+cross-reference a separate file.
 """
 
 import os
@@ -37,16 +49,24 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-import gex_vex
+
+def log(msg: str):
+    print(f"[GEX-DAILY] {msg}", flush=True)
+
+
+try:
+    import gex_vex
+except Exception as e:
+    log(f"FATAL: failed to import gex_vex.py — {type(e).__name__}: {e}")
+    log("This usually means gex_vex.py has a syntax error or was pasted/")
+    log("uploaded incorrectly (e.g. duplicated content, truncated file).")
+    log("Check the file directly before assuming this is a data/API issue.")
+    raise
 
 WEBHOOK_URL = os.environ.get("GEX_DISCORD_WEBHOOK", "")
 TICKERS = ["SPY", "QQQ", "IWM"]
 OUT_PATH = "gex_dashboard.png"
 ET = ZoneInfo("America/New_York")
-
-
-def log(msg: str):
-    print(f"[GEX-DAILY] {msg}", flush=True)
 
 
 def post_embed_to_discord(webhook_url: str, embed: dict) -> bool:
