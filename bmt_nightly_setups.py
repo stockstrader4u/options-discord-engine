@@ -31,6 +31,22 @@ get_next_expiry() in the scanner) rather than manually re-picking
 "Jul 17 or Jul 24" — this generalizes correctly week to week without
 needing a hardcoded date.
 
+DISCORD DIGEST FIX (2026-08-02): format_discord_digest() previously built
+its "market_context_line" from a HARDCODED template string ("tape favors
+mean-reversion into exhaustion... on the weakness... institutional buying
+into lows") that never changed regardless of what actually happened in
+the market that night -- confirmed present verbatim across multiple
+nights' posted output, and independently confirmed WRONG on at least one
+night (called a +0.72% SPY day "weakness"). The real Grok-generated
+market_theme (already being computed correctly in write_narratives() and
+used in the card image) was being silently discarded for the Discord text
+post. Fixed: format_discord_digest() now takes market_theme as a
+parameter and uses it. Also tightened write_narratives()'s prompt to
+explicitly ban the confirmed boilerplate phrases and require citing real
+per-night numbers, since a temperature=0 call with a rigid, unchanged
+prompt structure can still drift toward a narrow phrase bank even when
+correctly grounded in real data.
+
 Run locally:
     C:\\Python314\\python.exe bmt_nightly_setups.py
 
@@ -78,14 +94,6 @@ MIN_PREMIUM = 50_000   # matches BMT's manual "min $50K premium" filter
 TOP_N       = 5
 
 # ── Universe (SYNCED 2026-07-21 to the single BMT MASTER SCAN list) ────────
-# This is now the SAME 167-ticker curated list deployed to
-# er_lotto_scanner.py on 2026-07-21 — one master list for both products,
-# no more drift. Changes vs the old copy of this list: added TDOC, ROKU,
-# Z, MA, CHWY, XPEV, IBIT, SPOT-adjacent adds, plus the big_mover_screen-
-# validated FISV / AKAM / LUV / PYPL; dropped CRML and MP (removed from
-# the master list); SPY/QQQ/IWM removed from the list itself since they
-# are fetched separately for the market-context strip and were never
-# tradeable candidates anyway.
 FULL_WATCHLIST = [
     "TDOC","DDOG","DOCU","MDB","ANET","TWLO","ETSY","CRM","UBER","ROKU",
     "NFLX","NVDA","OKTA","SBUX","FTNT","SHOP","AAPL","Z","TSLA","MA",
@@ -106,11 +114,6 @@ FULL_WATCHLIST = [
     "AAOI","SPCX","AEHR","SKHY","AKAM","FISV","LUV",
 ]
 
-# ETFs, leveraged products, and non-equity symbols — excluded from the
-# tradeable candidate pool per BMT's own manual prompt rule. SPY/QQQ/IWM
-# are fetched separately for the market-context strip; IBIT is on the
-# master list (it reports nothing and trends like BTC) but is an ETF and
-# therefore stays out of the single-name setup pool.
 EXCLUDE_FROM_CANDIDATES = {
     "IWM", "QQQ", "SPY", "UVXY", "SQQQ", "TQQQ", "NUGT", "SLV", "USO",
     "IBIT", "NVDL", "OKEX:ETHUSD", "COINBASE:^BTCUSD",
@@ -124,8 +127,6 @@ CANDIDATE_UNIVERSE = [t for t in FULL_WATCHLIST if t not in EXCLUDE_FROM_CANDIDA
 EARNINGS_LOOKAHEAD_DAYS = 14
 
 def get_upcoming_earnings_map() -> dict:
-    """Returns {ticker: 'YYYY-MM-DD' earliest upcoming earnings date} for
-    the next EARNINGS_LOOKAHEAD_DAYS, or {} on total failure (logged)."""
     today = datetime.now(ET).strftime("%Y-%m-%d")
     end = (datetime.now(ET) + timedelta(days=EARNINGS_LOOKAHEAD_DAYS)).strftime("%Y-%m-%d")
     for attempt in range(3):
@@ -155,26 +156,6 @@ def get_upcoming_earnings_map() -> dict:
 
 
 def get_upcoming_earnings_date(ticker: str) -> str:
-    """
-    PRIMARY earnings-date source (REVISED 2026-07-21, same night, after
-    TWO confirmed-dead cheap sources — see comment block above):
-      1. Finnhub forward calendar: capped at 1,500 rows on the free
-         tier, silently missing TSLA/GOOGL/IBM/INTC/NOW/CRM/MMM during
-         a peak-season window (confirmed via live diagnostic query).
-      2. Yahoo chart-meta earningsTimestamp fields: confirmed live to
-         be None across the board (TSLA/GOOGL/IBM/MMM/AAPL all empty) —
-         consistent with the same morning's ER lotto run needing the
-         Grok fallback for every single date verification.
-    FINAL: yfinance's get_earnings_dates() — the SAME function already
-    extensively validated in production for get_historical_er_move()'s
-    fix, which returns FUTURE scheduled dates in the same dataframe as
-    past ones. Confirmed live before adopting: TSLA/GOOGL/IBM all
-    correctly showed 2026-07-22, BE/CAR showed 2026-07-28. Requires
-    lxml (added to this repo's requirements.txt — it was previously
-    only in -bmt-market-mcp's, per the different-repos-different-
-    packages convention).
-    Returns the EARLIEST future 'YYYY-MM-DD' date, or None.
-    """
     try:
         import yfinance as yf
         edf = yf.Ticker(ticker).get_earnings_dates(limit=8)
@@ -218,10 +199,6 @@ def call_jarvis(tool_name, arguments={}):
 
 
 def get_flow_for_ticker(ticker: str) -> dict:
-    """Same logic/thresholds as er_lotto_scanner.py's get_flow_for_ticker(),
-    but returns structured data (bias, premium, pct) instead of a
-    pre-formatted string, since we need the raw premium number to filter
-    on MIN_PREMIUM here."""
     result = call_jarvis("stock_ticker_unusual_options_data", {"filter_by_Ticker": ticker})
     if not result:
         return {"bias": None, "premium": 0, "call_pct": None}
@@ -255,10 +232,6 @@ def get_flow_for_ticker(ticker: str) -> dict:
 
 # ── Daily OHLC (same yfinance pattern proven elsewhere in the stack) ───────
 def get_daily_ohlc(ticker: str, sessions: int = 15) -> list:
-    """Returns structured daily bars: [{date, open, high, low, close,
-    volume}, ...] oldest-to-newest. Needed for deterministic swing
-    high/low calculation, not just the formatted text summary. Volume
-    added 2026-07-21 for the flow-intensity ranking (see main())."""
     try:
         import yfinance as yf
         stock = yf.Ticker(ticker)
@@ -278,10 +251,6 @@ def get_daily_ohlc(ticker: str, sessions: int = 15) -> list:
 
 
 def compute_avg_dollar_volume(bars: list) -> float:
-    """Average daily dollar volume (close x share volume) across the
-    supplied bars. Used to normalize flow premium into a size-relative
-    'intensity' — computed entirely from bars already fetched, zero
-    extra network calls."""
     vals = [b["close"] * b["volume"] for b in bars if b.get("close") and b.get("volume")]
     if not vals:
         return 0.0
@@ -307,7 +276,6 @@ def get_strike_increment(price):
 
 
 def compute_daily_atr(bars, period=10):
-    """Average high-low range over the last N bars."""
     recent = bars[-period:] if len(bars) >= period else bars
     if not recent:
         return 0.0
@@ -315,7 +283,6 @@ def compute_daily_atr(bars, period=10):
 
 
 def get_option_premium(ticker, direction, strike, expiry_iso):
-    """Fetches real mid-price of a specific option contract."""
     try:
         import yfinance as yf
         chain = yf.Ticker(ticker).option_chain(expiry_iso)
@@ -338,28 +305,6 @@ def get_option_premium(ticker, direction, strike, expiry_iso):
 
 def select_strike(ticker: str, direction: str, current_price: float,
                   expiry_iso: str, target1: float) -> tuple:
-    """
-    Returns (strike, premium_or_None).
-
-    Picks the best LIQUID OTM strike anchored to Target 1 — not blindly
-    ATM, and not just closest-to-T1 without checking liquidity.
-
-    Logic (tiered, always returns something):
-      1. Pull the full OTM side of the chain (above price for calls,
-         below for puts — no ATM).
-      2. Primary filter: OI >= 100. These are genuinely liquid contracts
-         with real open interest — fills are realistic.
-      3. Among primary-liquid OTM strikes, pick the one CLOSEST to T1.
-         T1 is the directional anchor (the strike makes sense if the
-         stock reaches its first target) but liquidity is the gate.
-      4. If no strike passes OI >= 100, retry with OI >= 25 (soft
-         fallback — some OTM liquidity is better than none).
-      5. If still nothing, take any OTM strike (last resort before ATM).
-      6. Final fallback: ATM if no OTM strikes exist at all.
-
-    Prints a [STRIKE] log line showing which tier fired, the chosen
-    strike, OI, volume, and premium so every selection is auditable.
-    """
     try:
         import yfinance as yf
         chain = yf.Ticker(ticker).option_chain(expiry_iso)
@@ -367,7 +312,6 @@ def select_strike(ticker: str, direction: str, current_price: float,
         if df.empty:
             raise ValueError("empty chain")
 
-        # OTM only — strictly beyond current price
         if direction.upper() == "CALL":
             otm = df[df["strike"] > current_price].copy()
         else:
@@ -393,17 +337,14 @@ def select_strike(ticker: str, direction: str, current_price: float,
                   f"closest to T1 ${target1}")
             return strike, premium
 
-        # Tier 1: OI >= 100
         result = _pick_from(otm[otm["openInterest"].fillna(0) >= 100], "OI>=100")
         if result:
             return result
 
-        # Tier 2: OI >= 25
         result = _pick_from(otm[otm["openInterest"].fillna(0) >= 25], "OI>=25 fallback")
         if result:
             return result
 
-        # Tier 3: any OTM
         result = _pick_from(otm, "any OTM, no liquidity")
         if result:
             return result
@@ -411,7 +352,6 @@ def select_strike(ticker: str, direction: str, current_price: float,
         raise ValueError("no OTM strikes available")
 
     except Exception as e:
-        # Final fallback: ATM
         inc = get_strike_increment(current_price)
         if direction.upper() == "CALL":
             atm = round((current_price // inc + 1) * inc, 2)
@@ -423,13 +363,6 @@ def select_strike(ticker: str, direction: str, current_price: float,
 
 
 def compute_trade_levels(direction, bars, current_price, dte=9):
-    """
-    DTE-aware stock-level entry/stop/target levels.
-    REWRITTEN 2026-07-21: anchored to real ATR, scaled by sqrt(DTE/5).
-    Stop = 0.75x ATR against entry.
-    T1 = 1x (ATR * sqrt(DTE/5)), T2 = 2x.
-    BE ($226, ATR~$6, 9 DTE): stop~$221.50, T1~$234, T2~$242.
-    """
     atr = compute_daily_atr(bars)
     if atr <= 0:
         atr = current_price * 0.02
@@ -455,12 +388,8 @@ def compute_trade_levels(direction, bars, current_price, dte=9):
     }
 
 
-
-
 # ── Deterministic chart-pattern detection ────────────────────────────────────
 def find_swing_points(bars: list) -> tuple:
-    """Returns (swing_highs, swing_lows) as lists of (index, price) for
-    local extremes — a bar whose high/low exceeds both immediate neighbors."""
     highs = [b["high"] for b in bars]
     lows  = [b["low"]  for b in bars]
     swing_highs, swing_lows = [], []
@@ -473,10 +402,6 @@ def find_swing_points(bars: list) -> tuple:
 
 
 def is_clean_uptrend(bars: list) -> dict:
-    """Returns {"clean": bool, "pattern": str or None}. Checks for CALLS:
-    (a) smooth monotonic rise in daily lows,
-    (b) genuine higher-lows swing sequence,
-    (c) clean V-recovery."""
     window = bars[-10:] if len(bars) >= 10 else bars
     if len(window) < 5:
         return {"clean": False, "pattern": None}
@@ -504,7 +429,6 @@ def is_clean_uptrend(bars: list) -> dict:
 
 
 def is_clean_downtrend(bars: list) -> dict:
-    """Mirror of is_clean_uptrend() for PUTS: lower-highs or clean breakdown."""
     window = bars[-10:] if len(bars) >= 10 else bars
     if len(window) < 5:
         return {"clean": False, "pattern": None}
@@ -531,15 +455,68 @@ def is_clean_downtrend(bars: list) -> dict:
     return {"clean": False, "pattern": None}
 
 
+def get_iv_vs_realized_vol_with_ratio(ticker: str, expiry_iso: str) -> tuple:
+    """
+    NEW (2026-08-03): computes ATM IV vs 20-day realized vol, returning
+    BOTH a formatted display string AND the raw numeric ratio -- the
+    ratio is used to actually GATE and RANK candidates during selection
+    (see main()), not just as narrative color after the fact. Direct
+    fix for a confirmed real problem: the previous design only surfaced
+    IV/RV richness AFTER a setup was already selected and published,
+    meaning a genuinely overpriced setup could still make the top 5 on
+    flow strength alone, with the narrative then having to awkwardly
+    warn against the very idea being published. Same core computation
+    as er_lotto_scanner.py's proven get_iv_vs_realized_vol().
+    """
+    try:
+        import yfinance as yf
+        import math
+        stock = yf.Ticker(ticker)
+        price = stock.info.get("regularMarketPrice") or stock.info.get("currentPrice")
+        if not price:
+            hist_1d = stock.history(period="1d")
+            price = float(hist_1d["Close"].iloc[-1]) if not hist_1d.empty else None
+        if not price or not expiry_iso:
+            return "N/A", None
+
+        chain = stock.option_chain(expiry_iso)
+        calls = chain.calls[chain.calls["impliedVolatility"] > 0]
+        puts = chain.puts[chain.puts["impliedVolatility"] > 0]
+        if calls.empty or puts.empty:
+            return "N/A", None
+        common = set(calls["strike"].tolist()) & set(puts["strike"].tolist())
+        if not common:
+            return "N/A", None
+        atm_strike = min(common, key=lambda s: abs(s - price))
+        call_iv = float(calls[calls["strike"] == atm_strike]["impliedVolatility"].iloc[0])
+        put_iv = float(puts[puts["strike"] == atm_strike]["impliedVolatility"].iloc[0])
+        atm_iv = (call_iv + put_iv) / 2
+
+        hist = stock.history(period="1mo")
+        if hist.empty or len(hist) < 10:
+            return "N/A", None
+        closes = hist["Close"].values
+        log_returns = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes)) if closes[i - 1] > 0]
+        if len(log_returns) < 5:
+            return "N/A", None
+        mean_r = sum(log_returns) / len(log_returns)
+        variance = sum((r - mean_r) ** 2 for r in log_returns) / (len(log_returns) - 1)
+        realized_vol = math.sqrt(variance) * math.sqrt(252)
+        if realized_vol <= 0:
+            return "N/A", None
+
+        ratio = round(atm_iv / realized_vol, 2)
+        atm_iv_pct = round(atm_iv * 100, 1)
+        realized_vol_pct = round(realized_vol * 100, 1)
+        label = "richly priced" if ratio >= 1.5 else ("cheaply priced" if ratio <= 0.8 else "fairly priced")
+        display_str = f"IV {atm_iv_pct}% vs {realized_vol_pct}% realized ({ratio}x, {label} vs recent movement)"
+        return display_str, ratio
+    except Exception as e:
+        print(f"  [IV/RV WARN] {ticker}: {e}")
+        return "N/A", None
+
+
 def check_chart_pattern(flow_bias: str, bars: list) -> dict:
-    """
-    Single entry point: given the flow bias (Bullish/Bearish/Neutral) and
-    real daily bars, deterministically decides direction + whether the
-    chart structure genuinely supports it. Neutral-flow tickers are
-    excluded outright — same "flow direction must align with chart
-    direction" rule from BMT's original manual prompt, just enforced in
-    code instead of left to an LLM's discretion.
-    """
     if flow_bias == "Bullish":
         result = is_clean_uptrend(bars)
         return {"direction": "CALL", "clean": result["clean"], "pattern": result["pattern"]}
@@ -551,23 +528,6 @@ def check_chart_pattern(flow_bias: str, bars: list) -> dict:
 
 
 def get_quote_change(ticker: str) -> dict:
-    """
-    BUGFIX (2026-07-18): originally trusted Yahoo's meta.previousClose /
-    meta.chartPreviousClose fields directly for the % change calculation.
-    Confirmed wrong in production: script reported SPY -1.53% and QQQ
-    -3.12% for July 17, 2026, when the REAL close-to-close moves that
-    day were S&P 500 -1.01% and Nasdaq -1.40% (per real index data).
-    QQQ's reported move was roughly DOUBLE the real one — consistent
-    with the meta field accidentally referencing a close from 2 sessions
-    back rather than the immediately preceding session (a known Yahoo
-    quirk that gets worse when queried outside regular trading hours,
-    e.g. over a weekend, which is exactly when this was caught).
-
-    Fixed: pull actual daily OHLC bars directly (same real chart data
-    used elsewhere in this file) and compute % change from the two most
-    recent REAL closing bars ourselves, rather than trusting a
-    single meta field that can silently reference the wrong day.
-    """
     try:
         r = requests.get(
             f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
@@ -579,9 +539,6 @@ def get_quote_change(ticker: str) -> dict:
         quote = result["indicators"]["quote"][0]
         closes, opens, highs, lows = quote["close"], quote["open"], quote["high"], quote["low"]
 
-        # Keep only bars with a real close (last bar of day can be None
-        # intraday/pre-market) — walk from the end to find the two most
-        # recent COMPLETE sessions.
         valid_idxs = [i for i in range(len(closes)) if closes[i] is not None]
         if len(valid_idxs) < 2:
             return {"price": None, "pct": None, "open": None, "high": None, "low": None}
@@ -603,15 +560,10 @@ def get_quote_change(ticker: str) -> dict:
 
 
 def get_tone_phrase(m: dict) -> str:
-    """Deterministic tone phrase from daily O/H/L/C — a coarser stand-in
-    for BMT's real intraday-based tone text (e.g. 'afternoon fade'),
-    since this script only has daily bars, not minute-level data. Close
-    position within the day's range is used as the best available proxy
-    for how the session actually traded."""
     price, o, h, l, pct = m.get("price"), m.get("open"), m.get("high"), m.get("low"), m.get("pct")
     if not all([price, o, h, l]) or h == l:
         return "N/A"
-    range_pos = (price - l) / (h - l)  # 0 = closed at low, 1 = closed at high
+    range_pos = (price - l) / (h - l)
     gapped = pct is not None and abs(pct) > 0.3
     if pct is not None and pct < 0:
         if range_pos < 0.3:
@@ -630,13 +582,9 @@ def get_tone_phrase(m: dict) -> str:
     return "Flat, inside day"
 
 
-MIN_DTE = 7  # minimum calendar days to expiry for a swing setup.
-
+MIN_DTE = 7
 
 def get_next_expiry(ticker: str, min_dte: int = MIN_DTE) -> dict:
-    """Returns {"label": "Jul 31", "iso": "2026-07-31"} for the nearest
-    available expiry with at least min_dte calendar days remaining, or
-    {"label": "N/A", "iso": None}."""
     try:
         import yfinance as yf
         expirations = yf.Ticker(ticker).options
@@ -657,64 +605,215 @@ def get_next_expiry(ticker: str, min_dte: int = MIN_DTE) -> dict:
 
 
 # ── Grok narrative call (ONE call per night, same model as the ER lotto pipeline)
+QUALITY_TAG_MAP = {
+    "V-recovery": "V-Recovery Bounce",
+    "higher lows": "Higher Lows Base",
+    "lower highs": "Lower Highs Breakdown",
+    "breakdown": "Clean Breakdown",
+}
+
+
+def build_quality_tag(pattern: str) -> str:
+    """
+    REDESIGNED (2026-08-03): previously asked the LLM to re-derive this
+    from data it was already handed (the pattern was already known
+    deterministically from check_chart_pattern()). Restating a known
+    value in sentence form isn't narrative, it's redundant -- confirmed
+    directly by the user. Now built in code: zero LLM cost, zero
+    hallucination risk, byte-for-byte accurate by construction.
+    """
+    return QUALITY_TAG_MAP.get(pattern, pattern.title() if pattern else "Pattern Match")
+
+
+def build_price_narrative(c: dict) -> str:
+    """Same reasoning as build_quality_tag() -- built directly from the
+    real OHLC bars already fetched, no LLM involved."""
+    bars = c["bars"]
+    if c["direction"] == "CALL":
+        extreme_bar = min(bars, key=lambda b: b["low"])
+        extreme_val, extreme_label, verb = extreme_bar["low"], "low", "bottomed"
+    else:
+        extreme_bar = max(bars, key=lambda b: b["high"])
+        extreme_val, extreme_label, verb = extreme_bar["high"], "high", "topped"
+    latest = bars[-1]
+    extreme_date_str = extreme_bar["date"].strftime("%b %d").replace(" 0", " ")
+    latest_date_str = latest["date"].strftime("%b %d").replace(" 0", " ")
+    return (f"{c['ticker']} {verb} at ${extreme_val:.2f} on {extreme_date_str}, "
+            f"closing at ${latest['close']:.2f} on {latest_date_str}.")
+
+
+def build_flow_note_display(flow: dict) -> str:
+    premium = flow["premium"]
+    premium_str = f"${premium / 1_000_000:.2f}M" if premium >= 1_000_000 else f"${premium / 1_000:.0f}K"
+    return f"{premium_str} OTM/ATM {flow['bias'].lower()}, {flow['call_pct']}% call-weighted"
+
+
+def build_time_pressure(c: dict) -> dict:
+    """
+    NEW (2026-08-03): fully deterministic -- exactly how far does the
+    stock need to move, and in how many days, to reach the suggested
+    strike? Fed to the LLM as grounding context so its synthesis can
+    reason about whether the IV/RV picture makes that SPECIFIC
+    move-in-that-SPECIFIC-window look plausible, tying vol pricing
+    directly to the contract's actual mechanics instead of generic
+    commentary disconnected from what the trade actually needs to do.
+    """
+    try:
+        expiry_dt = datetime.strptime(c["expiry_iso"], "%Y-%m-%d").date() if c.get("expiry_iso") else None
+        today = datetime.now(ET).date()
+        dte = (expiry_dt - today).days if expiry_dt else c.get("dte", "?")
+    except Exception:
+        dte = c.get("dte", "?")
+    if c.get("strike") and c.get("current_price"):
+        move_needed_pct = round((c["strike"] - c["current_price"]) / c["current_price"] * 100, 1)
+        summary = f"needs {move_needed_pct:+.1f}% by {c['next_expiry']} ({dte} calendar days) to reach the ${c['strike']:g} strike"
+    else:
+        move_needed_pct = None
+        summary = f"{dte} calendar days to {c['next_expiry']} expiry"
+    return {"dte": dte, "move_needed_pct": move_needed_pct, "summary": summary}
+
+
+def get_analyst_target(ticker: str) -> str:
+    """
+    NEW (2026-08-03): where does the stock sit relative to where
+    analysts think it's headed over 12 months? yfinance-only (no
+    Finnhub dependency added), a genuinely new signal beyond price/flow.
+    """
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info
+        target_mean = info.get("targetMeanPrice")
+        current = info.get("regularMarketPrice") or info.get("currentPrice")
+        rec_key = info.get("recommendationKey", "")
+        if not target_mean or not current:
+            return "N/A"
+        upside_pct = round((target_mean - current) / current * 100, 1)
+        consensus = rec_key.replace("_", " ").title() if rec_key else "N/A"
+        return f"Analyst target ${target_mean:.2f} ({upside_pct:+.1f}% from current), consensus: {consensus}"
+    except Exception as e:
+        print(f"  [ANALYST WARN] {ticker}: {e}")
+        return "N/A"
+
+
 def write_narratives(selected: list, rejected_summary: list, market_context: dict) -> dict:
+    """
+    REDESIGNED (2026-08-03), THIRD major revision -- three separate
+    real problems fixed, in order of when they were caught:
+
+    1. quality_tag/narrative/flow_note were NEVER "narrative" -- all
+       three restated data already known deterministically. Cut from
+       the LLM's job entirely; now built in code (see the builder
+       functions above this one).
+
+    2. EXPIRY-AWARENESS BUG: an earlier version's synthesis cited a
+       real news event that fell AFTER the contract's actual expiry
+       date, presenting it as if directly relevant to a position that
+       would already be closed by then. Fixed by giving the model each
+       setup's exact expiry date/DTE and requiring explicit before/
+       after-expiry framing for any cited event.
+
+    3. TONE/SELECTION MISMATCH: the previous design let the LLM
+       independently judge "is this a good trade" AFTER selection had
+       already published it -- resulting in every synthesis reading
+       skeptical, since IV/RV richness (a side effect of the exact
+       V-recovery pattern this scanner selects for) kept surfacing as
+       a reason to doubt ideas that had already been decided worth
+       publishing. FIXED UPSTREAM: main() now hard-excludes setups
+       with IV/RV > 2.5x from ever reaching selection, and ranks
+       surviving candidates by flow strength AND pricing quality
+       together (see main()'s selection loop). This function is told
+       explicitly that pricing has ALREADY been screened, so its job
+       is genuine synthesis on ideas that already cleared a bar, not
+       re-litigating from scratch.
+    """
     context_block = "\n".join(
-        f"{t}: ${market_context[t]['price']} ({market_context[t]['pct']:+.2f}%) "
-        f"[O={market_context[t].get('open')} H={market_context[t].get('high')} "
-        f"L={market_context[t].get('low')} C={market_context[t]['price']}]"
+        f"{t}: ${market_context[t]['price']} ({market_context[t]['pct']:+.2f}%)"
         for t in MARKET_CONTEXT_TICKERS if market_context.get(t, {}).get("price")
     )
 
+    # NEW (2026-08-03): setups are passed in CONVICTION ORDER (selection
+    # already ranks by flow-strength-and-pricing, see main()'s ranking_score
+    # sort) -- each is explicitly labeled #1 (highest conviction) through
+    # #N (lowest of the group, though still genuinely good -- only
+    # pricing-screened setups reach this list at all). This lets the
+    # model's writing structurally mirror the ranking: lead with #1,
+    # taper detail toward the bottom, instead of treating all 5 as
+    # interchangeable.
     setup_blocks = []
-    for c in selected:
+    for i, c in enumerate(selected):
+        tp = c.get("time_pressure") or build_time_pressure(c)
         setup_blocks.append(
-            f"### {c['ticker']} — ALREADY SELECTED as a {c['direction']} "
-            f"(deterministic pattern match: {c['pattern']})\n"
-            f"Options Flow: {c['flow']['bias']} — ${c['flow']['premium']:,.0f} bought OTM/ATM premium "
-            f"({c['flow']['call_pct']}% call-weighted)\n"
-            f"Next expiry: {c['next_expiry']}\n"
-            f"Last {len(c['ohlc_text'].splitlines())} sessions (daily OHLC):\n{c['ohlc_text']}\n"
+            f"### CONVICTION RANK #{i+1} of {len(selected)}: {c['ticker']} "
+            f"({c['direction']}, strike ${c.get('strike', '?'):g}, "
+            f"EXPIRES {c['next_expiry']} = {tp['dte']} calendar days from today)\n"
+            f"Flow: {build_flow_note_display(c['flow'])}\n"
+            f"IV vs Realized Vol: {c.get('iv_rv_str', 'N/A')} (this has ALREADY been screened -- "
+            f"anything over 2.5x was excluded before you saw this setup, so do not re-litigate "
+            f"whether the premium is 'too expensive' as if reconsidering the trade's validity)\n"
+            f"Analyst Target: {c.get('analyst_target', 'N/A')}\n"
+            f"Time pressure: {tp['summary']}\n"
         )
     setups_text = "\n".join(setup_blocks)
     rejected_text = "; ".join(rejected_summary) if rejected_summary else "none notable"
 
-    prompt = f"""You are writing subscriber-facing narrative copy for options setups that have ALREADY been selected by a deterministic screen — you are NOT deciding which tickers qualify, only describing why the ones given to you are good setups, using the real daily price data.
+    prompt = f"""These options setups have ALREADY been selected AND already screened for reasonable pricing (see each setup's IV/RV note) -- you are NOT deciding whether they're worth trading, that's already been decided. Your job is genuine synthesis.
 
-MARKET CONTEXT (today's SPY/QQQ/IWM open/high/low/close):
-{context_block}
+MARKET: {context_block}
+TODAY'S DATE: {datetime.now(ET).strftime('%Y-%m-%d')}
 
-ALREADY-SELECTED SETUPS (do not second-guess these, just write accurate narrative for each):
+SETUPS, IN CONVICTION ORDER (#1 = highest conviction, #{len(selected)} = lowest of this group -- still genuinely good, only pricing-screened setups reach this list):
 {setups_text}
 
-TICKERS THE DETERMINISTIC SCREEN REJECTED (for your risk-notes reference only): {rejected_text}
+TICKERS THE DETERMINISTIC SCREEN REJECTED (minor context only): {rejected_text}
 
-TASK:
-For each already-selected setup, write:
-- quality_tag: a 2-4 word badge summarizing the pattern (e.g. "Clean breakdown", "Higher lows pullback")
-- narrative: 2 sentences MAXIMUM, under 260 characters total, citing SPECIFIC price levels and dates from the daily data given — must be a complete thought that fits, not a longer narrative cut short
-- flow_note: short phrase summarizing the flow, e.g. "$855K at-ask puts, ~2% OTM"
+CRITICAL RULE ON DATES: if you mention ANY event/date via search, you MUST state whether it falls BEFORE or AFTER that specific contract's expiry date. An event after expiry is not a direct catalyst for that trade -- omit it or explicitly frame it as pre-positioning context only.
 
-Also write:
-- market_theme: ONE sentence describing today's overall market theme/bias, citing the real SPY/QQQ/IWM O/H/L/C given above
-- risk_notes: 1-2 sentences on risk for tomorrow (gap risk, theta given DTE, etc.) that names 2-3 of the rejected tickers listed above with brief reasons
+CRITICAL RULE ON TONE: these ideas already passed a real pricing bar -- do not write as if reconsidering whether they're worth trading. Lead with what supports each idea, not doubt about it, unless something genuinely concerning shows up in search.
 
-Return ONLY valid JSON, this exact shape, nothing else, one entry per selected ticker in the SAME ORDER given:
+CRITICAL RULE ON LINKS: do NOT include any URLs, website names, or "according to [source]" citations anywhere in your output -- write facts in plain prose without naming or linking sources. Discord auto-generates ugly, unrelated-looking link preview embeds from any URL or domain-like text (e.g. "tikr.com"), so citing a source by name or link breaks the formatting badly.
+
+CRITICAL RULE ON DIRECTION: these setups may be CALLS, PUTS, or a mix -- use direction-neutral language ("positions," "trades," "setups"), never assume "calls."
+
+You have TWO separate writing jobs:
+
+JOB 1 -- for the card image (keep these SHORT, as before):
+- market_theme: ONE sentence, cites actual SPY/QQQ closing prices and % moves by number.
+- risk_notes: ONE short sentence on risk for tomorrow.
+
+JOB 2 -- for the Discord text digest, a SEPARATE, cohesive multi-paragraph write-up covering ALL {len(selected)} setups TOGETHER as one connected piece, NOT independent per-ticker bullets:
+- digest_thesis: 2-3 sentences. DO NOT describe the screening methodology itself (bullish flow, IV/RV pricing, pattern matching) -- that filter is IDENTICAL every single night by construction, so describing it produces near-duplicate text night after night regardless of wording. Instead, identify what's DISTINCTIVE about TONIGHT'S SPECIFIC group: is there a real sector concentration (e.g. multiple names in the same industry)? A genuine connecting thread you found via search? Something notable about tonight's actual numbers (an unusually tight or wide spread of required moves, a standout IV/RV reading)? If nothing genuinely distinctive stands out beyond the standard screen, say that plainly and briefly rather than re-describing the mechanical filter in different words.
+- digest_body: flowing prose (not a bullet list) covering ALL {len(selected)} tickers IN THE CONVICTION ORDER GIVEN. Give more detail/reasoning to the higher-ranked setups (#1 should anchor and lead the paragraph), and group the lower-conviction ones together more briefly toward the end -- but EVERY ticker must be mentioned at least briefly, since this needs to fit in a single Discord message. Prioritize mentioning all {len(selected)} tickers briefly over writing extensively about only the top 2-3 and running out of room. Reference each ticker and its strike explicitly. Keep total length tight -- aim for roughly 1-2 sentences per ticker on average, erring short rather than long.
+- digest_risk: 1-2 sentences. DO NOT cite "these all share the same expiry so they all face theta/gap risk together" -- ALL setups in this pipeline always share one weekly expiry by construction, so this is true every single night and isn't distinctive information. Instead find a risk SPECIFIC to tonight: real sector concentration risk (if multiple names share an industry), a specific real macro event this particular week (use search -- FOMC, CPI, jobs report, a sector-specific data release) that could hit these positions, or something else genuinely tied to tonight's actual context. If truly nothing beyond the generic timing risk applies, say so plainly rather than restating the generic mechanic.
+
+Return ONLY valid JSON, nothing else:
 {{
-  "market_theme": "one sentence, cites real O/H/L/C levels",
-  "risk_notes": "1-2 sentences naming specific rejected tickers",
-  "setups": [
-    {{"ticker": "XXXX", "quality_tag": "...", "narrative": "...", "flow_note": "..."}}
-  ]
+  "market_theme": "one sentence, cites real SPY/QQQ numbers by value",
+  "risk_notes": "one short sentence, brief",
+  "digest_thesis": "2-3 sentences, the real shared thread",
+  "digest_body": "flowing prose covering all tickers in conviction order",
+  "digest_risk": "1-2 sentences, one shared risk"
 }}"""
 
     resp = requests.post(
         f"{OPENROUTER_BASE}/chat/completions",
         headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-        json={"model": "x-ai/grok-4.3", "max_tokens": 3000, "temperature": 0,
+        json={"model": "moonshotai/kimi-k2.6", "max_tokens": 16000, "temperature": 0,
+              "plugins": [{"id": "web"}],
               "messages": [{"role": "user", "content": prompt}]},
-        timeout=90
+        timeout=120
     )
-    content = resp.json()["choices"][0]["message"]["content"].strip()
+    raw = resp.json()
+    if "choices" not in raw:
+        print("  [NARRATIVE ERROR] unexpected response (no 'choices' key):")
+        print(f"  {json.dumps(raw, indent=2)[:1000]}")
+        raise ValueError("write_narratives: unexpected API response shape")
+    message = raw["choices"][0]["message"]
+    content = message.get("content")
+    if not content:
+        print("  [NARRATIVE ERROR] empty/None content -- likely an incomplete tool call:")
+        print(f"  {json.dumps(message, indent=2)[:1000]}")
+        raise ValueError("write_narratives: empty content in API response")
+    content = content.strip()
     content = content.replace("```json", "").replace("```", "").strip()
     return json.loads(content)
 
@@ -723,7 +822,6 @@ import textwrap
 
 def fit_value_fontsize(text: str, col_w_units: float, base_fontsize: float,
                         min_fontsize: float = 6.5, margin: float = 0.85) -> float:
-    """Dynamic font sizing for wide numbers in narrow columns."""
     bold_factor = 1.75
     avail_px = col_w_units * 150 * margin
     needed_px = len(text) * base_fontsize * bold_factor
@@ -733,7 +831,6 @@ def fit_value_fontsize(text: str, col_w_units: float, base_fontsize: float,
 
 
 def wrap_lines(text: str, width_chars: int, max_lines: int) -> list:
-    """Manual text wrapping to avoid matplotlib's built-in width guessing."""
     lines = textwrap.wrap(text, width=width_chars)
     if len(lines) > max_lines:
         lines = lines[:max_lines]
@@ -741,9 +838,32 @@ def wrap_lines(text: str, width_chars: int, max_lines: int) -> list:
     return lines
 
 
+def escape_dollars_for_matplotlib(text: str) -> str:
+    """
+    BUGFIX (2026-08-03): matplotlib's ax.text() treats a PAIR of literal
+    '$' characters as entering/exiting LaTeX math mode -- confirmed in
+    production: a narrative citing two real prices in one sentence
+    ("from $462.72 on Jul 14 to that $358.88 low") rendered as
+    "462.72onJul14tothat358.88" with spaces stripped, since matplotlib
+    tried to interpret everything between the two '$' as a math
+    expression. Since narrative text now legitimately cites MULTIPLE
+    real dollar amounts per sentence (exactly what was asked for),
+    this needed fixing.
+
+    IMPORTANT: this is applied ONLY inside render_card(), at each
+    rendering call site, using local values -- NEVER by mutating the
+    shared `accepted` list or the `market_theme`/`risk_notes` variables
+    also used by format_discord_digest(). Discord's own text renderer
+    has no concept of '$' as a math delimiter, so escaping there would
+    incorrectly show literal backslashes in the posted message. This
+    function exists specifically so the fix stays scoped to matplotlib
+    only.
+    """
+    return text.replace("$", r"\$") if text else text
+
+
 # ── Card rendering (matplotlib, matches BMT's real watchlist card layout) ──
 def compute_rr(entry_low, entry_high, target1, stop) -> float:
-    """R/R computed in Python from real numbers, not trusted from Grok."""
     entry_mid = (entry_low + entry_high) / 2
     reward = abs(target1 - entry_mid)
     risk = abs(entry_mid - stop)
@@ -754,7 +874,6 @@ def compute_rr(entry_low, entry_high, target1, stop) -> float:
 
 def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: str,
                  market_context: dict, target_date: datetime, data_date: datetime, out_path: str):
-    # ── Design tokens ──────────────────────────────────────────────────
     BG = "#0a0a0f"
     SURFACE = "#131318"
     BORDER = "#232329"
@@ -791,14 +910,12 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
     ax = fig.add_axes([0, 0, 1, 1])
     ax.set_xlim(0, fig_w); ax.set_ylim(0, fig_h); ax.axis("off"); ax.invert_yaxis()
 
-    # ── Header ──────────────────────────────────────────────────────────
     ax.text(0.5, 0.3, "BMT WATCHLIST", fontsize=12, fontweight="bold", color=TEXT_TERTIARY,
             va="top", zorder=5)
     ax.text(0.5, 0.85, today_str, fontsize=32, fontweight="bold", color=TEXT_PRIMARY, va="top", zorder=5)
     ax.text(0.5, 1.55, f"{n} setups   \u00b7   {dir_summary}   \u00b7   {expiry_summary}   \u00b7   "
             f"Based on {close_date_str} close", fontsize=12, color=TEXT_SECONDARY, va="top", zorder=5)
 
-    # ── Market context strip ────────────────────────────────────────────
     ctx_y = 2.15
     ctx_w = (fig_w - 1.0 - 0.5 * 2) / 3
     for i, t in enumerate(MARKET_CONTEXT_TICKERS):
@@ -820,9 +937,8 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
     ax.plot([0.5, fig_w - 0.5], [rule_y, rule_y], color=BORDER, linewidth=1, zorder=3)
     cursor_y = rule_y + 0.35
 
-    # ── Theme / risk callouts ───────────────────────────────────────────
     theme_color = RED if n_puts > n_calls else GREEN if n_calls > n_puts else BLUE
-    theme_lines = wrap_lines(market_theme, width_chars=160, max_lines=3)
+    theme_lines = wrap_lines(escape_dollars_for_matplotlib(market_theme), width_chars=160, max_lines=3)
     for i, line in enumerate(theme_lines):
         if i == 0:
             ax.add_patch(plt.Rectangle((0.5, cursor_y + 0.02), 0.06, 0.26, facecolor=theme_color,
@@ -831,7 +947,7 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
         cursor_y += 0.3
     cursor_y += 0.25
 
-    risk_lines = wrap_lines(risk_notes, width_chars=160, max_lines=4)
+    risk_lines = wrap_lines(escape_dollars_for_matplotlib(risk_notes), width_chars=160, max_lines=4)
     for i, line in enumerate(risk_lines):
         if i == 0:
             ax.add_patch(plt.Rectangle((0.5, cursor_y + 0.02), 0.06, 0.26, facecolor=GOLD,
@@ -840,7 +956,6 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
         cursor_y += 0.28
     cursor_y += 0.45
 
-    # ── Individual setup cards ────────────────────────────────────────
     PAD_L = 0.4
     PAD_TOP = 0.35
     HEADER_H = 0.55
@@ -858,7 +973,7 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
 
     narrative_line_counts = []
     for s in accepted:
-        lines = wrap_lines(s.get("narrative", ""), width_chars=48, max_lines=6)
+        lines = wrap_lines(escape_dollars_for_matplotlib(s.get("narrative", "")), width_chars=48, max_lines=6)
         s["_narrative_lines"] = lines
         narrative_line_counts.append(len(lines))
     max_narrative_lines = max(narrative_line_counts) if narrative_line_counts else 1
@@ -886,7 +1001,6 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
         cx = x + PAD_L
         yy = cards_top + PAD_TOP
 
-        # Header row
         ax.text(cx, yy, s["ticker"], fontsize=21, fontweight="bold", color=TEXT_PRIMARY, va="top", zorder=5)
         arrow = "\u25b2" if is_call else "\u25bc"
         ax.text(x + card_w - 0.3, yy + 0.02, f"{arrow} {s['direction']} ${s['strike']:g}",
@@ -900,7 +1014,7 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
         yy += SUBTITLE_H + GAP1
 
         ax.scatter([cx + 0.05], [yy + 0.16], s=18, color=accent, zorder=5)
-        ax.text(cx + 0.2, yy, s.get("quality_tag", "").upper(), fontsize=8.5, fontweight="bold",
+        ax.text(cx + 0.2, yy, escape_dollars_for_matplotlib(s.get("quality_tag", "")).upper(), fontsize=8.5, fontweight="bold",
                 color=accent, va="top", zorder=5)
         yy += BADGE_H + GAP2
 
@@ -931,7 +1045,7 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
             col_x += cw
         yy += STAT_LABEL_H + STAT_VALUE_H + GAP4
 
-        ax.text(cx, yy, f"FLOW   {s.get('flow_note', '')}", fontsize=8, color=TEXT_TERTIARY, va="top", zorder=5)
+        ax.text(cx, yy, f"FLOW   {escape_dollars_for_matplotlib(s.get('flow_note', ''))}", fontsize=8, color=TEXT_TERTIARY, va="top", zorder=5)
 
     footer_y = cards_top + card_h + 0.4
     ax.plot([0.5, fig_w - 0.5], [footer_y, footer_y], color=BORDER, linewidth=1, zorder=3)
@@ -1001,61 +1115,177 @@ def get_last_completed_trading_day() -> datetime:
     return d
 
 
-# ── Discord Text Summary (NEW 2026-07-26) ────────────────────────────────
-def format_discord_digest(accepted, market_context, risk_notes):
+# ── Discord Text Summary (FIXED 2026-08-02) ──────────────────────────────
+import re
+
+
+def strip_urls_and_domains(text: str) -> str:
     """
-    Dynamically generates Discord text summary with market context and contracts.
-    Posts BEFORE the card image.
-    
-    Returns: str (complete text ready to post to Discord)
+    Code-level backstop for the "no links" prompt instruction -- same
+    lesson as everywhere else tonight: don't just trust a prompt
+    instruction for something that needs to be reliable. Confirmed in
+    production: a "tikr.com" reference in the model's text caused
+    Discord to auto-generate an ugly, unrelated-looking link preview
+    embed (a random stock photo) in the actual posted digest. Strips
+    full URLs and bare domain-looking text (e.g. "tikr.com",
+    "reuters.com") so this can't happen even if the model doesn't
+    fully follow the prompt instruction.
     """
-    today = datetime.now(ET).strftime("%A, %B %d")
-    
-    # Get market context snapshot
-    spy = market_context.get("SPY", {})
-    qqq = market_context.get("QQQ", {})
-    spy_price = spy.get("price", "?")
-    spy_pct = spy.get("pct", 0) or 0
-    qqq_pct = qqq.get("pct", 0) or 0
-    
-    # Count flow bias (calls vs puts)
-    n_calls = sum(1 for s in accepted if s["direction"].upper() == "CALL")
-    n_puts = len(accepted) - n_calls
-    flow_bias = "call" if n_calls > n_puts else "put" if n_puts > n_calls else "mixed"
-    
-    # Build market context line
-    market_context_line = (
-        f"SPY ${spy_price} {spy_pct:+.2f}%, QQQ {qqq_pct:+.2f}% — "
-        f"tape favors mean-reversion into exhaustion. Flow is heavy into {flow_bias} structures "
-        f"on the weakness; {len(accepted)} setups across tech/growth names with clean chart patterns "
-        f"and institutional buying into lows."
+    if not text:
+        return text
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"\b[a-zA-Z0-9][a-zA-Z0-9-]*\.(com|net|org|io|ai|co|gov)\b", "", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    text = re.sub(r"\s+([.,;:])", r"\1", text)
+    return text
+
+
+def truncate_at_word_boundary(text: str, max_len: int) -> str:
+    """
+    Real length enforcement done in CODE, not by asking the LLM to
+    self-count characters (confirmed that instruction alone caused
+    Kimi to burn its entire token budget on manual character-by-
+    character arithmetic in its reasoning trace). Truncates at a word
+    boundary, never mid-word.
+    """
+    if not text or len(text) <= max_len:
+        return text
+    truncated = text[:max_len].rsplit(" ", 1)[0]
+    return truncated.rstrip(",.;:") + "..."
+
+
+def truncate_at_sentence_boundary(text: str, max_len: int) -> str:
+    """
+    BUGFIX (2026-08-03): confirmed in production that word-boundary
+    truncation on the multi-ticker body paragraph cut ENPH's discussion
+    off mid-sentence AND dropped BABA/ADBE from the digest entirely
+    without any indication they'd been cut -- a much worse failure than
+    losing one ticker cleanly, since it read as an incomplete thought
+    with no signal that content was missing. This keeps only COMPLETE
+    sentences that fit within the budget -- if the tail 1-2 tickers'
+    coverage doesn't fit, they're dropped from the PROSE cleanly (the
+    contract list at the bottom still lists all of them regardless, so
+    no real information is lost, just commentary on the last one or two).
+    """
+    if not text or len(text) <= max_len:
+        return text
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    result = ""
+    for s in sentences:
+        candidate = f"{result} {s}".strip() if result else s
+        if len(candidate) <= max_len:
+            result = candidate
+        else:
+            break
+    if result:
+        return result
+    # Fallback: not even one full sentence fits -- word-boundary as last resort
+    return truncate_at_word_boundary(text, max_len)
+
+
+def format_discord_digest(accepted, market_context, digest_thesis, digest_body, digest_risk):
+    """
+    REDESIGNED (2026-08-03), fourth revision, per direct user request:
+    replaces the previous per-ticker bullet-list digest with a single
+    cohesive, conviction-ordered write-up -- a shared thesis paragraph,
+    one flowing body paragraph covering all tickers (leading with the
+    highest-conviction setup, tapering detail toward the lowest), and
+    ONE consolidated risk paragraph, followed by the contract list.
+    This mirrors the actual selection ranking (see main()'s
+    ranking_score sort) instead of treating all setups as
+    interchangeable bullet points.
+
+    Header line and contract list are built in CODE (not asked of the
+    LLM) -- the header's expiry date and the contract list's tickers/
+    strikes are already known with certainty, no reason to risk an
+    LLM getting a real date or strike wrong when Python already has it.
+    """
+    expiries = set(c["next_expiry"] for c in accepted)
+    if len(expiries) == 1:
+        header = f"📋 **{list(expiries)[0].upper()} POSITIONS — WHAT CONNECTS THESE {len(accepted)} TRADES**"
+    else:
+        header = f"📋 **THIS WEEK'S POSITIONS — WHAT CONNECTS THESE {len(accepted)} TRADES**"
+
+    thesis = strip_urls_and_domains(digest_thesis.strip())
+    risk = strip_urls_and_domains(digest_risk.strip())
+    body_raw = strip_urls_and_domains(digest_body.strip())
+
+    contract_lines = "\n".join(
+        f"• {c['ticker']} {c['next_expiry']} ${c['strike']:g}{c['direction'][0]}"
+        for c in accepted
     )
-    
-    # Build contract list
-    contracts = "\n".join(
-        f"• {s['ticker']} {s['next_expiry']} ${s['strike']}{s['direction'][0].upper()}"
-        for s in accepted
-    )
-    
-    post = f"""📊 **BMT Market Digest** — {today}
 
-{market_context_line}
+    def _build(body_text):
+        return f"""{header}
 
-{risk_notes}
+{thesis}
 
-See card for levels.
+{body_text}
 
-{contracts}
+⚠️ {risk}
+
+_See card for entry/stop/target levels._
+
+{contract_lines}
 """
-    
+
+    # REAL ENFORCEMENT (2026-08-03 fix): confirmed in production that
+    # the previous version only WARNED when over 2000 chars -- it never
+    # actually trimmed anything, so the warning printed correctly
+    # (228 chars over) and then Discord rejected the post anyway. This
+    # measures the ACTUAL shell length (header/thesis/risk/contract
+    # list, using their REAL content, not an estimate) by building the
+    # post with an empty body first, then guarantees the body fits in
+    # whatever space is genuinely left -- correct regardless of how
+    # long thesis/risk/header/contract-list happen to be on any given
+    # night, rather than a fixed per-section guess that turned out
+    # wrong here.
+    shell_length = len(_build(""))
+    safety_margin = 15
+    available_for_body = max(100, 2000 - shell_length - safety_margin)
+
+    if len(body_raw) > available_for_body:
+        print(f"  [DIGEST TRUNCATION] body is {len(body_raw)} chars, only {available_for_body} available -- trimming")
+        body_final = truncate_at_sentence_boundary(body_raw, available_for_body)
+    else:
+        body_final = body_raw
+
+    post = _build(body_final)
+
+    digest_len = len(post)
+    print(f"  [DIGEST LENGTH] {digest_len} / 2000 characters", end="")
+    if digest_len > 2000:
+        print(f" — [ERROR] STILL exceeds limit by {digest_len - 2000} even after truncation — "
+              f"this means thesis+risk+header+contract_lines ALONE exceed budget, investigate prompt output")
+    else:
+        print(f" — OK, {2000 - digest_len} chars headroom")
+
     return post
 
 
 def post_text_to_discord(text_content: str) -> bool:
-    """Posts text summary to Discord webhook."""
+    """
+    DIAGNOSTIC ADDED (2026-08-03): confirmed in production that this
+    silently failed one night (card posted, text digest didn't) with
+    only a bare status-code log line -- not loud enough to catch
+    without actively watching the console. Root cause was almost
+    certainly Discord's 2000-character message content limit, hit
+    because catalyst_note had no length cap at the time. Now prints
+    the actual character count before posting (so an overflow is
+    visible BEFORE the request even goes out) and the full response
+    body on any non-2xx status, so a future failure of any kind is
+    immediately diagnosable instead of requiring guesswork.
+    """
+    char_count = len(text_content)
+    print(f"  Text digest length: {char_count} characters (Discord limit: 2000)")
+    if char_count > 2000:
+        print(f"  [WARNING] Digest exceeds Discord's 2000-char limit by {char_count - 2000} — "
+              f"this post WILL be rejected. Trim catalyst_note/narrative lengths.")
     try:
         r = requests.post(DISCORD_WEBHOOK, json={"content": text_content}, timeout=30)
         print(f"Text summary posted: {r.status_code}")
+        if r.status_code not in (200, 204):
+            print(f"  [DISCORD ERROR BODY] {r.text[:500]}")
         return r.status_code in (200, 204)
     except Exception as e:
         print(f"Text summary post FAILED: {e}")
@@ -1137,13 +1367,56 @@ def main():
                       if c["flow"]["bias"] != "Neutral" else "neutral flow, no clear direction")
             rejected_summary.append(f"{c['ticker']} ({reason})")
 
+    IV_RV_HARD_EXCLUDE_RATIO = 2.5  # matches the same AVOID-worthy threshold
+    # already established for the ER lotto scanner tonight (RULE 5) --
+    # reused deliberately for consistency across the stack rather than a
+    # fresh guess. NOTE: worth recalibrating over time with real data --
+    # this is a reasonable starting point, not a precisely-tuned number.
+
+    print(f"\nChecking IV vs realized volatility for {len(pattern_matched)} pattern-matched candidate(s)...")
+    for c in pattern_matched:
+        c["iv_rv_str"], c["iv_rv_ratio"] = get_iv_vs_realized_vol_with_ratio(c["ticker"], c.get("expiry_iso"))
+        print(f"  {c['ticker']}: {c['iv_rv_str']}")
+
+    # HARD EXCLUDE: a setup whose premium is priced far above what recent
+    # realized movement justifies is a bad economic trade regardless of
+    # how strong the flow signal is -- fixed here rather than letting a
+    # richly-priced setup reach publication and then have the narrative
+    # awkwardly warn against the very idea being presented.
+    pre_exclude_count = len(pattern_matched)
+    still_viable = []
+    for c in pattern_matched:
+        if c["iv_rv_ratio"] is not None and c["iv_rv_ratio"] > IV_RV_HARD_EXCLUDE_RATIO:
+            print(f"  [IV/RV EXCLUDE] {c['ticker']}: IV/RV at {c['iv_rv_ratio']}x — premium too rich to justify entry")
+            rejected_summary.append(
+                f"{c['ticker']} (IV/RV at {c['iv_rv_ratio']}x — premium too rich versus recent realized movement)"
+            )
+        else:
+            still_viable.append(c)
+    pattern_matched = still_viable
+    print(f"  {len(pattern_matched)}/{pre_exclude_count} candidate(s) remain after IV/RV pricing filter")
+
     for c in pattern_matched:
         if c["avg_dollar_vol"] > 0:
             c["flow_intensity"] = c["flow"]["premium"] / c["avg_dollar_vol"]
         else:
             c["flow_intensity"] = 0.0
             print(f"  [RANK WARN] {c['ticker']}: no volume data — flow intensity set to 0")
-    pattern_matched.sort(key=lambda c: (c["flow_intensity"], c["flow"]["premium"]), reverse=True)
+
+        # SOFT RANKING ADJUSTMENT: among candidates that pass the hard
+        # exclude, reward flow strength AND reasonable pricing together
+        # rather than flow alone -- a ratio of 1.0 (fair) scores at full
+        # weight, richer pricing scales the score down, so fairer-priced
+        # setups outrank richer ones with comparable flow. Missing IV/RV
+        # data gets a neutral-ish multiplier rather than a full penalty,
+        # since it's a data-availability gap, not a pricing signal.
+        if c["iv_rv_ratio"] is not None:
+            pricing_multiplier = max(0.4, 1.0 / c["iv_rv_ratio"])
+        else:
+            pricing_multiplier = 0.75
+        c["ranking_score"] = c["flow_intensity"] * pricing_multiplier
+
+    pattern_matched.sort(key=lambda c: (c["ranking_score"], c["flow"]["premium"]), reverse=True)
 
     selected = []
     for c in pattern_matched:
@@ -1201,38 +1474,60 @@ def main():
         c["premium"] = premium
     selected = [c for c in selected if "strike" in c]
 
-    print(f"\nSending {len(selected)} pre-selected setup(s) to Grok for narrative only...")
+    # NEW (2026-08-03): analyst target + time-pressure computed here,
+    # now that strike/current_price/dte are known -- fed to
+    # write_narratives() as grounding context for genuine synthesis.
+    print("\nComputing analyst target + time-pressure context for final selections...")
+    for c in selected:
+        c["analyst_target"] = get_analyst_target(c["ticker"])
+        c["time_pressure"] = build_time_pressure(c)
+        print(f"  {c['ticker']}: {c['time_pressure']['summary']} | {c['analyst_target']}")
+
+    print(f"\nSending {len(selected)} pre-selected setup(s) to Kimi K2.6, in conviction order, for narrative...")
     narrative_result = write_narratives(selected, rejected_summary, market_context)
     market_theme = narrative_result.get("market_theme", "")
     risk_notes = narrative_result.get("risk_notes", "")
-    narrative_lookup = {s["ticker"]: s for s in narrative_result.get("setups", [])}
+    digest_thesis = narrative_result.get("digest_thesis", "")
+    digest_body = narrative_result.get("digest_body", "")
+    digest_risk = narrative_result.get("digest_risk", "")
 
+    # NOTE: `selected` is already in CONVICTION ORDER (see main()'s
+    # ranking_score sort earlier) -- this order is preserved into
+    # `accepted` untouched (no re-sorting here), so position 0 is the
+    # highest-conviction setup all the way through to both the card
+    # and the digest.
     accepted = []
     for c in selected:
-        n = narrative_lookup.get(c["ticker"], {})
-        c["quality_tag"] = n.get("quality_tag", c.get("pattern", "").title())
-        c["narrative"] = n.get("narrative", f"Real {c['pattern']} pattern with {c['flow']['bias'].lower()} flow alignment.")
-        c["flow_note"] = n.get("flow_note", f"${c['flow']['premium']:,.0f} bought OTM/ATM, {c['flow']['call_pct']}% call-weighted")
+        # quality_tag/narrative/flow_note are built deterministically
+        # in code (see build_quality_tag/build_price_narrative/
+        # build_flow_note_display above) -- these are CARD-ONLY fields
+        # now; the Discord text digest gets the new consolidated
+        # digest_thesis/digest_body/digest_risk instead (see
+        # format_discord_digest() below).
+        c["quality_tag"] = build_quality_tag(c.get("pattern", ""))
+        c["narrative"] = build_price_narrative(c)
+        c["flow_note"] = build_flow_note_display(c["flow"])
         c["company_name"] = c.get("company_name", "")
         accepted.append(c)
 
-    print(f"\n=== MARKET THEME ===\n{market_theme}\n")
-    print(f"=== RISK NOTES ===\n{risk_notes}\n")
-    print(f"=== SELECTED ({len(accepted)}) ===")
-    for s in accepted:
-        print(f"  {s['ticker']} {s['direction']} ${s['strike']}")
+    print(f"\n=== MARKET THEME (card) ===\n{market_theme}\n")
+    print(f"=== RISK NOTES (card) ===\n{risk_notes}\n")
+    print(f"=== DIGEST THESIS ===\n{digest_thesis}\n")
+    print(f"=== DIGEST BODY ===\n{digest_body}\n")
+    print(f"=== DIGEST RISK ===\n{digest_risk}\n")
+    print(f"=== SELECTED, CONVICTION ORDER ({len(accepted)}) ===")
+    for i, s in enumerate(accepted):
+        print(f"  #{i+1}: {s['ticker']} {s['direction']} ${s['strike']}")
 
     out_path = "bmt_nightly_setups.png"
     render_card(accepted, rejected_summary, market_theme, risk_notes, market_context, target_date, data_date, out_path)
     print(f"\nCard saved to {out_path}")
 
-    # Post text summary FIRST (NEW 2026-07-26)
-    text_digest = format_discord_digest(accepted, market_context, risk_notes)
+    text_digest = format_discord_digest(accepted, market_context, digest_thesis, digest_body, digest_risk)
     posted_text = post_text_to_discord(text_digest)
-    
-    # THEN post the card images
+
     posted_card = post_image_to_discord(out_path, message="")
-    
+
     if posted_text and posted_card:
         print("✓ Text summary + card posted to Discord!")
     else:
