@@ -1,58 +1,10 @@
 """
 bmt_nightly_setups.py — Nightly top-5 trade-ideas digest.
 
-Reuses ONLY proven, already-working pieces from the BMT stack:
-  - JarvisFlow options flow: same call_jarvis() pattern as er_lotto_scanner.py
-  - Daily OHLC: same yfinance pattern as get_historical_er_move()/get_options_skew()
-  - Earnings calendar: same Finnhub /calendar/earnings forward-window shape
-    already proven in er_lotto_scanner.py's get_earnings_calendar()
-  - Ranking/reasoning: Grok via OpenRouter, same model already running the
-    ER lotto pipeline — no new model to validate
-  - Card image: matplotlib dark theme, same family as the ER lotto recap card
-  - Posting: Discord webhook (multipart image upload)
-
-No new data sources, no new AI models, no new validation needed.
-
-UNIVERSE (SYNCED 2026-07-21): BMT's single MASTER SCAN watchlist — the
-same 167-ticker curated list now used by er_lotto_scanner.py, so both
-products scan one list instead of drifting apart. ETFs/leveraged
-products/crypto pairs are excluded from the tradeable candidate pool
-(SPY/QQQ/IWM are fetched separately for the market-context strip only).
-
-FLOW NOTE: uses the SAME aggregate bullish/bearish flow summary already
-proven in er_lotto_scanner.py's get_flow_for_ticker() — NOT individual
-sweep/contract-level detail (that level of granularity isn't available
-to a standalone script; it required a live MCP tool connection). This is
-a real, acknowledged simplification vs. BMT's manual process, not hidden.
-
-EXPIRY NOTE: strikes are suggested against the nearest available weekly
-options expiry (computed dynamically per ticker, same pattern as
-get_next_expiry() in the scanner) rather than manually re-picking
-"Jul 17 or Jul 24" — this generalizes correctly week to week without
-needing a hardcoded date.
-
-DISCORD DIGEST FIX (2026-08-02): format_discord_digest() previously built
-its "market_context_line" from a HARDCODED template string ("tape favors
-mean-reversion into exhaustion... on the weakness... institutional buying
-into lows") that never changed regardless of what actually happened in
-the market that night -- confirmed present verbatim across multiple
-nights' posted output, and independently confirmed WRONG on at least one
-night (called a +0.72% SPY day "weakness"). The real Grok-generated
-market_theme (already being computed correctly in write_narratives() and
-used in the card image) was being silently discarded for the Discord text
-post. Fixed: format_discord_digest() now takes market_theme as a
-parameter and uses it. Also tightened write_narratives()'s prompt to
-explicitly ban the confirmed boilerplate phrases and require citing real
-per-night numbers, since a temperature=0 call with a rigid, unchanged
-prompt structure can still drift toward a narrow phrase bank even when
-correctly grounded in real data.
-
-Run locally:
-    C:\\Python314\\python.exe bmt_nightly_setups.py
-
-Requires: JARVIS_API_KEY, OPENROUTER_API_KEY, FINNHUB_API_KEY,
-NIGHTLY_SETUPS_DISCORD_WEBHOOK (set to the TEST webhook for this run)
-in your environment.
+HEADER FIX (2026-08-04): Discord digest header changed from the
+confusing "{EXPIRY} POSITIONS — WHAT CONNECTS THESE N TRADES" to a
+plain dated header "TRADE IDEAS — {DAY, MON DD}" using the actual
+target trading date. format_discord_digest() now takes target_date.
 """
 
 import os
@@ -70,19 +22,9 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# ── Config ────────────────────────────────────────────────────────────────
 JARVIS_API_KEY     = os.environ["JARVIS_API_KEY"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
-# NEW (2026-07-21): needed for the upcoming-earnings exclusion filter —
-# same Finnhub forward-window calendar shape already proven working in
-# er_lotto_scanner.py. Must be added to the bmt-trade-ideas Railway
-# service's Variables before deploying this version.
 FINNHUB_API_KEY    = os.environ["FINNHUB_API_KEY"]
-# NAMED DELIBERATELY (not "DISCORD_WEBHOOK") — if this script is deployed
-# into a Railway service/repo that already runs other Discord-posting
-# jobs (e.g. options-discord-engine's own flow alerts), a generically-
-# named env var risks silently colliding with an existing one. This name
-# is scoped specifically to this job.
 DISCORD_WEBHOOK    = os.environ["NIGHTLY_SETUPS_DISCORD_WEBHOOK"]
 JARVIS_MCP_URL      = "https://api.jarvisflow.io/.well-known/mcp"
 OPENROUTER_BASE    = "https://openrouter.ai/api/v1"
@@ -90,10 +32,9 @@ FINNHUB_BASE       = "https://finnhub.io/api/v1"
 ET                 = ZoneInfo("America/New_York")
 HEADERS            = {"User-Agent": "Mozilla/5.0"}
 
-MIN_PREMIUM = 50_000   # matches BMT's manual "min $50K premium" filter
+MIN_PREMIUM = 50_000
 TOP_N       = 5
 
-# ── Universe (SYNCED 2026-07-21 to the single BMT MASTER SCAN list) ────────
 FULL_WATCHLIST = [
     "TDOC","DDOG","DOCU","MDB","ANET","TWLO","ETSY","CRM","UBER","ROKU",
     "NFLX","NVDA","OKTA","SBUX","FTNT","SHOP","AAPL","Z","TSLA","MA",
@@ -122,8 +63,6 @@ MARKET_CONTEXT_TICKERS = ["SPY", "QQQ", "IWM"]
 
 CANDIDATE_UNIVERSE = [t for t in FULL_WATCHLIST if t not in EXCLUDE_FROM_CANDIDATES]
 
-
-# ── Upcoming-earnings exclusion (NEW 2026-07-21) ───────────────────────────
 EARNINGS_LOOKAHEAD_DAYS = 14
 
 def get_upcoming_earnings_map() -> dict:
@@ -145,13 +84,11 @@ def get_upcoming_earnings_map() -> dict:
                     continue
                 if sym not in er_map or d < er_map[sym]:
                     er_map[sym] = d
-            print(f"  [ER FILTER] Loaded {len(er_map)} upcoming earnings dates "
-                  f"({today} to {end})")
+            print(f"  [ER FILTER] Loaded {len(er_map)} upcoming earnings dates ({today} to {end})")
             return er_map
         except Exception as e:
             print(f"  [ER FILTER WARN] Finnhub calendar attempt {attempt+1}: {e}")
-    print("  [ER FILTER WARN] Could not load Finnhub earnings calendar after 3 attempts — "
-          "falling back to Yahoo per-ticker checks only for tonight's run.")
+    print("  [ER FILTER WARN] Could not load Finnhub earnings calendar after 3 attempts.")
     return {}
 
 
@@ -162,18 +99,13 @@ def get_upcoming_earnings_date(ticker: str) -> str:
         if edf is None or edf.empty:
             return None
         now = datetime.now(ET).replace(tzinfo=None)
-        future = sorted(
-            idx.strftime("%Y-%m-%d") for idx in edf.index
-            if idx.replace(tzinfo=None) > now
-        )
+        future = sorted(idx.strftime("%Y-%m-%d") for idx in edf.index if idx.replace(tzinfo=None) > now)
         return future[0] if future else None
     except Exception as e:
-        print(f"  [ER FILTER WARN] {ticker}: yfinance earnings-date check failed "
-              f"({type(e).__name__}: {e}) — relying on Finnhub map alone for this ticker")
+        print(f"  [ER FILTER WARN] {ticker}: {type(e).__name__}: {e}")
         return None
 
 
-# ── JarvisFlow (EXACT same pattern as er_lotto_scanner.py) ─────────────────
 def call_jarvis(tool_name, arguments={}):
     payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                "params": {"name": tool_name, "arguments": arguments}}
@@ -208,29 +140,20 @@ def get_flow_for_ticker(ticker: str) -> dict:
     flow = [f for f in flow if f.get("ticker", "").upper() == ticker.upper()]
     if not flow:
         return {"bias": None, "premium": 0, "call_pct": None}
-
-    bought_otm_atm = [
-        f for f in flow
-        if f.get("implied_Bought_Or_Sold") == "BOUGHT"
-        and f.get("moneyNess", "").upper() in ("OTM", "ATM")
-    ]
+    bought_otm_atm = [f for f in flow if f.get("implied_Bought_Or_Sold") == "BOUGHT"
+                       and f.get("moneyNess", "").upper() in ("OTM", "ATM")]
     if not bought_otm_atm:
         return {"bias": None, "premium": 0, "call_pct": None}
-
-    total_call = sum(float(f.get("total_Option_Premium_For_Trade", 0) or 0)
-                      for f in bought_otm_atm if f.get("put_Or_Call") == "CALL")
-    total_put = sum(float(f.get("total_Option_Premium_For_Trade", 0) or 0)
-                     for f in bought_otm_atm if f.get("put_Or_Call") == "PUT")
+    total_call = sum(float(f.get("total_Option_Premium_For_Trade", 0) or 0) for f in bought_otm_atm if f.get("put_Or_Call") == "CALL")
+    total_put = sum(float(f.get("total_Option_Premium_For_Trade", 0) or 0) for f in bought_otm_atm if f.get("put_Or_Call") == "PUT")
     total = total_call + total_put
     if total == 0:
         return {"bias": None, "premium": 0, "call_pct": None}
-
     call_pct = round(total_call / total * 100)
     bias = "Bullish" if call_pct > 55 else "Bearish" if call_pct < 45 else "Neutral"
     return {"bias": bias, "premium": total, "call_pct": call_pct}
 
 
-# ── Daily OHLC (same yfinance pattern proven elsewhere in the stack) ───────
 def get_daily_ohlc(ticker: str, sessions: int = 15) -> list:
     try:
         import yfinance as yf
@@ -239,12 +162,9 @@ def get_daily_ohlc(ticker: str, sessions: int = 15) -> list:
         if hist.empty:
             return []
         hist = hist.tail(sessions)
-        return [
-            {"date": date, "open": row["Open"], "high": row["High"],
-             "low": row["Low"], "close": row["Close"],
-             "volume": row.get("Volume", 0) or 0}
-            for date, row in hist.iterrows()
-        ]
+        return [{"date": date, "open": row["Open"], "high": row["High"], "low": row["Low"],
+                  "close": row["Close"], "volume": row.get("Volume", 0) or 0}
+                for date, row in hist.iterrows()]
     except Exception as e:
         print(f"  [OHLC WARN] {ticker}: {e}")
         return []
@@ -252,33 +172,22 @@ def get_daily_ohlc(ticker: str, sessions: int = 15) -> list:
 
 def compute_avg_dollar_volume(bars: list) -> float:
     vals = [b["close"] * b["volume"] for b in bars if b.get("close") and b.get("volume")]
-    if not vals:
-        return 0.0
-    return sum(vals) / len(vals)
+    return sum(vals) / len(vals) if vals else 0.0
 
 
 def format_ohlc_summary(bars: list) -> str:
-    return "\n".join(
-        f"{b['date'].strftime('%b %d')}: O={b['open']:.2f} H={b['high']:.2f} "
-        f"L={b['low']:.2f} C={b['close']:.2f}"
-        for b in bars
-    )
+    return "\n".join(f"{b['date'].strftime('%b %d')}: O={b['open']:.2f} H={b['high']:.2f} L={b['low']:.2f} C={b['close']:.2f}" for b in bars)
 
 
-# ── Deterministic trade-level calculation (NEW 2026-07-18) ────────────────
 def get_strike_increment(price):
-    if price < 50:
-        return 1.0
-    elif price < 200:
-        return 2.5
-    else:
-        return 5.0
+    if price < 50: return 1.0
+    elif price < 200: return 2.5
+    else: return 5.0
 
 
 def compute_daily_atr(bars, period=10):
     recent = bars[-period:] if len(bars) >= period else bars
-    if not recent:
-        return 0.0
+    if not recent: return 0.0
     return sum(b["high"] - b["low"] for b in recent) / len(recent)
 
 
@@ -293,25 +202,23 @@ def get_option_premium(ticker, direction, strike, expiry_iso):
         if row.empty:
             return None
         r = row.iloc[0]
-        bid  = r.get("bid", 0) or 0
-        ask  = r.get("ask", 0) or 0
+        bid = r.get("bid", 0) or 0
+        ask = r.get("ask", 0) or 0
         last = r.get("lastPrice", 0) or 0
-        mid  = (bid + ask) / 2 if (bid > 0 and ask > 0) else last
+        mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else last
         return round(mid, 2) if mid > 0 else None
     except Exception as e:
         print(f"  [OPTION PREMIUM WARN] {ticker}: {e}")
         return None
 
 
-def select_strike(ticker: str, direction: str, current_price: float,
-                  expiry_iso: str, target1: float) -> tuple:
+def select_strike(ticker: str, direction: str, current_price: float, expiry_iso: str, target1: float) -> tuple:
     try:
         import yfinance as yf
         chain = yf.Ticker(ticker).option_chain(expiry_iso)
         df = chain.calls if direction.upper() == "CALL" else chain.puts
         if df.empty:
             raise ValueError("empty chain")
-
         if direction.upper() == "CALL":
             otm = df[df["strike"] > current_price].copy()
         else:
@@ -323,34 +230,25 @@ def select_strike(ticker: str, direction: str, current_price: float,
             candidates = candidates.copy()
             candidates["dist"] = (candidates["strike"] - target1).abs()
             best = candidates.sort_values("dist").iloc[0]
-            strike  = float(best["strike"])
-            oi      = int(best.get("openInterest", 0) or 0)
-            vol     = int(best.get("volume", 0) or 0)
-            bid     = best.get("bid", 0) or 0
-            ask     = best.get("ask", 0) or 0
-            last    = best.get("lastPrice", 0) or 0
-            mid     = (bid + ask) / 2 if (bid > 0 and ask > 0) else last
+            strike = float(best["strike"])
+            oi = int(best.get("openInterest", 0) or 0)
+            vol = int(best.get("volume", 0) or 0)
+            bid = best.get("bid", 0) or 0
+            ask = best.get("ask", 0) or 0
+            last = best.get("lastPrice", 0) or 0
+            mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else last
             premium = round(mid, 2) if mid > 0 else None
             pct_str = f"{premium / current_price * 100:.1f}%" if premium else "N/A"
-            print(f"  [STRIKE] {ticker}: ${strike} ({tier_label}) "
-                  f"OI={oi} vol={vol} premium=${premium} ({pct_str} of price) "
-                  f"closest to T1 ${target1}")
+            print(f"  [STRIKE] {ticker}: ${strike} ({tier_label}) OI={oi} vol={vol} premium=${premium} ({pct_str} of price) closest to T1 ${target1}")
             return strike, premium
 
         result = _pick_from(otm[otm["openInterest"].fillna(0) >= 100], "OI>=100")
-        if result:
-            return result
-
+        if result: return result
         result = _pick_from(otm[otm["openInterest"].fillna(0) >= 25], "OI>=25 fallback")
-        if result:
-            return result
-
+        if result: return result
         result = _pick_from(otm, "any OTM, no liquidity")
-        if result:
-            return result
-
+        if result: return result
         raise ValueError("no OTM strikes available")
-
     except Exception as e:
         inc = get_strike_increment(current_price)
         if direction.upper() == "CALL":
@@ -366,32 +264,24 @@ def compute_trade_levels(direction, bars, current_price, dte=9):
     atr = compute_daily_atr(bars)
     if atr <= 0:
         atr = current_price * 0.02
-
-    entry_low  = round(current_price * 0.995, 2)
+    entry_low = round(current_price * 0.995, 2)
     entry_high = round(current_price * 1.005, 2)
-
     dte_factor = max(1.0, (max(dte, 1) / 5) ** 0.5)
     move = round(atr * dte_factor, 2)
-
     if direction.upper() == "CALL":
-        stop    = round(current_price - atr * 0.75, 2)
+        stop = round(current_price - atr * 0.75, 2)
         target1 = round(current_price + move, 2)
         target2 = round(current_price + move * 2, 2)
     else:
-        stop    = round(current_price + atr * 0.75, 2)
+        stop = round(current_price + atr * 0.75, 2)
         target1 = round(current_price - move, 2)
         target2 = round(current_price - move * 2, 2)
-
-    return {
-        "entry_low": entry_low, "entry_high": entry_high,
-        "stop": stop, "target1": target1, "target2": target2,
-    }
+    return {"entry_low": entry_low, "entry_high": entry_high, "stop": stop, "target1": target1, "target2": target2}
 
 
-# ── Deterministic chart-pattern detection ────────────────────────────────────
 def find_swing_points(bars: list) -> tuple:
     highs = [b["high"] for b in bars]
-    lows  = [b["low"]  for b in bars]
+    lows = [b["low"] for b in bars]
     swing_highs, swing_lows = [], []
     for i in range(1, len(bars) - 1):
         if highs[i] > highs[i - 1] and highs[i] > highs[i + 1]:
@@ -405,17 +295,14 @@ def is_clean_uptrend(bars: list) -> dict:
     window = bars[-10:] if len(bars) >= 10 else bars
     if len(window) < 5:
         return {"clean": False, "pattern": None}
-
     lows = [b["low"] for b in window]
     if all(lows[i + 1] >= lows[i] for i in range(len(lows) - 1)) and lows[-1] > lows[0]:
         return {"clean": True, "pattern": "higher lows"}
-
     swing_highs, swing_lows = find_swing_points(window)
     if len(swing_lows) >= 2:
         lows_seq = [v for _, v in swing_lows]
         if all(lows_seq[i] < lows_seq[i + 1] for i in range(len(lows_seq) - 1)):
             return {"clean": True, "pattern": "higher lows"}
-
     min_idx = min(range(len(window)), key=lambda i: window[i]["low"])
     if min_idx < len(window) - 2:
         low_val = window[min_idx]["low"]
@@ -424,7 +311,6 @@ def is_clean_uptrend(bars: list) -> dict:
         subsequent_lows = [window[i]["low"] for i in range(min_idx + 1, len(window))]
         if recovery_pct > 0.03 and all(l >= low_val for l in subsequent_lows):
             return {"clean": True, "pattern": "V-recovery"}
-
     return {"clean": False, "pattern": None}
 
 
@@ -432,17 +318,14 @@ def is_clean_downtrend(bars: list) -> dict:
     window = bars[-10:] if len(bars) >= 10 else bars
     if len(window) < 5:
         return {"clean": False, "pattern": None}
-
     highs = [b["high"] for b in window]
     if all(highs[i + 1] <= highs[i] for i in range(len(highs) - 1)) and highs[-1] < highs[0]:
         return {"clean": True, "pattern": "lower highs"}
-
     swing_highs, swing_lows = find_swing_points(window)
     if len(swing_highs) >= 2:
         highs_seq = [v for _, v in swing_highs]
         if all(highs_seq[i] > highs_seq[i + 1] for i in range(len(highs_seq) - 1)):
             return {"clean": True, "pattern": "lower highs"}
-
     max_idx = max(range(len(window)), key=lambda i: window[i]["high"])
     if max_idx < len(window) - 2:
         high_val = window[max_idx]["high"]
@@ -451,23 +334,10 @@ def is_clean_downtrend(bars: list) -> dict:
         subsequent_highs = [window[i]["high"] for i in range(max_idx + 1, len(window))]
         if breakdown_pct > 0.03 and all(h <= high_val for h in subsequent_highs):
             return {"clean": True, "pattern": "breakdown"}
-
     return {"clean": False, "pattern": None}
 
 
 def get_iv_vs_realized_vol_with_ratio(ticker: str, expiry_iso: str) -> tuple:
-    """
-    NEW (2026-08-03): computes ATM IV vs 20-day realized vol, returning
-    BOTH a formatted display string AND the raw numeric ratio -- the
-    ratio is used to actually GATE and RANK candidates during selection
-    (see main()), not just as narrative color after the fact. Direct
-    fix for a confirmed real problem: the previous design only surfaced
-    IV/RV richness AFTER a setup was already selected and published,
-    meaning a genuinely overpriced setup could still make the top 5 on
-    flow strength alone, with the narrative then having to awkwardly
-    warn against the very idea being published. Same core computation
-    as er_lotto_scanner.py's proven get_iv_vs_realized_vol().
-    """
     try:
         import yfinance as yf
         import math
@@ -478,7 +348,6 @@ def get_iv_vs_realized_vol_with_ratio(ticker: str, expiry_iso: str) -> tuple:
             price = float(hist_1d["Close"].iloc[-1]) if not hist_1d.empty else None
         if not price or not expiry_iso:
             return "N/A", None
-
         chain = stock.option_chain(expiry_iso)
         calls = chain.calls[chain.calls["impliedVolatility"] > 0]
         puts = chain.puts[chain.puts["impliedVolatility"] > 0]
@@ -491,7 +360,6 @@ def get_iv_vs_realized_vol_with_ratio(ticker: str, expiry_iso: str) -> tuple:
         call_iv = float(calls[calls["strike"] == atm_strike]["impliedVolatility"].iloc[0])
         put_iv = float(puts[puts["strike"] == atm_strike]["impliedVolatility"].iloc[0])
         atm_iv = (call_iv + put_iv) / 2
-
         hist = stock.history(period="1mo")
         if hist.empty or len(hist) < 10:
             return "N/A", None
@@ -504,7 +372,6 @@ def get_iv_vs_realized_vol_with_ratio(ticker: str, expiry_iso: str) -> tuple:
         realized_vol = math.sqrt(variance) * math.sqrt(252)
         if realized_vol <= 0:
             return "N/A", None
-
         ratio = round(atm_iv / realized_vol, 2)
         atm_iv_pct = round(atm_iv * 100, 1)
         realized_vol_pct = round(realized_vol * 100, 1)
@@ -529,31 +396,22 @@ def check_chart_pattern(flow_bias: str, bars: list) -> dict:
 
 def get_quote_change(ticker: str) -> dict:
     try:
-        r = requests.get(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
-            params={"interval": "1d", "range": "10d"},
-            headers=HEADERS, timeout=10
-        )
+        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+                          params={"interval": "1d", "range": "10d"}, headers=HEADERS, timeout=10)
         result = r.json()["chart"]["result"][0]
-        timestamps = result["timestamp"]
         quote = result["indicators"]["quote"][0]
         closes, opens, highs, lows = quote["close"], quote["open"], quote["high"], quote["low"]
-
         valid_idxs = [i for i in range(len(closes)) if closes[i] is not None]
         if len(valid_idxs) < 2:
             return {"price": None, "pct": None, "open": None, "high": None, "low": None}
-
         last_idx, prev_idx = valid_idxs[-1], valid_idxs[-2]
         price = closes[last_idx]
         prev_close = closes[prev_idx]
         pct = round((price - prev_close) / prev_close * 100, 2) if prev_close else None
-
-        return {
-            "price": round(price, 2), "pct": pct,
-            "open": round(opens[last_idx], 2) if opens[last_idx] else None,
-            "high": round(highs[last_idx], 2) if highs[last_idx] else None,
-            "low": round(lows[last_idx], 2) if lows[last_idx] else None,
-        }
+        return {"price": round(price, 2), "pct": pct,
+                "open": round(opens[last_idx], 2) if opens[last_idx] else None,
+                "high": round(highs[last_idx], 2) if highs[last_idx] else None,
+                "low": round(lows[last_idx], 2) if lows[last_idx] else None}
     except Exception as e:
         print(f"  [QUOTE WARN] {ticker}: {e}")
         return {"price": None, "pct": None, "open": None, "high": None, "low": None}
@@ -604,7 +462,6 @@ def get_next_expiry(ticker: str, min_dte: int = MIN_DTE) -> dict:
         return {"label": "N/A", "iso": None}
 
 
-# ── Grok narrative call (ONE call per night, same model as the ER lotto pipeline)
 QUALITY_TAG_MAP = {
     "V-recovery": "V-Recovery Bounce",
     "higher lows": "Higher Lows Base",
@@ -614,32 +471,21 @@ QUALITY_TAG_MAP = {
 
 
 def build_quality_tag(pattern: str) -> str:
-    """
-    REDESIGNED (2026-08-03): previously asked the LLM to re-derive this
-    from data it was already handed (the pattern was already known
-    deterministically from check_chart_pattern()). Restating a known
-    value in sentence form isn't narrative, it's redundant -- confirmed
-    directly by the user. Now built in code: zero LLM cost, zero
-    hallucination risk, byte-for-byte accurate by construction.
-    """
     return QUALITY_TAG_MAP.get(pattern, pattern.title() if pattern else "Pattern Match")
 
 
 def build_price_narrative(c: dict) -> str:
-    """Same reasoning as build_quality_tag() -- built directly from the
-    real OHLC bars already fetched, no LLM involved."""
     bars = c["bars"]
     if c["direction"] == "CALL":
         extreme_bar = min(bars, key=lambda b: b["low"])
-        extreme_val, extreme_label, verb = extreme_bar["low"], "low", "bottomed"
+        extreme_val, verb = extreme_bar["low"], "bottomed"
     else:
         extreme_bar = max(bars, key=lambda b: b["high"])
-        extreme_val, extreme_label, verb = extreme_bar["high"], "high", "topped"
+        extreme_val, verb = extreme_bar["high"], "topped"
     latest = bars[-1]
     extreme_date_str = extreme_bar["date"].strftime("%b %d").replace(" 0", " ")
     latest_date_str = latest["date"].strftime("%b %d").replace(" 0", " ")
-    return (f"{c['ticker']} {verb} at ${extreme_val:.2f} on {extreme_date_str}, "
-            f"closing at ${latest['close']:.2f} on {latest_date_str}.")
+    return f"{c['ticker']} {verb} at ${extreme_val:.2f} on {extreme_date_str}, closing at ${latest['close']:.2f} on {latest_date_str}."
 
 
 def build_flow_note_display(flow: dict) -> str:
@@ -649,15 +495,6 @@ def build_flow_note_display(flow: dict) -> str:
 
 
 def build_time_pressure(c: dict) -> dict:
-    """
-    NEW (2026-08-03): fully deterministic -- exactly how far does the
-    stock need to move, and in how many days, to reach the suggested
-    strike? Fed to the LLM as grounding context so its synthesis can
-    reason about whether the IV/RV picture makes that SPECIFIC
-    move-in-that-SPECIFIC-window look plausible, tying vol pricing
-    directly to the contract's actual mechanics instead of generic
-    commentary disconnected from what the trade actually needs to do.
-    """
     try:
         expiry_dt = datetime.strptime(c["expiry_iso"], "%Y-%m-%d").date() if c.get("expiry_iso") else None
         today = datetime.now(ET).date()
@@ -674,11 +511,6 @@ def build_time_pressure(c: dict) -> dict:
 
 
 def get_analyst_target(ticker: str) -> str:
-    """
-    NEW (2026-08-03): where does the stock sit relative to where
-    analysts think it's headed over 12 months? yfinance-only (no
-    Finnhub dependency added), a genuinely new signal beyond price/flow.
-    """
     try:
         import yfinance as yf
         info = yf.Ticker(ticker).info
@@ -696,49 +528,10 @@ def get_analyst_target(ticker: str) -> str:
 
 
 def write_narratives(selected: list, rejected_summary: list, market_context: dict) -> dict:
-    """
-    REDESIGNED (2026-08-03), THIRD major revision -- three separate
-    real problems fixed, in order of when they were caught:
-
-    1. quality_tag/narrative/flow_note were NEVER "narrative" -- all
-       three restated data already known deterministically. Cut from
-       the LLM's job entirely; now built in code (see the builder
-       functions above this one).
-
-    2. EXPIRY-AWARENESS BUG: an earlier version's synthesis cited a
-       real news event that fell AFTER the contract's actual expiry
-       date, presenting it as if directly relevant to a position that
-       would already be closed by then. Fixed by giving the model each
-       setup's exact expiry date/DTE and requiring explicit before/
-       after-expiry framing for any cited event.
-
-    3. TONE/SELECTION MISMATCH: the previous design let the LLM
-       independently judge "is this a good trade" AFTER selection had
-       already published it -- resulting in every synthesis reading
-       skeptical, since IV/RV richness (a side effect of the exact
-       V-recovery pattern this scanner selects for) kept surfacing as
-       a reason to doubt ideas that had already been decided worth
-       publishing. FIXED UPSTREAM: main() now hard-excludes setups
-       with IV/RV > 2.5x from ever reaching selection, and ranks
-       surviving candidates by flow strength AND pricing quality
-       together (see main()'s selection loop). This function is told
-       explicitly that pricing has ALREADY been screened, so its job
-       is genuine synthesis on ideas that already cleared a bar, not
-       re-litigating from scratch.
-    """
     context_block = "\n".join(
         f"{t}: ${market_context[t]['price']} ({market_context[t]['pct']:+.2f}%)"
         for t in MARKET_CONTEXT_TICKERS if market_context.get(t, {}).get("price")
     )
-
-    # NEW (2026-08-03): setups are passed in CONVICTION ORDER (selection
-    # already ranks by flow-strength-and-pricing, see main()'s ranking_score
-    # sort) -- each is explicitly labeled #1 (highest conviction) through
-    # #N (lowest of the group, though still genuinely good -- only
-    # pricing-screened setups reach this list at all). This lets the
-    # model's writing structurally mirror the ranking: lead with #1,
-    # taper detail toward the bottom, instead of treating all 5 as
-    # interchangeable.
     setup_blocks = []
     for i, c in enumerate(selected):
         tp = c.get("time_pressure") or build_time_pressure(c)
@@ -820,8 +613,7 @@ Return ONLY valid JSON, nothing else:
 
 import textwrap
 
-def fit_value_fontsize(text: str, col_w_units: float, base_fontsize: float,
-                        min_fontsize: float = 6.5, margin: float = 0.85) -> float:
+def fit_value_fontsize(text: str, col_w_units: float, base_fontsize: float, min_fontsize: float = 6.5, margin: float = 0.85) -> float:
     bold_factor = 1.75
     avail_px = col_w_units * 150 * margin
     needed_px = len(text) * base_fontsize * bold_factor
@@ -839,30 +631,9 @@ def wrap_lines(text: str, width_chars: int, max_lines: int) -> list:
 
 
 def escape_dollars_for_matplotlib(text: str) -> str:
-    """
-    BUGFIX (2026-08-03): matplotlib's ax.text() treats a PAIR of literal
-    '$' characters as entering/exiting LaTeX math mode -- confirmed in
-    production: a narrative citing two real prices in one sentence
-    ("from $462.72 on Jul 14 to that $358.88 low") rendered as
-    "462.72onJul14tothat358.88" with spaces stripped, since matplotlib
-    tried to interpret everything between the two '$' as a math
-    expression. Since narrative text now legitimately cites MULTIPLE
-    real dollar amounts per sentence (exactly what was asked for),
-    this needed fixing.
-
-    IMPORTANT: this is applied ONLY inside render_card(), at each
-    rendering call site, using local values -- NEVER by mutating the
-    shared `accepted` list or the `market_theme`/`risk_notes` variables
-    also used by format_discord_digest(). Discord's own text renderer
-    has no concept of '$' as a math delimiter, so escaping there would
-    incorrectly show literal backslashes in the posted message. This
-    function exists specifically so the fix stays scoped to matplotlib
-    only.
-    """
     return text.replace("$", r"\$") if text else text
 
 
-# ── Card rendering (matplotlib, matches BMT's real watchlist card layout) ──
 def compute_rr(entry_low, entry_high, target1, stop) -> float:
     entry_mid = (entry_low + entry_high) / 2
     reward = abs(target1 - entry_mid)
@@ -910,11 +681,10 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
     ax = fig.add_axes([0, 0, 1, 1])
     ax.set_xlim(0, fig_w); ax.set_ylim(0, fig_h); ax.axis("off"); ax.invert_yaxis()
 
-    ax.text(0.5, 0.3, "BMT WATCHLIST", fontsize=12, fontweight="bold", color=TEXT_TERTIARY,
-            va="top", zorder=5)
+    ax.text(0.5, 0.3, "BMT WATCHLIST", fontsize=12, fontweight="bold", color=TEXT_TERTIARY, va="top", zorder=5)
     ax.text(0.5, 0.85, today_str, fontsize=32, fontweight="bold", color=TEXT_PRIMARY, va="top", zorder=5)
-    ax.text(0.5, 1.55, f"{n} setups   \u00b7   {dir_summary}   \u00b7   {expiry_summary}   \u00b7   "
-            f"Based on {close_date_str} close", fontsize=12, color=TEXT_SECONDARY, va="top", zorder=5)
+    ax.text(0.5, 1.55, f"{n} setups   \u00b7   {dir_summary}   \u00b7   {expiry_summary}   \u00b7   Based on {close_date_str} close",
+            fontsize=12, color=TEXT_SECONDARY, va="top", zorder=5)
 
     ctx_y = 2.15
     ctx_w = (fig_w - 1.0 - 0.5 * 2) / 3
@@ -925,8 +695,7 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
         color = GREEN if (pct or 0) >= 0 else RED
         arrow = "\u2191" if (pct or 0) >= 0 else "\u2193"
         ax.text(x, ctx_y, t, fontsize=13, fontweight="bold", color=TEXT_SECONDARY, va="top", zorder=5)
-        ax.text(x, ctx_y + 0.4, f"${m.get('price', '?')}", fontsize=20, fontweight="bold",
-                color=TEXT_PRIMARY, va="top", zorder=5)
+        ax.text(x, ctx_y + 0.4, f"${m.get('price', '?')}", fontsize=20, fontweight="bold", color=TEXT_PRIMARY, va="top", zorder=5)
         ax.text(x, ctx_y + 0.88, get_tone_phrase(m), fontsize=9, color=TEXT_TERTIARY, va="top", zorder=5)
         ax.text(x + ctx_w, ctx_y, f"{arrow} {abs(pct):.2f}%" if pct is not None else "N/A",
                 fontsize=14, fontweight="bold", color=color, va="top", ha="right", zorder=5)
@@ -941,8 +710,7 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
     theme_lines = wrap_lines(escape_dollars_for_matplotlib(market_theme), width_chars=160, max_lines=3)
     for i, line in enumerate(theme_lines):
         if i == 0:
-            ax.add_patch(plt.Rectangle((0.5, cursor_y + 0.02), 0.06, 0.26, facecolor=theme_color,
-                                        linewidth=0, zorder=4))
+            ax.add_patch(plt.Rectangle((0.5, cursor_y + 0.02), 0.06, 0.26, facecolor=theme_color, linewidth=0, zorder=4))
         ax.text(0.72, cursor_y, line, fontsize=11.5, color=TEXT_PRIMARY, va="top", zorder=5)
         cursor_y += 0.3
     cursor_y += 0.25
@@ -950,8 +718,7 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
     risk_lines = wrap_lines(escape_dollars_for_matplotlib(risk_notes), width_chars=160, max_lines=4)
     for i, line in enumerate(risk_lines):
         if i == 0:
-            ax.add_patch(plt.Rectangle((0.5, cursor_y + 0.02), 0.06, 0.26, facecolor=GOLD,
-                                        linewidth=0, zorder=4))
+            ax.add_patch(plt.Rectangle((0.5, cursor_y + 0.02), 0.06, 0.26, facecolor=GOLD, linewidth=0, zorder=4))
         ax.text(0.72, cursor_y, line, fontsize=10.5, color=TEXT_SECONDARY, va="top", zorder=5)
         cursor_y += 0.28
     cursor_y += 0.45
@@ -995,8 +762,7 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
         card_bg = FancyBboxPatch((x, cards_top), card_w, card_h, boxstyle="round,pad=0,rounding_size=0.06",
                                   linewidth=1, edgecolor=BORDER_SOFT, facecolor=SURFACE, zorder=2)
         ax.add_patch(card_bg)
-        ax.add_patch(plt.Rectangle((x, cards_top + 0.15), 0.06, card_h - 0.3, facecolor=accent,
-                                    linewidth=0, zorder=3))
+        ax.add_patch(plt.Rectangle((x, cards_top + 0.15), 0.06, card_h - 0.3, facecolor=accent, linewidth=0, zorder=3))
 
         cx = x + PAD_L
         yy = cards_top + PAD_TOP
@@ -1028,20 +794,16 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
         col_weights = [1.3, 0.9, 0.9, 0.9]
         col_widths = [total_w * w / sum(col_weights) for w in col_weights]
         labels = ["ENTRY", "STOP", "TARGET 1", "TARGET 2"]
-        values = [f"${s['entry_low']}\u2013${s['entry_high']}", f"${s['stop']}",
-                  f"${s['target1']}", f"${s['target2']}"]
+        values = [f"${s['entry_low']}\u2013${s['entry_high']}", f"${s['stop']}", f"${s['target1']}", f"${s['target2']}"]
         colors = [TEXT_PRIMARY, RED, GREEN, GREEN]
         base_sizes = [10, 12, 12, 12]
         col_x = cx - 0.1
         for ci, (lab, val, vc, base_sz, cw) in enumerate(zip(labels, values, colors, base_sizes, col_widths)):
             if ci > 0:
-                ax.plot([col_x, col_x], [yy, yy + STAT_LABEL_H + STAT_VALUE_H - 0.05],
-                        color=BORDER, linewidth=0.8, zorder=4)
+                ax.plot([col_x, col_x], [yy, yy + STAT_LABEL_H + STAT_VALUE_H - 0.05], color=BORDER, linewidth=0.8, zorder=4)
             fitted_sz = fit_value_fontsize(val, cw, base_sz)
-            ax.text(col_x + cw / 2, yy, lab, fontsize=6.8, color=TEXT_TERTIARY, va="top",
-                    ha="center", zorder=5)
-            ax.text(col_x + cw / 2, yy + STAT_LABEL_H, val, fontsize=fitted_sz, fontweight="bold",
-                    color=vc, va="top", ha="center", zorder=5)
+            ax.text(col_x + cw / 2, yy, lab, fontsize=6.8, color=TEXT_TERTIARY, va="top", ha="center", zorder=5)
+            ax.text(col_x + cw / 2, yy + STAT_LABEL_H, val, fontsize=fitted_sz, fontweight="bold", color=vc, va="top", ha="center", zorder=5)
             col_x += cw
         yy += STAT_LABEL_H + STAT_VALUE_H + GAP4
 
@@ -1066,7 +828,6 @@ def post_image_to_discord(image_path: str, message: str = ""):
         return r.status_code in (200, 204)
 
 
-# ── US Market Holiday Calendar + Scheduling Logic ───────────────────────
 US_MARKET_HOLIDAYS_2026 = {
     "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
     "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
@@ -1077,9 +838,7 @@ US_MARKET_EARLY_CLOSE_2026 = {"2026-11-27", "2026-12-24"}
 def _check_holiday_list_freshness():
     current_year = datetime.now(ET).year
     if current_year != 2026:
-        print(f"  [HOLIDAY LIST WARNING] Running in {current_year}, but "
-              f"US_MARKET_HOLIDAYS_2026 is hardcoded for 2026 only — "
-              f"THIS LIST MUST BE UPDATED for {current_year}.")
+        print(f"  [HOLIDAY LIST WARNING] Running in {current_year}, but US_MARKET_HOLIDAYS_2026 is hardcoded for 2026 only — THIS LIST MUST BE UPDATED for {current_year}.")
 
 
 def is_trading_day(d: datetime) -> bool:
@@ -1115,22 +874,10 @@ def get_last_completed_trading_day() -> datetime:
     return d
 
 
-# ── Discord Text Summary (FIXED 2026-08-02) ──────────────────────────────
 import re
 
 
 def strip_urls_and_domains(text: str) -> str:
-    """
-    Code-level backstop for the "no links" prompt instruction -- same
-    lesson as everywhere else tonight: don't just trust a prompt
-    instruction for something that needs to be reliable. Confirmed in
-    production: a "tikr.com" reference in the model's text caused
-    Discord to auto-generate an ugly, unrelated-looking link preview
-    embed (a random stock photo) in the actual posted digest. Strips
-    full URLs and bare domain-looking text (e.g. "tikr.com",
-    "reuters.com") so this can't happen even if the model doesn't
-    fully follow the prompt instruction.
-    """
     if not text:
         return text
     text = re.sub(r"https?://\S+", "", text)
@@ -1141,13 +888,6 @@ def strip_urls_and_domains(text: str) -> str:
 
 
 def truncate_at_word_boundary(text: str, max_len: int) -> str:
-    """
-    Real length enforcement done in CODE, not by asking the LLM to
-    self-count characters (confirmed that instruction alone caused
-    Kimi to burn its entire token budget on manual character-by-
-    character arithmetic in its reasoning trace). Truncates at a word
-    boundary, never mid-word.
-    """
     if not text or len(text) <= max_len:
         return text
     truncated = text[:max_len].rsplit(" ", 1)[0]
@@ -1155,18 +895,6 @@ def truncate_at_word_boundary(text: str, max_len: int) -> str:
 
 
 def truncate_at_sentence_boundary(text: str, max_len: int) -> str:
-    """
-    BUGFIX (2026-08-03): confirmed in production that word-boundary
-    truncation on the multi-ticker body paragraph cut ENPH's discussion
-    off mid-sentence AND dropped BABA/ADBE from the digest entirely
-    without any indication they'd been cut -- a much worse failure than
-    losing one ticker cleanly, since it read as an incomplete thought
-    with no signal that content was missing. This keeps only COMPLETE
-    sentences that fit within the budget -- if the tail 1-2 tickers'
-    coverage doesn't fit, they're dropped from the PROSE cleanly (the
-    contract list at the bottom still lists all of them regardless, so
-    no real information is lost, just commentary on the last one or two).
-    """
     if not text or len(text) <= max_len:
         return text
     sentences = re.split(r"(?<=[.!?])\s+", text)
@@ -1179,41 +907,24 @@ def truncate_at_sentence_boundary(text: str, max_len: int) -> str:
             break
     if result:
         return result
-    # Fallback: not even one full sentence fits -- word-boundary as last resort
     return truncate_at_word_boundary(text, max_len)
 
 
-def format_discord_digest(accepted, market_context, digest_thesis, digest_body, digest_risk):
+def format_discord_digest(accepted, market_context, digest_thesis, digest_body, digest_risk, target_date: datetime):
     """
-    REDESIGNED (2026-08-03), fourth revision, per direct user request:
-    replaces the previous per-ticker bullet-list digest with a single
-    cohesive, conviction-ordered write-up -- a shared thesis paragraph,
-    one flowing body paragraph covering all tickers (leading with the
-    highest-conviction setup, tapering detail toward the lowest), and
-    ONE consolidated risk paragraph, followed by the contract list.
-    This mirrors the actual selection ranking (see main()'s
-    ranking_score sort) instead of treating all setups as
-    interchangeable bullet points.
-
-    Header line and contract list are built in CODE (not asked of the
-    LLM) -- the header's expiry date and the contract list's tickers/
-    strikes are already known with certainty, no reason to risk an
-    LLM getting a real date or strike wrong when Python already has it.
+    HEADER FIX (2026-08-04): header previously read "{EXPIRY} POSITIONS
+    — WHAT CONNECTS THESE N TRADES" (e.g. "AUG 14 POSITIONS — WHAT
+    CONNECTS THESE 5 TRADES"), confirmed confusing to subscribers.
+    Replaced with a plain dated header using the actual target trading
+    date these setups are FOR, per direct user request.
     """
-    expiries = set(c["next_expiry"] for c in accepted)
-    if len(expiries) == 1:
-        header = f"📋 **{list(expiries)[0].upper()} POSITIONS — WHAT CONNECTS THESE {len(accepted)} TRADES**"
-    else:
-        header = f"📋 **THIS WEEK'S POSITIONS — WHAT CONNECTS THESE {len(accepted)} TRADES**"
+    header = f"📋 **TRADE IDEAS — {target_date.strftime('%a, %b %d').upper()}**"
 
     thesis = strip_urls_and_domains(digest_thesis.strip())
     risk = strip_urls_and_domains(digest_risk.strip())
     body_raw = strip_urls_and_domains(digest_body.strip())
 
-    contract_lines = "\n".join(
-        f"• {c['ticker']} {c['next_expiry']} ${c['strike']:g}{c['direction'][0]}"
-        for c in accepted
-    )
+    contract_lines = "\n".join(f"• {c['ticker']} {c['next_expiry']} ${c['strike']:g}{c['direction'][0]}" for c in accepted)
 
     def _build(body_text):
         return f"""{header}
@@ -1229,17 +940,6 @@ _See card for entry/stop/target levels._
 {contract_lines}
 """
 
-    # REAL ENFORCEMENT (2026-08-03 fix): confirmed in production that
-    # the previous version only WARNED when over 2000 chars -- it never
-    # actually trimmed anything, so the warning printed correctly
-    # (228 chars over) and then Discord rejected the post anyway. This
-    # measures the ACTUAL shell length (header/thesis/risk/contract
-    # list, using their REAL content, not an estimate) by building the
-    # post with an empty body first, then guarantees the body fits in
-    # whatever space is genuinely left -- correct regardless of how
-    # long thesis/risk/header/contract-list happen to be on any given
-    # night, rather than a fixed per-section guess that turned out
-    # wrong here.
     shell_length = len(_build(""))
     safety_margin = 15
     available_for_body = max(100, 2000 - shell_length - safety_margin)
@@ -1255,8 +955,7 @@ _See card for entry/stop/target levels._
     digest_len = len(post)
     print(f"  [DIGEST LENGTH] {digest_len} / 2000 characters", end="")
     if digest_len > 2000:
-        print(f" — [ERROR] STILL exceeds limit by {digest_len - 2000} even after truncation — "
-              f"this means thesis+risk+header+contract_lines ALONE exceed budget, investigate prompt output")
+        print(f" — [ERROR] STILL exceeds limit by {digest_len - 2000} even after truncation — investigate prompt output")
     else:
         print(f" — OK, {2000 - digest_len} chars headroom")
 
@@ -1264,23 +963,10 @@ _See card for entry/stop/target levels._
 
 
 def post_text_to_discord(text_content: str) -> bool:
-    """
-    DIAGNOSTIC ADDED (2026-08-03): confirmed in production that this
-    silently failed one night (card posted, text digest didn't) with
-    only a bare status-code log line -- not loud enough to catch
-    without actively watching the console. Root cause was almost
-    certainly Discord's 2000-character message content limit, hit
-    because catalyst_note had no length cap at the time. Now prints
-    the actual character count before posting (so an overflow is
-    visible BEFORE the request even goes out) and the full response
-    body on any non-2xx status, so a future failure of any kind is
-    immediately diagnosable instead of requiring guesswork.
-    """
     char_count = len(text_content)
     print(f"  Text digest length: {char_count} characters (Discord limit: 2000)")
     if char_count > 2000:
-        print(f"  [WARNING] Digest exceeds Discord's 2000-char limit by {char_count - 2000} — "
-              f"this post WILL be rejected. Trim catalyst_note/narrative lengths.")
+        print(f"  [WARNING] Digest exceeds Discord's 2000-char limit by {char_count - 2000} — this post WILL be rejected.")
     try:
         r = requests.post(DISCORD_WEBHOOK, json={"content": text_content}, timeout=30)
         print(f"Text summary posted: {r.status_code}")
@@ -1298,20 +984,17 @@ def main():
 
     force_publish = os.environ.get("FORCE_PUBLISH") == "1"
     if force_publish:
-        print("  [FORCE_PUBLISH=1 — scheduling gate BYPASSED for testing. "
-              "This must NEVER happen on a real production run.]")
+        print("  [FORCE_PUBLISH=1 — scheduling gate BYPASSED for testing. This must NEVER happen on a real production run.]")
         target_date = get_next_actual_trading_day()
     elif not should_publish_tonight():
         tomorrow = et_now + timedelta(days=1)
-        print(f"  Tomorrow ({tomorrow.strftime('%A, %B %d')}) is not a trading day "
-              f"(weekend or market holiday) — skipping tonight's run entirely. No data pulled, no post made.")
+        print(f"  Tomorrow ({tomorrow.strftime('%A, %B %d')}) is not a trading day (weekend or market holiday) — skipping tonight's run entirely.")
         return
     else:
         target_date = get_target_trading_day()
 
     data_date = get_last_completed_trading_day()
-    print(f"  Publishing ideas for {target_date.strftime('%A, %B %d')}, "
-          f"using data as of {data_date.strftime('%A, %B %d')} close.\n")
+    print(f"  Publishing ideas for {target_date.strftime('%A, %B %d')}, using data as of {data_date.strftime('%A, %B %d')} close.\n")
 
     print(f"Universe: {len(CANDIDATE_UNIVERSE)} candidate tickers (ETFs/leveraged/crypto excluded)")
 
@@ -1367,30 +1050,19 @@ def main():
                       if c["flow"]["bias"] != "Neutral" else "neutral flow, no clear direction")
             rejected_summary.append(f"{c['ticker']} ({reason})")
 
-    IV_RV_HARD_EXCLUDE_RATIO = 2.5  # matches the same AVOID-worthy threshold
-    # already established for the ER lotto scanner tonight (RULE 5) --
-    # reused deliberately for consistency across the stack rather than a
-    # fresh guess. NOTE: worth recalibrating over time with real data --
-    # this is a reasonable starting point, not a precisely-tuned number.
+    IV_RV_HARD_EXCLUDE_RATIO = 2.5
 
     print(f"\nChecking IV vs realized volatility for {len(pattern_matched)} pattern-matched candidate(s)...")
     for c in pattern_matched:
         c["iv_rv_str"], c["iv_rv_ratio"] = get_iv_vs_realized_vol_with_ratio(c["ticker"], c.get("expiry_iso"))
         print(f"  {c['ticker']}: {c['iv_rv_str']}")
 
-    # HARD EXCLUDE: a setup whose premium is priced far above what recent
-    # realized movement justifies is a bad economic trade regardless of
-    # how strong the flow signal is -- fixed here rather than letting a
-    # richly-priced setup reach publication and then have the narrative
-    # awkwardly warn against the very idea being presented.
     pre_exclude_count = len(pattern_matched)
     still_viable = []
     for c in pattern_matched:
         if c["iv_rv_ratio"] is not None and c["iv_rv_ratio"] > IV_RV_HARD_EXCLUDE_RATIO:
             print(f"  [IV/RV EXCLUDE] {c['ticker']}: IV/RV at {c['iv_rv_ratio']}x — premium too rich to justify entry")
-            rejected_summary.append(
-                f"{c['ticker']} (IV/RV at {c['iv_rv_ratio']}x — premium too rich versus recent realized movement)"
-            )
+            rejected_summary.append(f"{c['ticker']} (IV/RV at {c['iv_rv_ratio']}x — premium too rich versus recent realized movement)")
         else:
             still_viable.append(c)
     pattern_matched = still_viable
@@ -1402,14 +1074,6 @@ def main():
         else:
             c["flow_intensity"] = 0.0
             print(f"  [RANK WARN] {c['ticker']}: no volume data — flow intensity set to 0")
-
-        # SOFT RANKING ADJUSTMENT: among candidates that pass the hard
-        # exclude, reward flow strength AND reasonable pricing together
-        # rather than flow alone -- a ratio of 1.0 (fair) scores at full
-        # weight, richer pricing scales the score down, so fairer-priced
-        # setups outrank richer ones with comparable flow. Missing IV/RV
-        # data gets a neutral-ish multiplier rather than a full penalty,
-        # since it's a data-availability gap, not a pricing signal.
         if c["iv_rv_ratio"] is not None:
             pricing_multiplier = max(0.4, 1.0 / c["iv_rv_ratio"])
         else:
@@ -1435,9 +1099,7 @@ def main():
             if blocks:
                 src = "yfinance" if er_date == yf_er else "Finnhub"
                 print(f"  [ER EXCLUDE] {c['ticker']}: reports earnings {er_date} (per {src})")
-                rejected_summary.append(
-                    f"{c['ticker']} (reports earnings {er_date}, before expiry — excluded as an earnings play)"
-                )
+                rejected_summary.append(f"{c['ticker']} (reports earnings {er_date}, before expiry — excluded as an earnings play)")
                 continue
         selected.append(c)
 
@@ -1454,7 +1116,6 @@ def main():
             print(f"  [WARN] {c['ticker']}: no current price -- dropping from selected")
             continue
         c["current_price"] = current_price
-
         dte = 9
         if c.get("expiry_iso"):
             try:
@@ -1463,20 +1124,12 @@ def main():
             except Exception:
                 pass
         c["dte"] = dte
-
         c.update(compute_trade_levels(c["direction"], c["bars"], current_price, dte=dte))
-
-        strike, premium = select_strike(
-            c["ticker"], c["direction"], current_price,
-            c.get("expiry_iso", ""), c["target1"]
-        )
+        strike, premium = select_strike(c["ticker"], c["direction"], current_price, c.get("expiry_iso", ""), c["target1"])
         c["strike"] = strike
         c["premium"] = premium
     selected = [c for c in selected if "strike" in c]
 
-    # NEW (2026-08-03): analyst target + time-pressure computed here,
-    # now that strike/current_price/dte are known -- fed to
-    # write_narratives() as grounding context for genuine synthesis.
     print("\nComputing analyst target + time-pressure context for final selections...")
     for c in selected:
         c["analyst_target"] = get_analyst_target(c["ticker"])
@@ -1491,19 +1144,8 @@ def main():
     digest_body = narrative_result.get("digest_body", "")
     digest_risk = narrative_result.get("digest_risk", "")
 
-    # NOTE: `selected` is already in CONVICTION ORDER (see main()'s
-    # ranking_score sort earlier) -- this order is preserved into
-    # `accepted` untouched (no re-sorting here), so position 0 is the
-    # highest-conviction setup all the way through to both the card
-    # and the digest.
     accepted = []
     for c in selected:
-        # quality_tag/narrative/flow_note are built deterministically
-        # in code (see build_quality_tag/build_price_narrative/
-        # build_flow_note_display above) -- these are CARD-ONLY fields
-        # now; the Discord text digest gets the new consolidated
-        # digest_thesis/digest_body/digest_risk instead (see
-        # format_discord_digest() below).
         c["quality_tag"] = build_quality_tag(c.get("pattern", ""))
         c["narrative"] = build_price_narrative(c)
         c["flow_note"] = build_flow_note_display(c["flow"])
@@ -1523,7 +1165,7 @@ def main():
     render_card(accepted, rejected_summary, market_theme, risk_notes, market_context, target_date, data_date, out_path)
     print(f"\nCard saved to {out_path}")
 
-    text_digest = format_discord_digest(accepted, market_context, digest_thesis, digest_body, digest_risk)
+    text_digest = format_discord_digest(accepted, market_context, digest_thesis, digest_body, digest_risk, target_date)
     posted_text = post_text_to_discord(text_digest)
 
     posted_card = post_image_to_discord(out_path, message="")
@@ -1541,16 +1183,10 @@ run_nightly_job = main
 
 
 def start_scheduler():
-    """Persistent-service entry point for Railway deployment."""
     scheduler = BackgroundScheduler(timezone="America/New_York")
-    scheduler.add_job(
-        run_nightly_job, "cron",
-        hour=18, minute=0,
-        id="nightly_setups", replace_existing=True, max_instances=1,
-    )
+    scheduler.add_job(run_nightly_job, "cron", hour=18, minute=0, id="nightly_setups", replace_existing=True, max_instances=1)
     scheduler.start()
-    print("Scheduler started: nightly setups job fires daily at 6:00pm ET "
-          "(should_publish_tonight() internally skips weekends/holidays).")
+    print("Scheduler started: nightly setups job fires daily at 6:00pm ET (should_publish_tonight() internally skips weekends/holidays).")
 
     def heartbeat():
         while True:
