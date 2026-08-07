@@ -47,6 +47,27 @@ Yahoo Finance. All formulas and aggregation logic are verified against
 synthetic option-chain data (see test_gex_vex.py). Run this against a
 real ticker once deployed to confirm yfinance's actual response shape
 matches what's assumed here (column names, NaN handling, etc.).
+
+WATCH-LINE ACTIONABILITY FIX (2026-08-07): generate_gex_watch_lines()'s
+prompt previously EXPLICITLY BANNED the one sentence structure that
+would tell a subscriber what to actually do ("watch $X support / $Y
+resistance" was a banned phrase), in favor of "insight" -- which in
+practice produced dense, mechanism-describing prose ("dealer hedging
+likely pins price without breakout") with no verb telling the reader
+what action to take. Confirmed directly by the user: paying subscribers
+found the published "What To Watch" section informative-sounding but
+not actionable -- no clear "so what do I do tomorrow."
+
+FIX: the prompt now REQUIRES each line to end with a concrete,
+second-person action clause (stay defined-risk / fade a break /
+trim near / size down / etc.), not just a market-structure
+observation. This is a prompt-shape change only -- the underlying data
+is still pulled and computed fresh every single run (spot, walls,
+expected move, gamma flip, regime), nothing is hardcoded or templated;
+only the INSTRUCTION given to the model changed. The full detailed
+dashboard card (render_gex_dashboard_card) is completely untouched --
+this only affects the shorter "What To Watch" text in the Discord
+embed and its data-derived fallback.
 """
 
 import math
@@ -335,8 +356,32 @@ def compute_gex_vex(ticker: str, expiries: list = None) -> dict:
 
         banded_strikes = _restrict_to_band(per_strike, spot, band_pct=0.30)
 
-        call_wall = max(banded_strikes, key=lambda k: banded_strikes[k]["call_gex"])
-        put_wall = max(banded_strikes, key=lambda k: banded_strikes[k]["put_gex"])
+        # BUGFIX (2026-08-07): call_wall and put_wall were previously
+        # selected from the ENTIRE banded strike range with no
+        # constraint on which side of spot they fall on -- max()
+        # simply picked whichever strike had the highest call_gex (or
+        # put_gex) anywhere in the band, even if that strike was now
+        # BELOW spot. Confirmed in a real published card: SPY's Call
+        # Wall ($765) and Put Wall ($762) were BOTH below the live spot
+        # price ($768.39) -- price had moved up through both strikes,
+        # but the old logic kept reporting them as if they were still
+        # meaningful resistance/support levels ahead of price, when
+        # they were actually already behind it. A "call wall" that
+        # isn't above spot, or a "put wall" that isn't below spot,
+        # isn't a wall in any meaningful sense -- it can't act as
+        # resistance/support for a move that's already past it.
+        #
+        # FIX: call_wall is now selected ONLY from strikes strictly
+        # ABOVE spot; put_wall ONLY from strikes strictly BELOW spot.
+        # If no strikes exist on the correct side within the band
+        # (e.g. an unusually tight band, or spot sitting at the very
+        # edge of the available chain), returns None honestly rather
+        # than silently falling back to a wrong-side strike.
+        above_spot = {k: v for k, v in banded_strikes.items() if k > spot}
+        below_spot = {k: v for k, v in banded_strikes.items() if k < spot}
+
+        call_wall = max(above_spot, key=lambda k: above_spot[k]["call_gex"]) if above_spot else None
+        put_wall = max(below_spot, key=lambda k: below_spot[k]["put_gex"]) if below_spot else None
         max_pos_strike = max(banded_strikes, key=lambda k: banded_strikes[k]["net_gex"])
         max_neg_strike = min(banded_strikes, key=lambda k: banded_strikes[k]["net_gex"])
 
@@ -451,13 +496,24 @@ def format_gex_card(result: dict) -> str:
     else:
         gex_str = f"+${net_gex/1e9:.2f}B   long gamma \u2192 moves dampened"
 
+    call_wall = result.get("call_wall")
+    put_wall = result.get("put_wall")
+    call_wall_pct = result.get("call_wall_pct")
+    put_wall_pct = result.get("put_wall_pct")
+    # BUGFIX (2026-08-07): call_wall/put_wall can now legitimately be
+    # None (see compute_gex_vex()'s side-of-spot fix) if no strike
+    # exists on the correct side of spot within the band -- format
+    # defensively instead of assuming a numeric value is always present.
+    call_wall_str = f"${call_wall:,.0f}  ({call_wall_pct:+.1f}%)" if call_wall is not None else "N/A (no strike above spot in band)"
+    put_wall_str = f"${put_wall:,.0f}  ({put_wall_pct:+.1f}%)" if put_wall is not None else "N/A (no strike below spot in band)"
+
     lines = [
         f"\U0001F4CA **{t}**  ${spot:,.2f}   (exp {exp_label})",
         f"  GAMMA FLIP  {flip_str}",
         f"  NET GEX  {gex_str}",
         f"  NET VEX  ${result['net_vex']/1e6:,.2f}M",
-        f"  CALL WALL  ${result['call_wall']:,.0f}  ({result['call_wall_pct']:+.1f}%)",
-        f"  PUT WALL   ${result['put_wall']:,.0f}  ({result['put_wall_pct']:+.1f}%)",
+        f"  CALL WALL  {call_wall_str}",
+        f"  PUT WALL   {put_wall_str}",
         f"  MAX +GEX   ${result['max_pos_gex_strike']:,.0f}   +${result['max_pos_gex_value']/1e6:,.2f}M",
         f"  MAX -GEX   ${result['max_neg_gex_strike']:,.0f}   -${abs(result['max_neg_gex_value'])/1e6:,.2f}M",
     ]
@@ -498,29 +554,55 @@ def build_gex_dashboard(tickers=("SPY", "QQQ", "IWM"), expiries: list = None) ->
 
 
 def _fallback_watch_line(r: dict) -> str:
+    """
+    ACTIONABILITY FIX (2026-08-07): the fallback (used whenever the LLM
+    call is unavailable/fails) previously described the SAME thing the
+    table already shows -- "range likely holds between $X and $Y" is a
+    level restatement, not an instruction. Now closes with a concrete
+    action clause so subscribers get something actionable even on a
+    fallback run, not just on nights the LLM call succeeds.
+    """
     em = r.get("expected_move") or {}
     em_pct = em.get("pct")
     call_pct = r.get("call_wall_pct")
     put_pct = r.get("put_wall_pct")
     call_wall, put_wall = r.get("call_wall"), r.get("put_wall")
+    ticker = r.get("ticker", "")
+
+    # BUGFIX (2026-08-07): call_wall/put_wall can now legitimately be
+    # None (see compute_gex_vex()'s side-of-spot fix). Handle that case
+    # explicitly with its own message rather than crashing on an
+    # f-string ":,.0f" format against None, or (worse) silently
+    # formatting a wrong-side wall as if it were still meaningful.
+    if call_wall is None and put_wall is None:
+        return f"{ticker} has no clean wall on either side within range this week — no strong wall-based lean, size accordingly."
+    if call_wall is None:
+        return (f"{ticker} has no call wall above spot in range — upside looks open, "
+                f"but respect the ${put_wall:,.0f} put wall below on any pullback.")
+    if put_wall is None:
+        return (f"{ticker} has no put wall below spot in range — downside looks open, "
+                f"but respect the ${call_wall:,.0f} call wall above on any rally.")
 
     if em_pct is None or call_pct is None or put_pct is None:
-        return f"Range likely holds between ${put_wall:,.0f} put and ${call_wall:,.0f} call walls."
+        return (f"{ticker} range likely holds between ${put_wall:,.0f} and "
+                f"${call_wall:,.0f} — trade the range, don't chase a breakout.")
 
     reaches_call = em_pct >= call_pct
     reaches_put = em_pct >= abs(put_pct)
 
     if reaches_call and reaches_put:
-        return (f"Expected move spans both walls this week — ${put_wall:,.0f} and "
-                f"${call_wall:,.0f} are both realistically in play.")
+        return (f"{ticker}'s expected move spans both walls — ${put_wall:,.0f} and "
+                f"${call_wall:,.0f} are both realistically in play, so keep size "
+                f"modest and be ready to move either direction.")
     if reaches_call:
-        return (f"Expected move could reach the ${call_wall:,.0f} call wall; "
-                f"${put_wall:,.0f} put side looks further out of range.")
+        return (f"{ticker} could realistically tag the ${call_wall:,.0f} call wall — "
+                f"favor upside setups and trim near that level rather than chasing higher.")
     if reaches_put:
-        return (f"Expected move could reach the ${put_wall:,.0f} put wall; "
-                f"${call_wall:,.0f} call side looks further out of range.")
-    return (f"Expected move falls short of both walls — ${put_wall:,.0f} and "
-            f"${call_wall:,.0f} likely hold unless something outsized hits.")
+        return (f"{ticker} could realistically tag the ${put_wall:,.0f} put wall — "
+                f"favor downside setups and cover near that level rather than chasing lower.")
+    return (f"{ticker}'s expected move falls short of both walls — "
+            f"stay range-bound, fade moves toward ${put_wall:,.0f} or ${call_wall:,.0f} "
+            f"rather than trading for a breakout.")
 
 
 def _classify_wall_reach(r: dict) -> str:
@@ -528,6 +610,10 @@ def _classify_wall_reach(r: dict) -> str:
     em_pct = em.get("pct")
     call_pct = r.get("call_wall_pct")
     put_pct = r.get("put_wall_pct")
+    # BUGFIX (2026-08-07): call_wall_pct/put_wall_pct can now be None
+    # if compute_gex_vex() found no strike on the correct side of spot
+    # -- treat that the same as "unknown" here rather than crashing on
+    # abs(None).
     if em_pct is None or call_pct is None or put_pct is None:
         return "unknown"
     reaches_call = em_pct >= call_pct
@@ -542,24 +628,30 @@ def _classify_wall_reach(r: dict) -> str:
 
 
 def _consolidated_watch_line(results: list, classification: str) -> str:
+    """
+    ACTIONABILITY FIX (2026-08-07): same fix as _fallback_watch_line(),
+    applied to the consolidated (all-tickers-share-a-pattern) fallback
+    case -- ends with an explicit action clause instead of stopping at
+    the observation.
+    """
     valid = [r for r in results if "error" not in r]
     tickers_str = "/".join(r["ticker"] for r in valid)
 
     if classification == "put_only":
         levels = " · ".join(f"{r['ticker']} ${r['put_wall']:,.0f}" for r in valid)
         return (f"All three lean toward their put walls this week ({levels}) — "
-                f"downside levels look more realistically in play than upside resistance.")
+                f"favor downside setups and take profit near those levels rather than chasing lower.")
     if classification == "call_only":
         levels = " · ".join(f"{r['ticker']} ${r['call_wall']:,.0f}" for r in valid)
         return (f"All three lean toward their call walls this week ({levels}) — "
-                f"upside resistance looks more realistically in play than downside support.")
+                f"favor upside setups and trim near those levels rather than chasing higher.")
     if classification == "both":
         levels = " · ".join(f"{r['ticker']} ${r['put_wall']:,.0f}/${r['call_wall']:,.0f}" for r in valid)
         return (f"{tickers_str} all have wide enough expected moves to test both walls "
-                f"this week ({levels}) — either side could realistically get tested.")
+                f"this week ({levels}) — keep size modest, either side could realistically get tested.")
     levels = " · ".join(f"{r['ticker']} ${r['put_wall']:,.0f}/${r['call_wall']:,.0f}" for r in valid)
     return (f"{tickers_str} all look contained inside their walls this week ({levels}) — "
-            f"expected moves fall short of both sides.")
+            f"trade the range, fade moves toward either wall rather than chasing a breakout.")
 
 
 def build_watch_lines_fallback(results: list) -> dict:
@@ -577,6 +669,30 @@ def build_watch_lines_fallback(results: list) -> dict:
 
 
 def generate_gex_watch_lines(results: list, api_key: str = None) -> dict:
+    """
+    ACTIONABILITY FIX (2026-08-07): the prompt sent to the model
+    previously BANNED the one sentence structure that gives a
+    subscriber something to actually do ("watch $X support / $Y
+    resistance" was explicitly listed as banned), in favor of pure
+    "insight" -- market-structure description with no instruction
+    attached. Confirmed directly by the user this produced text that
+    read as informative but not actionable ("dealer hedging likely
+    pins price without breakout" tells you WHY, never WHAT TO DO).
+
+    This is a PROMPT-SHAPE change only. Every run still pulls that
+    day's real, freshly-computed numbers (spot, walls, expected move,
+    gamma flip, regime) into the prompt exactly as before -- nothing
+    is templated or hardcoded. The only thing that changed is the
+    INSTRUCTION: the model must now close each line with a concrete,
+    second-person action clause (stay defined-risk near X / fade a
+    break above Y / trim near Z / size down here / etc.), not just a
+    market-structure observation. The old "don't just restate the
+    table" rule is kept (still true -- a bare "range holds $X-$Y" adds
+    nothing over the table above it), but restating levels is now
+    explicitly ALLOWED as long as it's in service of an action clause,
+    since the earlier version's blanket ban on level-mentions is what
+    pushed the model toward abstract mechanism-only prose instead.
+    """
     valid = [r for r in results if "error" not in r]
     fallback = build_watch_lines_fallback(results)
 
@@ -605,13 +721,22 @@ def generate_gex_watch_lines(results: list, api_key: str = None) -> dict:
 
     base_instructions = (
         'This posts directly below a table that ALREADY shows each ticker\'s exact put '
-        'wall, call wall, and expected move numbers — do NOT just restate those numbers '
-        'back. Say something the raw numbers alone don\'t: whether the expected move is '
-        'large enough to realistically test a wall, how the tickers compare to each other, '
-        'or what the short/long gamma regime implies for price behavior near those levels.\n\n'
+        'wall, call wall, and expected move numbers -- you do not need to re-derive those '
+        'numbers, you can reference them directly. Your job is to translate the setup into '
+        'something a subscriber can actually DO tomorrow.\n\n'
         f"Data:\n{chr(10).join(data_lines)}\n\n"
-        'BANNED: any line that just says "range holds between $X and $Y" or "watch $X '
-        'support / $Y resistance" with no other insight.\n'
+        'REQUIRED: every line MUST end with a concrete, second-person action clause -- '
+        'a real instruction, not just a description of market structure. Use verbs like '
+        '"favor," "fade," "trim," "cover," "stay defined-risk," "keep size small," '
+        '"don\'t chase," "avoid." Good examples of the SHAPE required (write fresh ones '
+        'from the real data above, do not reuse these examples verbatim):\n'
+        '  - "SPY likely chops between $X-$Y -- fade moves toward either wall, don\'t chase a breakout."\n'
+        '  - "QQQ has room to run toward $X -- favor calls over puts this week, but trim near $X."\n'
+        '  - "IWM is sitting right on the gamma flip -- keep size small, a break either way could accelerate fast."\n\n'
+        'BANNED: a line that is PURELY a mechanism description with no action verb '
+        '(e.g. "dealer hedging likely pins price without breakout" alone, with nothing telling '
+        'the reader what to actually do about it). You may mention the mechanism, but the '
+        'sentence must land on an instruction.\n'
         'Direct, trader-to-trader, no fluff.'
     )
 
@@ -620,15 +745,15 @@ def generate_gex_watch_lines(results: list, api_key: str = None) -> dict:
 
 {base_instructions}
 
-All three tickers share the SAME setup this week ({next(iter(unique_patterns))} pattern) — don't write three separate near-identical lines. Write exactly ONE consolidated sentence covering all three tickers together, naming each ticker and its specific level. Output ONLY that one sentence, nothing else before or after. Max 30 words."""
+All three tickers share the SAME setup this week ({next(iter(unique_patterns))} pattern) — don't write three separate near-identical lines. Write exactly ONE consolidated sentence covering all three tickers together, naming each ticker and its specific level, ENDING with a concrete action clause. Output ONLY that one sentence, nothing else before or after. Max 35 words."""
     else:
         prompt = f"""You are writing "what to watch" lines for a GEX/VEX options positioning snapshot from BlueMoonTrades (BMT).
 
 {base_instructions}
 
 The tickers have DIFFERENT setups this week, so write one line per ticker. Output ONLY lines in this EXACT format, one per ticker, nothing else before or after:
-TICKER | one tight, actionable clause
-Max ~15 words per line."""
+TICKER | one tight clause ending in a concrete action
+Max ~18 words per line."""
 
     try:
         resp = requests.post(
@@ -732,7 +857,7 @@ def build_gex_embed(results: list, week_label: str, watch_lines: dict = None) ->
     if move_lines:
         fields.append({"name": "\U0001F4CF Expected Move", "value": "\n".join(move_lines), "inline": True})
     if watch_field_lines:
-        fields.append({"name": "\U0001F440 What To Watch", "value": "\n".join(watch_field_lines), "inline": False})
+        fields.append({"name": "\U0001F440 What To Watch \u2014 Action", "value": "\n".join(watch_field_lines), "inline": False})
 
     return {
         "title": f"\U0001F4CA GEX/VEX Snapshot \u2014 {week_label}",
@@ -862,7 +987,13 @@ def render_gex_dashboard_card(results: list, week_label: str, out_path: str):
 
     No emoji inside the rendered image — matplotlib's bundled fonts
     don't render emoji glyphs (same constraint as the trade journal's
-    title bar and every prior version of this function)."""
+    title bar and every prior version of this function).
+
+    NOTE (2026-08-07): this rendered card is UNCHANGED by the
+    actionability fix -- only generate_gex_watch_lines()'s prompt (used
+    for the Discord EMBED's "What To Watch" field, not this image) was
+    modified. This card remains the full-detail reference view; the
+    embed text above it is what got the actionability rewrite."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
