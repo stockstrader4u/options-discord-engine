@@ -5,6 +5,42 @@ HEADER FIX (2026-08-04): Discord digest header changed from the
 confusing "{EXPIRY} POSITIONS — WHAT CONNECTS THESE N TRADES" to a
 plain dated header "TRADE IDEAS — {DAY, MON DD}" using the actual
 target trading date. format_discord_digest() now takes target_date.
+
+EARNINGS-EXCLUSION BUGFIX (2026-08-07): confirmed in production --
+$TEAM and $CLSK, both reporting earnings THE SAME NIGHT this script
+ran, were selected and published anyway, despite this pipeline being
+specifically designed to exclude any candidate reporting earnings
+before its suggested contract's expiry.
+
+ROOT CAUSE: get_upcoming_earnings_date() (yfinance) only ever looks at
+FUTURE earnings dates ("idx.replace(tzinfo=None) > now") -- a same-day
+report can fall out of that forward-only window by the time this
+script runs in the evening, either because yfinance's cached "next
+earnings" field hasn't rolled over yet post-report, or because a
+same-day AMC report is no longer strictly "future" relative to `now`.
+Combined with Finnhub's calendar having KNOWN gaps for specific tickers
+(the exact same class of gap already documented and worked around in
+er_lotto_scanner.py's Grok/yfinance cross-check merge), a ticker whose
+earnings happen tonight can slip past BOTH sources simultaneously:
+Finnhub simply doesn't have it, and yfinance no longer considers it
+"future". When that happens, er_dates ends up empty, er_date is None,
+and the entire exclusion block is skipped -- the candidate is selected
+as if it had no earnings event at all.
+
+This is also structurally concerning upstream of the exclusion check:
+a ticker reporting earnings that same evening will often show unusual
+options flow SPECIFICALLY BECAUSE of the earnings event, meaning
+exactly the tickers this filter most needs to catch are also the ones
+most likely to score highly on the flow-intensity ranking that
+determines which candidates reach the exclusion check in the first
+place.
+
+FIX: added get_earnings_today_and_recent() as an explicit, independent
+SAME-DAY-OR-VERY-RECENT check (does not rely on "is this in the
+future") that is run as a mandatory additional gate on every candidate
+BEFORE ranking/selection -- not just relying on the existing forward-
+looking date-vs-expiry comparison. See that function and its call site
+in main() for the full mechanism.
 """
 
 import os
@@ -103,6 +139,50 @@ def get_upcoming_earnings_date(ticker: str) -> str:
         return future[0] if future else None
     except Exception as e:
         print(f"  [ER FILTER WARN] {ticker}: {type(e).__name__}: {e}")
+        return None
+
+
+def get_earnings_today_and_recent(ticker: str, lookback_days: int = 2) -> str:
+    """
+    NEW (2026-08-07 bugfix): explicit, independent same-day-or-very-
+    recent earnings check -- deliberately does NOT rely on "is this
+    date in the future", unlike get_upcoming_earnings_date(). This is
+    the direct fix for $TEAM and $CLSK both reporting earnings the same
+    evening this script ran and still getting selected: their earnings
+    date fell OUT of get_upcoming_earnings_date()'s forward-only window
+    (a same-day report may no longer count as "future" by evening, or
+    yfinance's cached next-earnings field may not have rolled over yet)
+    while Finnhub's calendar simply didn't have them for this ticker
+    (a known, already-documented gap -- see er_lotto_scanner.py's
+    Grok/yfinance cross-check merge for the same class of issue).
+
+    Checks yfinance's earnings-dates history directly for ANY date
+    within [today - lookback_days, today] -- i.e. "did this ticker
+    report earnings today, or within the last couple of days" --
+    completely independent of whether that date is technically "in the
+    future" from get_upcoming_earnings_date()'s point of view. A
+    lookback (not just today) is used because a stock that just
+    reported yesterday can still be in an elevated-volatility, elevated-
+    flow state that isn't a genuine multi-day swing setup, which is
+    exactly the kind of candidate this exclusion exists to filter out.
+
+    Returns the earnings date string (YYYY-MM-DD) if found within the
+    window, else None.
+    """
+    try:
+        import yfinance as yf
+        edf = yf.Ticker(ticker).get_earnings_dates(limit=8)
+        if edf is None or edf.empty:
+            return None
+        today = datetime.now(ET).date()
+        window_start = today - timedelta(days=lookback_days)
+        for idx in edf.index:
+            idx_date = idx.replace(tzinfo=None).date() if idx.tzinfo else idx.date()
+            if window_start <= idx_date <= today:
+                return idx_date.strftime("%Y-%m-%d")
+        return None
+    except Exception as e:
+        print(f"  [ER SAME-DAY WARN] {ticker}: {type(e).__name__}: {e}")
         return None
 
 
@@ -1019,9 +1099,33 @@ def main():
         print("Nothing qualifies tonight — no digest to post.")
         return
 
+    # ── SAME-DAY EARNINGS GATE (2026-08-07 bugfix) ────────────────────
+    # Runs BEFORE any other processing, on every ticker that cleared the
+    # flow filter -- deliberately independent of, and in ADDITION to,
+    # the existing expiry-vs-earnings-date exclusion further down in
+    # this function. See get_earnings_today_and_recent()'s docstring
+    # for the full root-cause explanation ($TEAM, $CLSK both reporting
+    # earnings the same night and still getting published).
+    print(f"\nChecking {len(qualifying)} qualifying candidate(s) for same-day/recent earnings...")
+    rejected_summary = []
+    still_qualifying = []
+    for q in qualifying:
+        same_day_er = get_earnings_today_and_recent(q["ticker"])
+        if same_day_er:
+            print(f"  [SAME-DAY ER EXCLUDE] {q['ticker']}: reported/reports earnings {same_day_er} — "
+                  f"excluded regardless of flow strength (elevated flow is likely earnings-driven, not a genuine swing setup)")
+            rejected_summary.append(f"{q['ticker']} (earnings {same_day_er} — too recent/same-day, excluded before ranking)")
+            continue
+        still_qualifying.append(q)
+    qualifying = still_qualifying
+    print(f"  {len(qualifying)} candidate(s) remain after same-day earnings exclusion")
+
+    if not qualifying:
+        print("Nothing qualifies tonight after same-day earnings exclusion — no digest to post.")
+        return
+
     print("Pulling daily OHLC + next expiry for qualifying candidates...")
     candidates = []
-    rejected_summary = []
     for q in qualifying:
         bars = get_daily_ohlc(q["ticker"])
         if not bars:
