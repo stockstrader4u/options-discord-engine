@@ -157,10 +157,37 @@ def get_spot_price(ticker: str):
         if resp.status_code != 200:
             print(f"[GEX WARN] {ticker} spot price: HTTP {resp.status_code} — {resp.text[:200]}")
             return None
-        quote = resp.json().get("quote", {})
+        raw = resp.json()
+        quote = raw.get("quote", {})
         bid, ask = quote.get("bp"), quote.get("ap")
+        # DIAGNOSTIC LOGGING (2026-08-08): added after a real production
+        # run showed AAPL priced at $295.94 when Alpaca's own dashboard
+        # confirmed the true price was $313.19 at the same time -- a
+        # ~5.5% gap with no code-visible explanation on static review
+        # (this function's bid/ask averaging logic checked out fine).
+        # Logs the full raw response symbol/timestamp/bid/ask on EVERY
+        # call so the next occurrence can be diagnosed from real
+        # evidence -- e.g. confirming whether Alpaca returned AAPL's
+        # own symbol with a wrong price (a provider-side data issue) or
+        # whether the response was for a DIFFERENT symbol entirely
+        # (which would point to a request/response mismatch bug
+        # instead). Intentionally verbose -- this is a real, unsolved
+        # discrepancy, not a routine log line.
+        returned_symbol = raw.get("symbol", "?")
+        quote_ts = quote.get("t", "?")
+        print(f"  [SPOT DEBUG] requested={ticker} returned_symbol={returned_symbol} "
+              f"bid={bid} ask={ask} quote_timestamp={quote_ts}")
+        if returned_symbol != "?" and returned_symbol != ticker:
+            print(f"  [SPOT WARN] {ticker}: Alpaca returned data for symbol "
+                  f"'{returned_symbol}' instead of the requested '{ticker}' — "
+                  f"this would fully explain a wrong price. Full raw response: {raw}")
         if bid and ask:
-            return (bid + ask) / 2
+            mid = (bid + ask) / 2
+            spread_pct = abs(ask - bid) / mid * 100 if mid else 0
+            if spread_pct > 5:
+                print(f"  [SPOT WARN] {ticker}: unusually wide bid/ask spread "
+                      f"({spread_pct:.1f}%) — bid={bid} ask={ask}, worth a second look")
+            return mid
         return ask or bid or None
     except Exception as e:
         print(f"[GEX WARN] {ticker} spot price: {e}")
@@ -407,25 +434,42 @@ def compute_gex_vex(ticker: str, expiries: list = None) -> dict:
         above_spot = {k: v for k, v in banded_strikes.items() if k > spot}
         below_spot = {k: v for k, v in banded_strikes.items() if k < spot}
 
-        MIN_WALL_SHARE = 0.15  # a wall must hold at least 15% of its
+        # THRESHOLD LOWERED (2026-08-08): confirmed in production that
+        # MIN_WALL_SHARE=0.15 was rejecting REAL put walls, not just
+        # band-edge artifacts -- every one of 7 real Mag 7 tickers lost
+        # its put wall in the same run, which is too systematic to be
+        # coincidence and strongly suggests the original 0.15 threshold
+        # (picked without empirical basis) was simply too strict for
+        # real markets, where put-side open interest is often more
+        # spread across strikes than call-side. Lowered to 0.10 as a
+        # less aggressive first correction, PLUS added real diagnostic
+        # logging below so future threshold tuning is based on actual
+        # observed share percentages, not another blind guess.
+        MIN_WALL_SHARE = 0.10  # a wall must hold at least 10% of its
                                 # side's total gamma within the band to
                                 # count as a real concentration, not
                                 # just the least-thin strike available.
 
-        def _select_wall(side_strikes, gex_key):
+        def _select_wall(side_strikes, gex_key, side_label):
             if not side_strikes:
+                print(f"  [WALL DEBUG] {ticker} {side_label}: no strikes on this side within the band")
                 return None
             total = sum(v[gex_key] for v in side_strikes.values())
             if total <= 0:
+                print(f"  [WALL DEBUG] {ticker} {side_label}: {len(side_strikes)} strike(s) in band, "
+                      f"but total {gex_key}=0 — no real interest here")
                 return None
             best_strike = max(side_strikes, key=lambda k: side_strikes[k][gex_key])
             best_share = side_strikes[best_strike][gex_key] / total
+            print(f"  [WALL DEBUG] {ticker} {side_label}: best strike ${best_strike:,.0f} "
+                  f"holds {best_share:.1%} of {len(side_strikes)}-strike band total "
+                  f"(threshold={MIN_WALL_SHARE:.0%}) — {'ACCEPTED' if best_share >= MIN_WALL_SHARE else 'REJECTED'}")
             if best_share < MIN_WALL_SHARE:
                 return None
             return best_strike
 
-        call_wall = _select_wall(above_spot, "call_gex")
-        put_wall = _select_wall(below_spot, "put_gex")
+        call_wall = _select_wall(above_spot, "call_gex", "CALL side")
+        put_wall = _select_wall(below_spot, "put_gex", "PUT side")
         max_pos_strike = max(banded_strikes, key=lambda k: banded_strikes[k]["net_gex"])
         max_neg_strike = min(banded_strikes, key=lambda k: banded_strikes[k]["net_gex"])
 

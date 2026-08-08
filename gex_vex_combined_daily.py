@@ -166,10 +166,25 @@ def build_single_ticker_embed(r: dict, week_label: str, watch_line: str) -> dict
     dot = "\U0001F534" if is_short else "\U0001F7E2"
 
     em = r.get("expected_move") or {}
+    # BUGFIX (2026-08-08): the Key Levels field required BOTH put_wall
+    # AND call_wall to be present ("and" condition) before showing
+    # EITHER one -- confirmed in production: AAPL had a real, valid
+    # call wall ($310, correctly shown in the rendered card image) but
+    # its put wall legitimately came back None (correctly excluded by
+    # the new minimum-significance wall-selection fix), and this "and"
+    # condition threw away the perfectly good call wall data along
+    # with the missing put wall, showing a bare "N/A" for the whole
+    # field. This happened on EVERY Mag 7 ticker in the run that
+    # exposed it, since the same threshold fix made missing walls much
+    # more common (correctly) than before. Fixed by formatting each
+    # side independently, matching the same fix already applied to
+    # gex_vex.py's build_gex_embed() for the SPY/QQQ/IWM dashboard.
+    put_str = f"${r['put_wall']:,.0f}" if r.get("put_wall") is not None else "N/A"
+    call_str = f"${r['call_wall']:,.0f}" if r.get("call_wall") is not None else "N/A"
     fields = [
         {"name": "\U0001F4CA Regime", "value": f"{dot} **{regime_word}**", "inline": True},
         {"name": "\U0001F3AF Key Levels",
-         "value": f"Put ${r['put_wall']:,.0f} \u00b7 Call ${r['call_wall']:,.0f}" if r.get("put_wall") and r.get("call_wall") else "N/A",
+         "value": f"Put {put_str} \u00b7 Call {call_str}",
          "inline": True},
         {"name": "\U0001F4CF Expected Move",
          "value": f"\u00b1${em['dollar']} ({em['pct']}%)" if em else "N/A",
