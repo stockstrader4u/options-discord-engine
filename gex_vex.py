@@ -555,12 +555,27 @@ def build_gex_dashboard(tickers=("SPY", "QQQ", "IWM"), expiries: list = None) ->
 
 def _fallback_watch_line(r: dict) -> str:
     """
-    ACTIONABILITY FIX (2026-08-07): the fallback (used whenever the LLM
-    call is unavailable/fails) previously described the SAME thing the
-    table already shows -- "range likely holds between $X and $Y" is a
-    level restatement, not an instruction. Now closes with a concrete
-    action clause so subscribers get something actionable even on a
-    fallback run, not just on nights the LLM call succeeds.
+    PLAIN-ENGLISH FIX (2026-08-08): the 2026-08-07 actionability pass
+    made this end in a real instruction, but still used trading jargon
+    ("wall," "fade," "size") -- same gap confirmed in the LLM-path
+    output on a real published post. Rewritten in plain, beginner-
+    legible English: "level" instead of "wall," "take profit" / "don't
+    chase" instead of "fade" / "trim," and a brief plain-language
+    reason attached to the instruction, not just the instruction alone.
+
+    REGIME-AWARENESS BUGFIX (2026-08-08, later same day): this function
+    is the FALLBACK -- the guaranteed-safe text swapped in whenever the
+    LLM-generated line fails validation (see _line_matches_regime()).
+    Confirmed via direct testing that this function ITSELF was
+    regime-inconsistent: the "expected move falls short of both walls"
+    branch always described "a calmer, more contained week" regardless
+    of whether the ticker was actually long or short gamma -- but
+    "contained/pulls back" is specifically a LONG-gamma property. A
+    short-gamma ticker having a small expected move THIS WEEK doesn't
+    mean it has the same self-correcting tendency; it just means the
+    move hasn't been large so far. Fixed by threading is_long_gamma
+    through every branch and writing genuinely different, mechanism-
+    correct text for each case rather than one shared "calm" framing.
     """
     em = r.get("expected_move") or {}
     em_pct = em.get("pct")
@@ -568,6 +583,7 @@ def _fallback_watch_line(r: dict) -> str:
     put_pct = r.get("put_wall_pct")
     call_wall, put_wall = r.get("call_wall"), r.get("put_wall")
     ticker = r.get("ticker", "")
+    is_long = r.get("net_gex", 0) >= 0
 
     # BUGFIX (2026-08-07): call_wall/put_wall can now legitimately be
     # None (see compute_gex_vex()'s side-of-spot fix). Handle that case
@@ -575,34 +591,66 @@ def _fallback_watch_line(r: dict) -> str:
     # f-string ":,.0f" format against None, or (worse) silently
     # formatting a wrong-side wall as if it were still meaningful.
     if call_wall is None and put_wall is None:
-        return f"{ticker} has no clean wall on either side within range this week — no strong wall-based lean, size accordingly."
+        return (f"{ticker} doesn't have a clear ceiling or floor level nearby this week — "
+                f"there's no strong lean either way, so keep positions small and stay flexible.")
     if call_wall is None:
-        return (f"{ticker} has no call wall above spot in range — upside looks open, "
-                f"but respect the ${put_wall:,.0f} put wall below on any pullback.")
+        return (f"{ticker} doesn't have a clear ceiling level above the current price this week, "
+                f"so a move higher has room to run — but if it drops back toward ${put_wall:,.0f}, "
+                f"that level has previously acted as a floor.")
     if put_wall is None:
-        return (f"{ticker} has no put wall below spot in range — downside looks open, "
-                f"but respect the ${call_wall:,.0f} call wall above on any rally.")
+        return (f"{ticker} doesn't have a clear floor level below the current price this week, "
+                f"so a move lower has room to run — but if it rallies toward ${call_wall:,.0f}, "
+                f"that level has previously acted as a ceiling.")
 
     if em_pct is None or call_pct is None or put_pct is None:
-        return (f"{ticker} range likely holds between ${put_wall:,.0f} and "
-                f"${call_wall:,.0f} — trade the range, don't chase a breakout.")
+        if is_long:
+            return (f"{ticker} will likely stay somewhere between ${put_wall:,.0f} and "
+                    f"${call_wall:,.0f} this week — expect back-and-forth trading that tends "
+                    f"to get pulled back toward the middle rather than a big breakout.")
+        return (f"{ticker} will likely stay somewhere between ${put_wall:,.0f} and "
+                f"${call_wall:,.0f} this week, but keep in mind there's less of a cushion here "
+                f"than usual — if it does break past either level, the move could extend "
+                f"further than a typical week.")
 
     reaches_call = em_pct >= call_pct
     reaches_put = em_pct >= abs(put_pct)
 
     if reaches_call and reaches_put:
-        return (f"{ticker}'s expected move spans both walls — ${put_wall:,.0f} and "
-                f"${call_wall:,.0f} are both realistically in play, so keep size "
-                f"modest and be ready to move either direction.")
+        if is_long:
+            return (f"{ticker} could realistically swing toward either ${put_wall:,.0f} "
+                    f"or ${call_wall:,.0f} this week, but it tends to get pulled back toward "
+                    f"the middle rather than break through cleanly. Keep position sizes modest "
+                    f"and don't chase either move.")
+        return (f"{ticker} could realistically swing all the way to either ${put_wall:,.0f} "
+                f"or ${call_wall:,.0f} this week, and with less cushion than usual, a move past "
+                f"either level could run further than expected. Keep position sizes modest and "
+                f"be ready for it to go either direction.")
     if reaches_call:
-        return (f"{ticker} could realistically tag the ${call_wall:,.0f} call wall — "
-                f"favor upside setups and trim near that level rather than chasing higher.")
+        if is_long:
+            return (f"{ticker} could realistically reach ${call_wall:,.0f} this week. If it "
+                    f"gets there, expect it to get pulled back rather than break out — that's a "
+                    f"reasonable spot to take some profit rather than assume it keeps climbing.")
+        return (f"{ticker} could realistically reach ${call_wall:,.0f} this week. If it clears "
+                f"that level, the move could extend further than usual since there's less "
+                f"cushion above it — take some profit there rather than assume it keeps "
+                f"climbing without a pause.")
     if reaches_put:
-        return (f"{ticker} could realistically tag the ${put_wall:,.0f} put wall — "
-                f"favor downside setups and cover near that level rather than chasing lower.")
-    return (f"{ticker}'s expected move falls short of both walls — "
-            f"stay range-bound, fade moves toward ${put_wall:,.0f} or ${call_wall:,.0f} "
-            f"rather than trading for a breakout.")
+        if is_long:
+            return (f"{ticker} could realistically drop to ${put_wall:,.0f} this week. If it "
+                    f"gets there, expect it to get pulled back rather than break down further — "
+                    f"that's a reasonable spot to take some profit on a bearish position.")
+        return (f"{ticker} could realistically drop to ${put_wall:,.0f} this week. If it clears "
+                f"that level, the move could extend further than usual since there's less "
+                f"cushion below it — take some profit on a bearish position rather than assume "
+                f"it keeps falling without a pause.")
+    if is_long:
+        return (f"{ticker}'s likely range this week probably won't stretch all the way to "
+                f"${put_wall:,.0f} or ${call_wall:,.0f} — expect a calmer, more contained week, "
+                f"so it's better to trade the back-and-forth than to bet on a big breakout.")
+    return (f"{ticker}'s likely range this week probably won't stretch all the way to "
+            f"${put_wall:,.0f} or ${call_wall:,.0f} on paper, but keep in mind there's less of "
+            f"a cushion here than usual — if something does push it past either level, the move "
+            f"could pick up speed quickly, so don't assume it stays this quiet all week.")
 
 
 def _classify_wall_reach(r: dict) -> str:
@@ -629,29 +677,34 @@ def _classify_wall_reach(r: dict) -> str:
 
 def _consolidated_watch_line(results: list, classification: str) -> str:
     """
-    ACTIONABILITY FIX (2026-08-07): same fix as _fallback_watch_line(),
-    applied to the consolidated (all-tickers-share-a-pattern) fallback
-    case -- ends with an explicit action clause instead of stopping at
-    the observation.
+    PLAIN-ENGLISH FIX (2026-08-08): same rewrite as _fallback_watch_line()
+    applied to the consolidated (all-tickers-share-a-pattern) case --
+    "level" instead of "wall," everyday phrasing instead of trader
+    shorthand, and a brief plain-language reason attached.
     """
     valid = [r for r in results if "error" not in r]
     tickers_str = "/".join(r["ticker"] for r in valid)
 
     if classification == "put_only":
         levels = " · ".join(f"{r['ticker']} ${r['put_wall']:,.0f}" for r in valid)
-        return (f"All three lean toward their put walls this week ({levels}) — "
-                f"favor downside setups and take profit near those levels rather than chasing lower.")
+        return (f"{tickers_str} could all realistically drift lower toward their nearby "
+                f"support levels this week ({levels}). If you're holding a bearish position "
+                f"and one of these gets there, that's a sensible spot to take profit rather "
+                f"than assume the drop keeps going.")
     if classification == "call_only":
         levels = " · ".join(f"{r['ticker']} ${r['call_wall']:,.0f}" for r in valid)
-        return (f"All three lean toward their call walls this week ({levels}) — "
-                f"favor upside setups and trim near those levels rather than chasing higher.")
+        return (f"{tickers_str} could all realistically climb toward their nearby resistance "
+                f"levels this week ({levels}). If one gets there, that's a sensible spot to "
+                f"take profit rather than assume it keeps climbing.")
     if classification == "both":
         levels = " · ".join(f"{r['ticker']} ${r['put_wall']:,.0f}/${r['call_wall']:,.0f}" for r in valid)
-        return (f"{tickers_str} all have wide enough expected moves to test both walls "
-                f"this week ({levels}) — keep size modest, either side could realistically get tested.")
+        return (f"{tickers_str} all have enough room to swing to either their upper or lower "
+                f"levels this week ({levels}) — expect a wider, more volatile range, so keep "
+                f"position sizes modest.")
     levels = " · ".join(f"{r['ticker']} ${r['put_wall']:,.0f}/${r['call_wall']:,.0f}" for r in valid)
-    return (f"{tickers_str} all look contained inside their walls this week ({levels}) — "
-            f"trade the range, fade moves toward either wall rather than chasing a breakout.")
+    return (f"{tickers_str} all look likely to stay contained within their usual range this "
+            f"week ({levels}) — expect a calmer, more back-and-forth week rather than a big "
+            f"move, so trading the range makes more sense than betting on a breakout.")
 
 
 def build_watch_lines_fallback(results: list) -> dict:
@@ -668,30 +721,123 @@ def build_watch_lines_fallback(results: list) -> dict:
     return {r["ticker"]: _fallback_watch_line(r) for r in valid}
 
 
+# VALIDATION-AND-FALLBACK FIX (2026-08-08): three escalating rounds of
+# prompt engineering (banned phrases -> absolute rule + worked example
+# -> deterministic pre-computed FACT handed to the model) reduced the
+# regime-mismatch failure rate but never eliminated it -- confirmed via
+# 8 total real test runs across all three rounds, with the LAST round
+# (the model handed a pre-computed, correct-by-construction FACT to
+# use) STILL producing a run where ALL THREE tickers had the wrong
+# mechanism (short-gamma tickers described with long-gamma "pulls back"
+# language, and the long-gamma ticker described with short-gamma "keep
+# going further" language) -- confirming this is not a prompt-wording
+# problem that further instruction-tuning can reliably solve; the model
+# sometimes contradicts a fact it was explicitly handed.
+#
+# FIX: stop trying to prevent the error via instructions alone. Instead,
+# VALIDATE each ticker's generated line against the same deterministic
+# regime classification used elsewhere in this module, and if a line
+# uses acceleration-style phrasing for a long-gamma ticker (or vice
+# versa), swap in that ticker's line from build_watch_lines_fallback()
+# -- which is code-only, has no LLM involved, and is therefore
+# regime-correct by construction every time. This guarantees nothing
+# posted to Discord is ever a demonstrably wrong statement about a
+# ticker's mechanism, even though it means an occasional ticker gets
+# the more template-y fallback wording instead of a fresh LLM sentence
+# -- a mismatched swap in wording quality is a far smaller problem than
+# publishing a factually backwards explanation to subscribers.
+_ACCELERATION_PHRASES = [
+    "run further than usual", "could continue further", "continue past",
+    "could run away", "run away to the upside", "run away to the downside",
+    "could extend", "little to slow", "nothing to slow", "less support",
+    "less to slow", "continuation above", "continuation past",
+    "keep going", "keep running", "little resistance", "little cushion",
+    "leaves more room", "leaves little cushion", "less cushion",
+    "accelerate", "run harder", "bigger move once", "extend further",
+]
+_PULLBACK_PHRASES = [
+    "pull back", "pulled back", "pulls back", "gets pulled", "get pulled",
+    "self-correct", "cushion that tends to pull", "come back toward",
+    "snap back", "revert toward", "reverts toward", "back toward the middle",
+    "back toward the center", "pulls price back", "pull price back",
+    "keep it in check", "keeps it in check",
+    "keep it pinned", "stays pinned",
+]
+
+
+def _line_matches_regime(ticker_line: str, is_long_gamma: bool) -> bool:
+    """
+    Returns False if the line contains phrasing that describes the
+    WRONG mechanism for this ticker's actual regime -- i.e. a
+    long-gamma ticker's line using acceleration/"could run further"
+    language, or a short-gamma ticker's line using pull-back/
+    self-correcting language. Either mismatch means the line makes a
+    factually backwards claim about how this ticker tends to behave.
+
+    This is intentionally a simple substring check, not a full semantic
+    read -- it exists to catch the SPECIFIC, CONFIRMED failure pattern
+    from real test runs, not to validate every possible way a line
+    could be wrong. A line with neither set of phrases present (e.g. it
+    only talks about price levels without characterizing the
+    mechanism) passes -- there's nothing wrong to catch there.
+    """
+    line_lower = ticker_line.lower()
+    has_acceleration = any(p in line_lower for p in _ACCELERATION_PHRASES)
+    has_pullback = any(p in line_lower for p in _PULLBACK_PHRASES)
+
+    if is_long_gamma and has_acceleration:
+        return False
+    if (not is_long_gamma) and has_pullback and not has_acceleration:
+        # A short-gamma ticker described PURELY in pull-back terms with
+        # no acceleration language anywhere is also backwards -- short
+        # gamma should lean toward "could extend," not "gets pulled back."
+        return False
+    return True
+
+
 def generate_gex_watch_lines(results: list, api_key: str = None) -> dict:
     """
-    ACTIONABILITY FIX (2026-08-07): the prompt sent to the model
-    previously BANNED the one sentence structure that gives a
-    subscriber something to actually do ("watch $X support / $Y
-    resistance" was explicitly listed as banned), in favor of pure
-    "insight" -- market-structure description with no instruction
-    attached. Confirmed directly by the user this produced text that
-    read as informative but not actionable ("dealer hedging likely
-    pins price without breakout" tells you WHY, never WHAT TO DO).
+    PLAIN-ENGLISH FIX (2026-08-08): yesterday's actionability fix (see
+    the 2026-08-07 note below) successfully got every line ending in a
+    real instruction (fade / trim / stay defined-risk / etc.), but
+    confirmed in a REAL published post that it did NOT fix the actual
+    complaint -- the lines were still full of unexplained trading
+    jargon ("short gamma near flip," "call wall," "defined-risk," used
+    as a verb: "fade moves toward $X"). A beginner reading "SPY short
+    gamma near flip -- fade moves toward $769 or $777, stay
+    defined-risk" has no idea what any of those four terms mean, even
+    though the sentence technically satisfied the action-clause
+    requirement. Actionable and plain-English are two separate bars;
+    the previous fix only cleared the first one.
 
-    This is a PROMPT-SHAPE change only. Every run still pulls that
-    day's real, freshly-computed numbers (spot, walls, expected move,
-    gamma flip, regime) into the prompt exactly as before -- nothing
-    is templated or hardcoded. The only thing that changed is the
-    INSTRUCTION: the model must now close each line with a concrete,
-    second-person action clause (stay defined-risk near X / fade a
-    break above Y / trim near Z / size down here / etc.), not just a
-    market-structure observation. The old "don't just restate the
-    table" rule is kept (still true -- a bare "range holds $X-$Y" adds
-    nothing over the table above it), but restating levels is now
-    explicitly ALLOWED as long as it's in service of an action clause,
-    since the earlier version's blanket ban on level-mentions is what
-    pushed the model toward abstract mechanism-only prose instead.
+    This is, again, a PROMPT-SHAPE change only -- every run still
+    pulls that day's real numbers into the prompt fresh. What changed:
+      1. An explicit, enforced BANNED JARGON list (gamma, flip, wall,
+         regime, defined-risk, fade [as a verb], dealer, hedging, etc.)
+         -- the model must express the same underlying fact in
+         everyday words instead (e.g. "expect back-and-forth chop,"
+         "don't chase a big move," "a good spot to take some profit").
+      2. Length constraints loosened substantially, per direct user
+         instruction ("it doesn't have to be so short... extend the
+         write up... a little more if that makes sense") -- a
+         beginner-legible explanation of WHY a level matters usually
+         needs more words than a jargon-dense one-liner, not fewer.
+      3. Requires each line to briefly explain WHY (in plain terms,
+         e.g. "because the market tends to swing harder once it
+         breaks past this point") before or alongside the instruction,
+         not just the instruction alone -- a beginner acting on advice
+         they don't understand at all is a worse outcome than a
+         slightly longer explanation.
+
+    VALIDATION-AND-FALLBACK FIX (2026-08-08, later same day): see the
+    module-level comment above _line_matches_regime() for the full
+    story -- after prompt-only fixes plateaued at roughly a 1-in-3 to
+    1-in-8 mismatch rate (and one run got ALL THREE tickers backwards
+    despite being handed the correct fact directly), every per-ticker
+    line generated here is now validated against the same deterministic
+    regime check, and swapped for the guaranteed-correct fallback line
+    if it fails. This applies whether the batch went through the
+    same-pattern (consolidated paragraph) path or the per-ticker path.
     """
     valid = [r for r in results if "error" not in r]
     fallback = build_watch_lines_fallback(results)
@@ -706,60 +852,124 @@ def generate_gex_watch_lines(results: list, api_key: str = None) -> dict:
     unique_patterns = set(classifications.values())
     same_pattern = len(unique_patterns) == 1 and "unknown" not in unique_patterns
 
+    # DETERMINISTIC REGIME-BEHAVIOR FIX (2026-08-08): confirmed via 5
+    # real test runs (2 in the original actionability-only version, 3
+    # in the first regime-instruction attempt) that asking the LLM to
+    # DERIVE the correct plain-English mechanism from "long gamma" vs.
+    # "short gamma" is unreliable -- it kept independently reasoning
+    # its way to short-gamma-style "could run further" language for
+    # IWM (a long-gamma ticker) specifically when IWM's PUT wall
+    # happened to be unusually far away, incorrectly generalizing "that
+    # one side is unconstrained" into "so this ticker isn't
+    # self-correcting at all." Tightening the prompt's wording reduced
+    # the failure rate (2/2 -> 1/3) but did not eliminate it, and the
+    # "passing" runs still contained the same underlying wrong
+    # inference in different phrasing the banned-word check didn't
+    # catch (e.g. "leaves more room for bigger swings" instead of the
+    # exact banned phrase "run further than usual") -- confirming this
+    # is a reasoning failure, not a wording failure, and no amount of
+    # "don't say X" instruction reliably suppresses an INFERENCE, only
+    # specific phrasings of it.
+    #
+    # FIX: the correct plain-English regime-behavior sentence is now
+    # computed HERE, in Python, deterministically -- correct by
+    # construction, the same way beat_strength is pre-classified in
+    # er_lotto_scanner.py rather than left for the model to judge. This
+    # fact is handed to the model as a GIVEN in the data line (not
+    # something to derive), and the model's job is narrowed to: use
+    # this fact to write the explanation in a natural, varied,
+    # conversational way -- not to reason about which mechanism
+    # applies in the first place. This removes the failure mode
+    # entirely rather than reducing its frequency.
+    def _regime_behavior_fact(net_gex: float) -> str:
+        if net_gex >= 0:
+            return ("FACT (use this, do not contradict it): this ticker tends to get pulled "
+                     "back toward the middle of its range if it swings too far in EITHER "
+                     "direction, regardless of how close or far either the put or call level "
+                     "is. Explain the outcome using this self-correcting/pull-back idea.")
+        return ("FACT (use this, do not contradict it): this ticker has LESS of a cushion "
+                "against bigger moves -- once price clears a nearby level, the move can "
+                "accelerate rather than get pulled back. Explain the outcome using this "
+                "less-support/can-extend idea.")
+
     data_lines = []
     for r in valid:
         flip = r.get("gamma_flip")
         flip_str = f"${flip:,.2f}" if flip is not None else "no clean flip"
         regime = "short gamma" if r["net_gex"] < 0 else "long gamma"
         em = r.get("expected_move") or {}
+        behavior_fact = _regime_behavior_fact(r["net_gex"])
         data_lines.append(
             f"{r['ticker']}: spot ${r['spot']:,.2f}, {regime}, "
             f"put wall ${r['put_wall']:,.0f} ({r['put_wall_pct']:+.1f}%), "
             f"call wall ${r['call_wall']:,.0f} ({r['call_wall_pct']:+.1f}%), "
-            f"expected move \u00b1{em.get('pct', '?')}%, gamma flip {flip_str}"
+            f"expected move \u00b1{em.get('pct', '?')}%, gamma flip {flip_str}\n"
+            f"  {behavior_fact}"
         )
 
     base_instructions = (
         'This posts directly below a table that ALREADY shows each ticker\'s exact put '
         'wall, call wall, and expected move numbers -- you do not need to re-derive those '
-        'numbers, you can reference them directly. Your job is to translate the setup into '
-        'something a subscriber can actually DO tomorrow.\n\n'
+        'numbers, and you do NOT need to name them using trading jargon. Your reader is a '
+        'BEGINNER subscriber with no options-trading background. Your job is to explain, in '
+        'plain everyday English, what kind of week this setup implies and what to actually '
+        'do about it -- as if talking to a smart friend who has never traded options.\n\n'
         f"Data:\n{chr(10).join(data_lines)}\n\n"
-        'REQUIRED: every line MUST end with a concrete, second-person action clause -- '
-        'a real instruction, not just a description of market structure. Use verbs like '
-        '"favor," "fade," "trim," "cover," "stay defined-risk," "keep size small," '
-        '"don\'t chase," "avoid." Good examples of the SHAPE required (write fresh ones '
-        'from the real data above, do not reuse these examples verbatim):\n'
-        '  - "SPY likely chops between $X-$Y -- fade moves toward either wall, don\'t chase a breakout."\n'
-        '  - "QQQ has room to run toward $X -- favor calls over puts this week, but trim near $X."\n'
-        '  - "IWM is sitting right on the gamma flip -- keep size small, a break either way could accelerate fast."\n\n'
-        'BANNED: a line that is PURELY a mechanism description with no action verb '
-        '(e.g. "dealer hedging likely pins price without breakout" alone, with nothing telling '
-        'the reader what to actually do about it). You may mention the mechanism, but the '
-        'sentence must land on an instruction.\n'
-        'Direct, trader-to-trader, no fluff.'
+        'REQUIRED, in this order, for every ticker:\n'
+        '  1. A plain-English description of what kind of price action to expect (choppy/'
+        'range-bound vs. sharper/bigger swings vs. steady grind) -- use the FACT given in the '
+        'data for that ticker as the basis, translated into what it actually FEELS like to '
+        'watch the stock trade. Do NOT reason about the mechanism yourself or override the '
+        'given FACT with your own judgment, even if a wall looks unusually close or far -- the '
+        'FACT already accounts for that ticker\'s real situation and is correct as given.\n'
+        '  2. A concrete instruction using the real price level(s) from the data (e.g. "if it '
+        'rallies toward $X, that\'s a good spot to take profit rather than chase higher" or '
+        '"keep positions small this week" or "a move past $X could run further than usual, so '
+        'don\'t fight it" -- only use "could run further" language if the ticker\'s FACT says '
+        'less cushion/can extend; use "gets pulled back" language if the FACT says '
+        'self-correcting/pull-back).\n'
+        '  3. Briefly, in plain words, WHY -- restate the given FACT in your own natural '
+        'phrasing, one clause is enough (e.g. "...because there\'s a cushion that tends to '
+        'pull it back" or "...because there\'s less support once it clears that level").\n\n'
+        'BANNED WORDS/PHRASES -- do not use ANY of these, express the same idea in plain '
+        'English instead: "gamma," "flip," "wall" (say "level" or the actual dollar figure '
+        'instead), "regime," "defined-risk," "fade" (as a verb -- say "don\'t chase" or "take '
+        'profit" instead), "dealer," "dealer hedging," "positioning," "short gamma," "long '
+        'gamma," "FACT" (that word is a label for you, never print it). If you catch yourself '
+        'about to use one of these words, stop and rewrite that clause in plain language.\n\n'
+        'Good examples of the STYLE required (write fresh content from the real data above, do '
+        'not reuse these examples verbatim):\n'
+        '  "SPY: expect a bumpy, back-and-forth week rather than a clean trend in either '
+        'direction -- if it pushes up toward $777 or down toward $769, don\'t chase that move, '
+        'since the options market is set up to pull price back toward the middle of that range. '
+        'Keep position sizes small and take quick profits rather than holding for a big breakout."\n'
+        '  "IWM: expect a steadier week than the other two, with a built-in cushion that tends '
+        'to pull it back if it swings too far in either direction. If it pushes up toward $302, '
+        'don\'t expect it to run away to the upside -- that cushion should keep it in check, so '
+        'ride the move rather than betting on a breakout past it."\n\n'
+        'Direct, warm, plain-spoken -- like explaining it to a friend, not writing for other '
+        'traders. Complete sentences, not clipped trader shorthand.'
     )
 
     if same_pattern:
-        prompt = f"""You are writing a "what to watch" line for a GEX/VEX options positioning snapshot from BlueMoonTrades (BMT).
+        prompt = f"""You are writing the "what to watch" section for a GEX/VEX options positioning snapshot from BlueMoonTrades (BMT), read by beginner subscribers.
 
 {base_instructions}
 
-All three tickers share the SAME setup this week ({next(iter(unique_patterns))} pattern) — don't write three separate near-identical lines. Write exactly ONE consolidated sentence covering all three tickers together, naming each ticker and its specific level, ENDING with a concrete action clause. Output ONLY that one sentence, nothing else before or after. Max 35 words."""
+All three tickers share the SAME setup this week ({next(iter(unique_patterns))} pattern). Write ONE combined paragraph (3-5 sentences) covering all three tickers together, naming each ticker and its real price level(s), following the REQUIRED structure and BANNED WORDS rules above. Output ONLY that paragraph, nothing else before or after."""
     else:
-        prompt = f"""You are writing "what to watch" lines for a GEX/VEX options positioning snapshot from BlueMoonTrades (BMT).
+        prompt = f"""You are writing the "what to watch" section for a GEX/VEX options positioning snapshot from BlueMoonTrades (BMT), read by beginner subscribers.
 
 {base_instructions}
 
-The tickers have DIFFERENT setups this week, so write one line per ticker. Output ONLY lines in this EXACT format, one per ticker, nothing else before or after:
-TICKER | one tight clause ending in a concrete action
-Max ~18 words per line."""
+The tickers have DIFFERENT setups this week, so write one entry per ticker, each 2-3 full sentences following the REQUIRED structure and BANNED WORDS rules above. Output ONLY lines in this EXACT format, one per ticker, nothing else before or after:
+TICKER | 2-3 sentence plain-English explanation ending in a concrete instruction"""
 
     try:
         resp = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": "x-ai/grok-4.3", "max_tokens": 220, "temperature": 0.6,
+            json={"model": "x-ai/grok-4.3", "max_tokens": 600, "temperature": 0.6,
                   "messages": [{"role": "user", "content": prompt}]},
             timeout=30,
         )
@@ -775,7 +985,24 @@ Max ~18 words per line."""
     if same_pattern:
         cleaned = raw.strip().strip('"').lstrip("*").rstrip("*").strip()
         if cleaned:
-            return {r["ticker"]: cleaned for r in valid}
+            # Consolidated path: one shared paragraph covers all tickers,
+            # which only happens when they share the SAME classification
+            # (_classify_wall_reach), but they can still have DIFFERENT
+            # gamma signs feeding into this paragraph in principle -- so
+            # validate per-ticker against the shared text and fall back
+            # to the deterministic per-ticker fallback (not the shared
+            # consolidated fallback) for any ticker whose regime the
+            # shared paragraph appears to contradict.
+            result = {}
+            for r in valid:
+                is_long = r["net_gex"] >= 0
+                if _line_matches_regime(cleaned, is_long):
+                    result[r["ticker"]] = cleaned
+                else:
+                    print(f"[GEX WARN] generate_gex_watch_lines: consolidated line contradicts "
+                          f"{r['ticker']}'s actual regime — using per-ticker fallback for {r['ticker']} instead")
+                    result[r["ticker"]] = fallback.get(r["ticker"], cleaned)
+            return result
         print(f"[GEX WARN] generate_gex_watch_lines: couldn't extract a usable consolidated line. "
               f"Raw Grok response was:\n{raw!r}\nUsing fallback instead.")
         return fallback
@@ -802,7 +1029,25 @@ Max ~18 words per line."""
               f"out of {len(raw.splitlines())} line(s) — using fallback. Raw Grok response was:\n{raw!r}")
         return fallback
 
-    return parsed
+    # VALIDATION PASS: check every ticker's line (whether it came from
+    # the LLM or was already the fallback from an unmatched line above)
+    # against its real, deterministic regime. Any line that describes
+    # the wrong mechanism gets swapped for that ticker's guaranteed-
+    # correct fallback line instead. This is the actual fix -- see the
+    # module-level comment above _line_matches_regime() for why prompt
+    # instructions alone were not sufficient.
+    validated = dict(parsed)
+    for r in valid:
+        ticker = r["ticker"]
+        line = validated.get(ticker, "")
+        is_long = r["net_gex"] >= 0
+        if line and not _line_matches_regime(line, is_long):
+            print(f"[GEX WARN] generate_gex_watch_lines: {ticker}'s generated line contradicts "
+                  f"its actual regime ({'long' if is_long else 'short'} gamma) — swapping in the "
+                  f"deterministic fallback line for {ticker} instead. Rejected line was: {line!r}")
+            validated[ticker] = fallback.get(ticker, line)
+
+    return validated
 
 
 def build_gex_embed(results: list, week_label: str, watch_lines: dict = None) -> dict:
