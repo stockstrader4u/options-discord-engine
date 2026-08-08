@@ -723,6 +723,20 @@ def _consolidated_watch_line(results: list, classification: str) -> str:
     applied to the consolidated (all-tickers-share-a-pattern) case --
     "level" instead of "wall," everyday phrasing instead of trader
     shorthand, and a brief plain-language reason attached.
+
+    SAFE-BY-CONSTRUCTION NOTE (2026-08-08): this function formats
+    put_wall/call_wall with no explicit None-guard of its own, unlike
+    _fallback_watch_line() and the data-line builder in
+    generate_gex_watch_lines() (both of which needed real fixes after
+    a production crash -- see their bugfix notes). This one doesn't
+    need the same fix: build_watch_lines_fallback() only ever calls
+    this function when EVERY ticker in the batch has classification !=
+    "unknown", and _classify_wall_reach() only returns a non-"unknown"
+    classification when call_wall_pct/put_wall_pct are BOTH not None
+    (which only happens when call_wall/put_wall themselves are not
+    None) -- so by the time execution reaches here, every wall value
+    used below is already guaranteed present. Documented explicitly so
+    this isn't mistaken for a missed case during a future audit.
     """
     valid = [r for r in results if "error" not in r]
     tickers_str = "/".join(r["ticker"] for r in valid)
@@ -941,10 +955,21 @@ def generate_gex_watch_lines(results: list, api_key: str = None) -> dict:
         regime = "short gamma" if r["net_gex"] < 0 else "long gamma"
         em = r.get("expected_move") or {}
         behavior_fact = _regime_behavior_fact(r["net_gex"])
+        # BUGFIX (2026-08-08): call_wall/put_wall can legitimately be
+        # None now that wall selection requires a minimum significance
+        # threshold -- this was the THIRD unguarded format-string site
+        # found after the same crash hit build_gex_embed() in
+        # production (see that function's matching bugfix note). Same
+        # fix pattern: format each side independently with an explicit
+        # None check, rather than assuming both walls always exist.
+        put_wall_str = (f"${r['put_wall']:,.0f} ({r['put_wall_pct']:+.1f}%)"
+                         if r.get("put_wall") is not None else "no clear level nearby")
+        call_wall_str = (f"${r['call_wall']:,.0f} ({r['call_wall_pct']:+.1f}%)"
+                          if r.get("call_wall") is not None else "no clear level nearby")
         data_lines.append(
             f"{r['ticker']}: spot ${r['spot']:,.2f}, {regime}, "
-            f"put wall ${r['put_wall']:,.0f} ({r['put_wall_pct']:+.1f}%), "
-            f"call wall ${r['call_wall']:,.0f} ({r['call_wall_pct']:+.1f}%), "
+            f"put wall {put_wall_str}, "
+            f"call wall {call_wall_str}, "
             f"expected move \u00b1{em.get('pct', '?')}%, gamma flip {flip_str}\n"
             f"  {behavior_fact}"
         )
@@ -1116,8 +1141,23 @@ def build_gex_embed(results: list, week_label: str, watch_lines: dict = None) ->
         # — same total info, but the break is controlled instead of
         # Discord's unpredictable inline wrap.
         regime_lines.append(f"{dot} **{r['ticker']}**\n{regime_word}")
+        # BUGFIX (2026-08-08): call_wall/put_wall can legitimately be
+        # None now that wall selection requires a minimum significance
+        # threshold (see compute_gex_vex()'s wall-selection fix) --
+        # confirmed in production: this line crashed BOTH the Mag 7 and
+        # SPY/QQQ/IWM sections with "unsupported format string passed
+        # to NoneType.__format__" the very first run after that fix
+        # shipped, since a ticker with no wall clearing the bar on
+        # either side now legitimately returns None here, and this
+        # f-string had no guard for that (unlike the card renderers,
+        # which already handled it). Formats each side independently so
+        # a ticker missing ONE wall still shows the other correctly,
+        # rather than the whole line falling back to "N/A" over a
+        # single missing side.
+        put_str = f"${r['put_wall']:,.0f}" if r.get("put_wall") is not None else "N/A"
+        call_str = f"${r['call_wall']:,.0f}" if r.get("call_wall") is not None else "N/A"
         levels_lines.append(
-            f"**{r['ticker']}**  Put ${r['put_wall']:,.0f} \u00b7 Call ${r['call_wall']:,.0f}"
+            f"**{r['ticker']}**  Put {put_str} \u00b7 Call {call_str}"
         )
         em = r.get("expected_move") or {}
         if em:
