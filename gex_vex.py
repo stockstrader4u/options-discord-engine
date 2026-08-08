@@ -354,40 +354,82 @@ def compute_gex_vex(ticker: str, expiries: list = None) -> dict:
         net_gex_total = sum(v["net_gex"] for v in per_strike.values())
         net_vex_total = sum(v["net_vex"] for v in per_strike.values())
 
-        banded_strikes = _restrict_to_band(per_strike, spot, band_pct=0.30)
+        # Computed here (moved earlier than before) specifically so wall
+        # selection below can size its search radius against this
+        # ticker's OWN expected move, instead of a flat percentage that
+        # doesn't account for how volatile a given name actually is.
+        expected_move = expected_move_from_quotes(em_calls, em_puts, spot)
 
-        # BUGFIX (2026-08-07): call_wall and put_wall were previously
-        # selected from the ENTIRE banded strike range with no
-        # constraint on which side of spot they fall on -- max()
-        # simply picked whichever strike had the highest call_gex (or
-        # put_gex) anywhere in the band, even if that strike was now
-        # BELOW spot. Confirmed in a real published card: SPY's Call
-        # Wall ($765) and Put Wall ($762) were BOTH below the live spot
-        # price ($768.39) -- price had moved up through both strikes,
-        # but the old logic kept reporting them as if they were still
-        # meaningful resistance/support levels ahead of price, when
-        # they were actually already behind it. A "call wall" that
-        # isn't above spot, or a "put wall" that isn't below spot,
-        # isn't a wall in any meaningful sense -- it can't act as
-        # resistance/support for a move that's already past it.
+        # WALL-SELECTION BUGFIX (2026-08-08): confirmed via a real
+        # published run that "walls" were frequently just artifacts of
+        # the flat +/-30% search band's own edge, not real market
+        # structure. Example: NVDA's expected move for the week was
+        # roughly +/-0.6%, yet its reported put wall sat at -27.8% away
+        # from spot -- within a few DOLLARS of the exact 30% band floor
+        # for every affected ticker (AAPL $2.84 from the floor, MSFT
+        # $0.15, AMZN $3.62, NVDA $4.89 -- not a coincidence). The old
+        # logic always forced an answer by picking whichever strike had
+        # the most gamma among the tiny sliver of strikes still inside
+        # the band, even when that strike had no real chance of being
+        # reached and wasn't a genuine concentration of dealer exposure
+        # -- just the least-thin option in an otherwise-thin tail.
         #
-        # FIX: call_wall is now selected ONLY from strikes strictly
-        # ABOVE spot; put_wall ONLY from strikes strictly BELOW spot.
-        # If no strikes exist on the correct side within the band
-        # (e.g. an unusually tight band, or spot sitting at the very
-        # edge of the available chain), returns None honestly rather
-        # than silently falling back to a wrong-side strike.
+        # A wall that's 6x further away than the week's own expected
+        # move isn't a usable risk level for a trader deciding what to
+        # watch this week -- presenting it next to a genuinely-nearby
+        # call wall as if the two were comparable is actively
+        # misleading, not just imprecise.
+        #
+        # FIX, two parts:
+        #   1. The search band is now sized off THIS ticker's actual
+        #      expected move (not a flat 30% for every name regardless
+        #      of real volatility) -- specifically, up to 3x the
+        #      expected move, or a 10% floor if expected move is
+        #      unavailable/tiny, whichever is larger. A wall up to 3x
+        #      the expected move is still a meaningful "watch this
+        #      level" data point; beyond that it's not realistically
+        #      in play this week.
+        #   2. Even within that tighter, more relevant band, a strike
+        #      must clear a minimum share of that side's total gamma
+        #      to count as a real wall (MIN_WALL_SHARE below) -- this
+        #      stops a strike from being crowned "the wall" purely for
+        #      being the biggest fish in an otherwise-empty pond.
+        #   3. If nothing clears the bar, call_wall/put_wall is
+        #      returned as None (already handled everywhere downstream
+        #      -- see the 2026-08-07 side-of-spot fix's None-handling)
+        #      rather than forcing a misleading answer.
+        if expected_move and expected_move.get("pct"):
+            band_pct = max(expected_move["pct"] * 3 / 100, 0.10)
+        else:
+            band_pct = 0.10
+        banded_strikes = _restrict_to_band(per_strike, spot, band_pct=band_pct)
+
         above_spot = {k: v for k, v in banded_strikes.items() if k > spot}
         below_spot = {k: v for k, v in banded_strikes.items() if k < spot}
 
-        call_wall = max(above_spot, key=lambda k: above_spot[k]["call_gex"]) if above_spot else None
-        put_wall = max(below_spot, key=lambda k: below_spot[k]["put_gex"]) if below_spot else None
+        MIN_WALL_SHARE = 0.15  # a wall must hold at least 15% of its
+                                # side's total gamma within the band to
+                                # count as a real concentration, not
+                                # just the least-thin strike available.
+
+        def _select_wall(side_strikes, gex_key):
+            if not side_strikes:
+                return None
+            total = sum(v[gex_key] for v in side_strikes.values())
+            if total <= 0:
+                return None
+            best_strike = max(side_strikes, key=lambda k: side_strikes[k][gex_key])
+            best_share = side_strikes[best_strike][gex_key] / total
+            if best_share < MIN_WALL_SHARE:
+                return None
+            return best_strike
+
+        call_wall = _select_wall(above_spot, "call_gex")
+        put_wall = _select_wall(below_spot, "put_gex")
         max_pos_strike = max(banded_strikes, key=lambda k: banded_strikes[k]["net_gex"])
         max_neg_strike = min(banded_strikes, key=lambda k: banded_strikes[k]["net_gex"])
 
         gamma_flip = find_gamma_flip(per_strike, spot=spot)
-
-        expected_move = expected_move_from_quotes(em_calls, em_puts, spot)
 
         return {
             "ticker": ticker,
@@ -1258,8 +1300,22 @@ def render_single_ticker_gex_card(r: dict, week_label: str, out_path: str):
     _CARD_BG   = "#141b2e"
     _ROW_BG    = "#0f1526"
     _TRACK_BG  = "#1e293b"
-    _DATA_FONT   = "Liberation Mono"
-    _HEADER_FONT = "Liberation Sans"
+    # FONT BUGFIX (2026-08-08): the original "Liberation Mono"/"Liberation
+    # Sans" font names are NOT installed in the Railway container --
+    # confirmed via a real production run that logged hundreds of
+    # "findfont: Font family ... not found" warnings per card (one per
+    # text element drawn), which also flooded/truncated the Railway log
+    # viewer before the actual run-summary/posting-confirmation lines
+    # could be seen. Cards still rendered (matplotlib was silently
+    # falling back to DejaVu Sans regardless), so this was a log-noise
+    # and diagnostics problem, not a rendering failure -- but explicitly
+    # requesting DejaVu Sans / DejaVu Sans Mono (matplotlib's own bundled
+    # default fonts, guaranteed present with zero extra system
+    # dependencies) means the SAME font actually gets used with no
+    # fallback warning at all, keeping production logs clean and
+    # actually readable.
+    _DATA_FONT   = "DejaVu Sans Mono"
+    _HEADER_FONT = "DejaVu Sans"
 
     def _fmt_b(v):
         return f"-${abs(v)/1e9:.2f}B" if v < 0 else f"+${v/1e9:.2f}B"
@@ -1541,8 +1597,22 @@ def render_gex_dashboard_card(results: list, week_label: str, out_path: str):
     _CARD_BG   = "#141b2e"
     _ROW_BG    = "#0f1526"
     _TRACK_BG  = "#1e293b"
-    _DATA_FONT   = "Liberation Mono"
-    _HEADER_FONT = "Liberation Sans"
+    # FONT BUGFIX (2026-08-08): the original "Liberation Mono"/"Liberation
+    # Sans" font names are NOT installed in the Railway container --
+    # confirmed via a real production run that logged hundreds of
+    # "findfont: Font family ... not found" warnings per card (one per
+    # text element drawn), which also flooded/truncated the Railway log
+    # viewer before the actual run-summary/posting-confirmation lines
+    # could be seen. Cards still rendered (matplotlib was silently
+    # falling back to DejaVu Sans regardless), so this was a log-noise
+    # and diagnostics problem, not a rendering failure -- but explicitly
+    # requesting DejaVu Sans / DejaVu Sans Mono (matplotlib's own bundled
+    # default fonts, guaranteed present with zero extra system
+    # dependencies) means the SAME font actually gets used with no
+    # fallback warning at all, keeping production logs clean and
+    # actually readable.
+    _DATA_FONT   = "DejaVu Sans Mono"
+    _HEADER_FONT = "DejaVu Sans"
 
     def _fmt_b(v):
         return f"-${abs(v)/1e9:.2f}B" if v < 0 else f"+${v/1e9:.2f}B"
