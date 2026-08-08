@@ -181,14 +181,39 @@ def get_spot_price(ticker: str):
             print(f"  [SPOT WARN] {ticker}: Alpaca returned data for symbol "
                   f"'{returned_symbol}' instead of the requested '{ticker}' — "
                   f"this would fully explain a wrong price. Full raw response: {raw}")
-        if bid and ask:
+
+        # ROOT-CAUSE FIX (2026-08-08): confirmed via the diagnostic
+        # logging above that AAPL's real production discrepancy
+        # ($295.94 shown vs. $313.19 actual) was caused by Alpaca
+        # returning a real, live bid (295.94) alongside ask=0 -- the
+        # OLD "if bid and ask" check treated 0 as falsy and silently
+        # fell through to "return ask or bid or None", which returned
+        # the lone bid as if it were a trustworthy mid-price. A bid
+        # with NO matching ask is not a reliable spot price -- it's
+        # half a quote, and publishing it as if it were the real price
+        # is actively misleading, not just imprecise. Same underlying
+        # failure mode independently confirmed on the OPTIONS quote
+        # side too (see compute_gex_vex()'s has_valid_quote fix).
+        #
+        # FIX: an ask of exactly 0 (or missing) is now treated as an
+        # UNRELIABLE quote, not silently accepted. If ask is missing/0
+        # but bid looks real, this returns None (causing that ticker to
+        # be skipped this run, same as any other data failure) rather
+        # than publishing a number that LOOKS like a legitimate price
+        # but is actually derived from half a quote.
+        if bid and ask and bid > 0 and ask > 0:
             mid = (bid + ask) / 2
             spread_pct = abs(ask - bid) / mid * 100 if mid else 0
             if spread_pct > 5:
                 print(f"  [SPOT WARN] {ticker}: unusually wide bid/ask spread "
                       f"({spread_pct:.1f}%) — bid={bid} ask={ask}, worth a second look")
             return mid
-        return ask or bid or None
+
+        print(f"  [SPOT WARN] {ticker}: incomplete quote (bid={bid}, ask={ask}) -- "
+              f"at least one side is missing or exactly 0, which is NOT a reliable "
+              f"spot price. Skipping this ticker this run rather than publishing a "
+              f"number derived from an incomplete quote.")
+        return None
     except Exception as e:
         print(f"[GEX WARN] {ticker} spot price: {e}")
         return None
@@ -303,6 +328,13 @@ def compute_gex_vex(ticker: str, expiries: list = None) -> dict:
         total_oi_seen = 0.0
         em_calls, em_puts = {}, {}
         first_expiry_done = False
+        # Tracks how many contracts on each side had an invalid quote
+        # (bid/ask missing or exactly 0) -- see the diagnosis note
+        # above the has_valid_quote check below. Used after the loop to
+        # tell a genuine "zero interest" side apart from a "we
+        # couldn't get usable quote data" side.
+        zero_quote_strikes = {}
+        total_contracts_seen = {"call": 0, "put": 0}
 
         for exp in target_expiries:
             contracts = _fetch_alpaca_contracts(ticker, exp)
@@ -325,6 +357,7 @@ def compute_gex_vex(ticker: str, expiries: list = None) -> dict:
                 oi_raw = c.get("open_interest")
                 oi = float(oi_raw) if oi_raw is not None else 0.0
                 total_oi_seen += oi
+                total_contracts_seen["call" if is_call else "put"] += 1
 
                 snap = snapshots.get(symbol, {})
                 bid, ask = snap.get("bid"), snap.get("ask")
@@ -332,7 +365,29 @@ def compute_gex_vex(ticker: str, expiries: list = None) -> dict:
                 if not first_expiry_done:
                     (em_calls if is_call else em_puts)[strike] = {"bid": bid, "ask": ask}
 
-                if bid and ask and bid > 0 and ask > 0:
+                # DIAGNOSIS (2026-08-08): confirmed via real production
+                # logs that entire sides of the chain (all put strikes
+                # for AAPL/MSFT/AMZN/NVDA, all call strikes for
+                # GOOGL/META/TSLA, in the SAME run) came back with
+                # put_gex or call_gex summing to exactly 0 across every
+                # strike -- not a threshold problem, a DATA problem.
+                # Root cause: Alpaca's options snapshot quotes had
+                # ask=0 (or bid=0) for every contract on the affected
+                # side at this specific off-hours run time (8:00pm UTC
+                # / 4:00pm ET, right at/after close) -- same falsy-zero
+                # failure mode independently confirmed on the STOCK
+                # quote side too (AAPL/MSFT/AMZN spot price bug, see
+                # get_spot_price()'s diagnostic logging). "bid and ask"
+                # is False when either is exactly 0, so iv silently
+                # became 0.0 for every affected strike, and gamma/gex
+                # followed to 0 -- indistinguishable, before this fix,
+                # from a genuine absence of options interest.
+                has_valid_quote = bid is not None and ask is not None and bid > 0 and ask > 0
+                if not has_valid_quote:
+                    zero_quote_strikes.setdefault("call" if is_call else "put", 0)
+                    zero_quote_strikes["call" if is_call else "put"] += 1
+
+                if has_valid_quote:
                     mid_price = (bid + ask) / 2
                     iv = solve_implied_vol(mid_price, spot, strike, t_years, is_call)
                 else:
@@ -362,6 +417,34 @@ def compute_gex_vex(ticker: str, expiries: list = None) -> dict:
         for k in per_strike:
             per_strike[k]["net_gex"] = per_strike[k]["call_gex"] - per_strike[k]["put_gex"]
             per_strike[k]["net_vex"] = per_strike[k]["call_vex"] - per_strike[k]["put_vex"]
+
+        # DATA-QUALITY CHECK (2026-08-08): reports, per side, what
+        # fraction of that side's contracts had an unusable quote
+        # (bid/ask missing or exactly 0) -- see the diagnosis note
+        # above has_valid_quote earlier in this function. A side where
+        # MOST or ALL contracts lacked a usable quote produced a
+        # genuinely zero call_gex/put_gex sum for reasons that have
+        # NOTHING to do with real market interest -- the old code had
+        # no way to distinguish that from an honest "nobody's trading
+        # this side" finding, and the wall-selection significance
+        # filter downstream would reject a 0-total side either way,
+        # silently. Logged here so a bad run is visible in the logs
+        # BEFORE it reaches wall selection, rather than only showing up
+        # as an unexplained missing wall several steps later.
+        quote_quality = {}
+        for side in ("call", "put"):
+            total = total_contracts_seen.get(side, 0)
+            zero_count = zero_quote_strikes.get(side, 0)
+            if total > 0:
+                zero_pct = zero_count / total
+                quote_quality[side] = {"total": total, "zero_quote": zero_count, "zero_pct": zero_pct}
+                if zero_pct > 0.5:
+                    print(f"  [DATA QUALITY WARN] {ticker} {side} side: {zero_count}/{total} "
+                          f"({zero_pct:.0%}) contracts had NO usable bid/ask this run -- "
+                          f"any resulting wall/GEX finding on this side reflects MISSING DATA, "
+                          f"not necessarily real market interest. This is a known off-hours "
+                          f"data-availability issue (see get_spot_price()'s matching diagnostic), "
+                          f"not a code bug.")
 
         if not per_strike:
             return {"error": f"{ticker}: no strikes with usable data", "ticker": ticker}
@@ -492,6 +575,7 @@ def compute_gex_vex(ticker: str, expiries: list = None) -> dict:
             "gamma_flip": gamma_flip,
             "expected_move": expected_move,
             "per_strike": per_strike,
+            "quote_quality": quote_quality,
         }
     except Exception as e:
         return {"error": f"{ticker}: {type(e).__name__}: {e}", "ticker": ticker}
