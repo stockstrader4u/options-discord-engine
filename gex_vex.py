@@ -1199,6 +1199,287 @@ def compute_regime_subtitle(results: list) -> dict:
     return subtitles
 
 
+def compute_single_ticker_subtitle(r: dict) -> tuple:
+    """
+    NEW (2026-08-08): standalone-ticker equivalent of
+    compute_regime_subtitle(), for the Mag 7 daily pipeline where each
+    ticker is rendered on its OWN card with no same-run peers to rank
+    against (compute_regime_subtitle()'s "most/moderately/mildest of
+    the group" ranking has nothing to compare against for a single
+    ticker run alone). Returns the same (rank_str, implication_str)
+    tuple shape so render_single_ticker_gex_card() can reuse the exact
+    same rendering code path as the multi-ticker card's per-panel loop.
+    """
+    net_gex = r.get("net_gex")
+    if net_gex is None:
+        return ("", "")
+    sign_word = "short" if net_gex < 0 else "long"
+    imp = ("moves likely to fade back toward range" if sign_word == "long"
+           else "moves could run further than usual if a wall breaks")
+    return (f"{sign_word} gamma", imp)
+
+
+def render_single_ticker_gex_card(r: dict, week_label: str, out_path: str):
+    """
+    NEW (2026-08-08): renders ONE ticker's GEX/VEX panel as its own
+    standalone Discord-ready PNG -- built for the Mag 7 daily pipeline,
+    where each of the 7 tickers gets posted as its own separate card
+    rather than several tickers side-by-side in one wide image (per
+    direct user request: cramming 7 tickers into one card was
+    confirmed to make it "too clumsy and unreadable").
+
+    This is NOT a new design -- it's the exact same per-ticker panel
+    already proven in render_gex_dashboard_card() (colors, layout,
+    POSITIONING/KEY LEVELS/EXPECTED MOVE sections, range bar with
+    wall/flip/spot markers, wall-collision handling), just rendered as
+    a single full-width panel instead of one of several narrow columns.
+    render_gex_dashboard_card() itself is UNCHANGED and continues to
+    power the existing 3-across SPY/QQQ/IWM card exactly as before --
+    this is a new, separate function, not a modification of that one.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    import re as _re
+
+    def S(text):
+        return _re.sub(r"[^\x00-\uFFFF]", "", str(text))
+
+    _BG        = "#0a0e1a"
+    _HDR_BG    = "#151c31"
+    _HDR_TXT   = "#f8fafc"
+    _TXT       = "#e9edf5"
+    _TXT_DIM   = "#9aa7c7"
+    _GREEN     = "#34d399"
+    _RED       = "#fb7185"
+    _BORDER    = "#2d3b56"
+    _GOLD      = "#fbbf24"
+    _CARD_BG   = "#141b2e"
+    _ROW_BG    = "#0f1526"
+    _TRACK_BG  = "#1e293b"
+    _DATA_FONT   = "Liberation Mono"
+    _HEADER_FONT = "Liberation Sans"
+
+    def _fmt_b(v):
+        return f"-${abs(v)/1e9:.2f}B" if v < 0 else f"+${v/1e9:.2f}B"
+
+    def _fmt_m(v):
+        return f"-${abs(v)/1e6:.2f}M" if v < 0 else f"+${v/1e6:.2f}M"
+
+    FIG_W = 8.4  # single-panel width -- roughly the per-ticker column
+                 # width from the 3-across dashboard, standalone.
+    MARGIN = 0.36
+    HDR_H = 0.64
+    SUB_H = 0.26
+    GAP = 0.30
+
+    STAT_ROW_H = 0.42
+    SECTION_LABEL_H = 0.34
+    N_SECTIONS = 3
+    N_STAT_ROWS = 9
+    SECTION_GAP = 0.11
+    STAT_SECTION_H = (N_SECTIONS * SECTION_LABEL_H) + (N_STAT_ROWS * STAT_ROW_H) + (N_SECTIONS * SECTION_GAP)
+    CARD_PAD = 0.26
+
+    HEADER_BLOCK_H = 0.22 + 0.32 + 0.28 + 0.22 + 0.24
+    BAR_H_ACTUAL = 0.40
+    BAR_BLOCK_H = 0.32 + BAR_H_ACTUAL + 0.46
+    CARD_H = CARD_PAD + HEADER_BLOCK_H + BAR_BLOCK_H + STAT_SECTION_H
+
+    KEY_H = 0.58
+    FOOTER_H = 0.36
+
+    usable_w = FIG_W - 2 * MARGIN
+    fig_h = MARGIN + HDR_H + SUB_H + GAP + CARD_H + GAP + KEY_H + GAP + FOOTER_H + MARGIN
+
+    fig = plt.figure(figsize=(FIG_W, fig_h), dpi=200, facecolor=_BG)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, FIG_W)
+    ax.set_ylim(fig_h, 0)
+    ax.axis("off")
+
+    def rect(x, y, w, h, color, z=2, alpha=1.0):
+        ax.add_patch(patches.Rectangle((x, y), w, h, facecolor=color, edgecolor="none", zorder=z, alpha=alpha))
+
+    def rrect(x, y, w, h, color, radius=0.05, z=2, alpha=1.0, ec="none", lw=0):
+        ax.add_patch(patches.FancyBboxPatch(
+            (x, y), w, h, boxstyle=f"round,pad=0,rounding_size={radius}",
+            facecolor=color, edgecolor=ec, linewidth=lw, zorder=z, alpha=alpha))
+
+    def hline(y, x0, x1, color=_BORDER, lw=0.5):
+        ax.plot([x0, x1], [y, y], color=color, linewidth=lw, zorder=3)
+
+    def txt(x, y, text, fs=8.0, color=_TXT, bold=False, ha="left",
+            font=_DATA_FONT, style="normal"):
+        ax.text(x, y, S(text), fontsize=fs, color=color,
+                 fontweight="bold" if bold else "normal", fontstyle=style,
+                 ha=ha, va="center", zorder=6, fontfamily=font)
+
+    cur = MARGIN
+
+    ticker = r.get("ticker", "?")
+
+    if "error" in r:
+        rect(MARGIN, cur, usable_w, HDR_H, _HDR_BG)
+        hline(cur + HDR_H, MARGIN, MARGIN + usable_w, _GOLD, 1.4)
+        txt(MARGIN + 0.22, cur + HDR_H / 2, f"{ticker} GEX / VEX  \u2014  {week_label}",
+            fs=13, color=_HDR_TXT, bold=True, font=_HEADER_FONT)
+        cur += HDR_H + GAP
+        rrect(MARGIN, cur, usable_w, 1.0, _CARD_BG, radius=0.07, ec=_BORDER, lw=0.8, z=2)
+        txt(MARGIN + usable_w / 2, cur + 0.5, f"{ticker}: data unavailable this run",
+            fs=9, color=_TXT_DIM, ha="center", font=_HEADER_FONT)
+        cur += 1.0 + MARGIN
+        fig.set_size_inches(FIG_W, cur)
+        plt.savefig(out_path, facecolor=_BG, bbox_inches="tight", pad_inches=0.2)
+        plt.close(fig)
+        print(f"[GEX] Single-ticker error card ({ticker}) -> {out_path}")
+        return
+
+    rect(MARGIN, cur, usable_w, HDR_H, _HDR_BG)
+    hline(cur + HDR_H, MARGIN, MARGIN + usable_w, _GOLD, 1.4)
+    txt(MARGIN + 0.22, cur + HDR_H / 2, f"{ticker} GEX / VEX  \u2014  {week_label}",
+        fs=13, color=_HDR_TXT, bold=True, font=_HEADER_FONT)
+    cur += HDR_H
+
+    txt(FIG_W / 2, cur + SUB_H / 2,
+        "Standard public-GEX approximation \u2014 dealers assumed net long calls / net short puts",
+        fs=7.4, color=_TXT_DIM, ha="center", font=_HEADER_FONT)
+    cur += SUB_H + GAP
+
+    spot = r["spot"]
+    net_gex = r["net_gex"]
+    net_vex = r["net_vex"]
+    is_short = net_gex < 0
+    regime_color = _RED if is_short else _GREEN
+
+    rrect(MARGIN, cur, usable_w, CARD_H, _CARD_BG, radius=0.07, ec=_BORDER, lw=0.9, z=2)
+    rrect(MARGIN, cur, usable_w, 0.10, regime_color, radius=0.05, z=3)
+
+    inner_x0 = MARGIN + CARD_PAD
+    inner_w = usable_w - CARD_PAD * 2
+    y = cur + CARD_PAD + 0.24
+
+    txt(inner_x0, y, ticker, fs=19, color=_TXT, bold=True, font=_HEADER_FONT)
+    txt(inner_x0 + 1.05, y, f"${spot:,.2f}", fs=11.5, color=_TXT_DIM, font=_DATA_FONT)
+    y += 0.32
+
+    regime_word = "SHORT GAMMA" if is_short else "LONG GAMMA"
+    txt(inner_x0, y, regime_word, fs=10.5, color=regime_color, bold=True, font=_HEADER_FONT)
+    y += 0.28
+
+    rank_str, implication_str = compute_single_ticker_subtitle(r)
+    txt(inner_x0, y, rank_str, fs=8.0, color=_TXT_DIM, style="italic", font=_HEADER_FONT)
+    y += 0.22
+    txt(inner_x0, y, implication_str, fs=7.6, color=_TXT, font=_HEADER_FONT)
+    y += 0.24
+
+    bar_h = BAR_H_ACTUAL
+    bar_x0 = inner_x0
+    bar_w = inner_w
+    bar_y = y + 0.08
+
+    call_wall = r["call_wall"]
+    put_wall = r["put_wall"]
+    em = r.get("expected_move") or {}
+    em_min = em.get("min", spot)
+    em_max = em.get("max", spot)
+    gamma_flip = r.get("gamma_flip")
+
+    range_min = min(put_wall, em_min, spot) if put_wall else min(em_min, spot)
+    range_max = max(call_wall, em_max, spot) if call_wall else max(em_max, spot)
+    pad = (range_max - range_min) * 0.14 or 1.0
+    range_min -= pad
+    range_max += pad
+    span = range_max - range_min
+
+    def to_x(price, bar_x0=bar_x0, bar_w=bar_w, range_min=range_min, span=span):
+        return bar_x0 + (price - range_min) / span * bar_w
+
+    rrect(bar_x0, bar_y, bar_w, bar_h, _TRACK_BG, radius=bar_h * 0.4, z=3)
+    em_x0, em_x1 = to_x(em_min), to_x(em_max)
+    rect(em_x0, bar_y, max(em_x1 - em_x0, 0.02), bar_h, _GOLD, z=4, alpha=0.45)
+
+    if put_wall and call_wall:
+        pw_x, cw_x = to_x(put_wall), to_x(call_wall)
+        collision = abs(pw_x - cw_x) < bar_w * 0.10
+
+        ax.plot([pw_x, pw_x], [bar_y - 0.04, bar_y + bar_h + 0.04], color=_RED, linewidth=2.6, zorder=5)
+        ax.plot([cw_x, cw_x], [bar_y - 0.04, bar_y + bar_h + 0.04], color=_GREEN, linewidth=2.6, zorder=5)
+
+        if collision:
+            mid_x = (pw_x + cw_x) / 2
+            txt(mid_x, bar_y - 0.18, f"P/C \u2248 ${put_wall:,.0f}", fs=7.2, color=_TXT, bold=True, ha="center", font=_HEADER_FONT)
+        else:
+            txt(pw_x, bar_y - 0.18, f"P ${put_wall:,.0f}", fs=7.2, color=_RED, bold=True, ha="center", font=_HEADER_FONT)
+            txt(cw_x, bar_y - 0.18, f"C ${call_wall:,.0f}", fs=7.2, color=_GREEN, bold=True, ha="center", font=_HEADER_FONT)
+
+    if gamma_flip is not None and range_min <= gamma_flip <= range_max:
+        gf_x = to_x(gamma_flip)
+        ax.plot([gf_x, gf_x], [bar_y - 0.07, bar_y + bar_h + 0.07], color="#c084fc", linewidth=1.6, linestyle="--", zorder=5)
+
+    sp_x = to_x(spot)
+    ax.plot([sp_x], [bar_y + bar_h / 2], marker="o", markersize=10,
+            markerfacecolor=_GOLD, markeredgecolor="#ffffff", markeredgewidth=1.7, zorder=7)
+
+    y = bar_y + bar_h + 0.46
+
+    def stat_row(label, value, color, y):
+        rect(inner_x0 - 0.07, y - STAT_ROW_H / 2 + 0.03, inner_w + 0.14, STAT_ROW_H - 0.07, _ROW_BG, z=2)
+        txt(inner_x0, y, label, fs=8.0, color=_TXT_DIM, font=_HEADER_FONT)
+        txt(inner_x0 + inner_w, y, value, fs=9.0, color=color, bold=True, ha="right")
+
+    def section_label(text, y):
+        txt(inner_x0, y, text, fs=7.3, color="#7dd3fc", bold=True, font=_HEADER_FONT)
+
+    section_label("POSITIONING", y)
+    y += SECTION_LABEL_H
+    gf_str = f"${gamma_flip:,.2f}" if gamma_flip is not None else "N/A"
+    stat_row("Gamma Flip", gf_str, _TXT_DIM if gamma_flip is None else _TXT, y); y += STAT_ROW_H
+    stat_row("Net GEX", _fmt_b(net_gex), _RED if net_gex < 0 else _GREEN, y); y += STAT_ROW_H
+    stat_row("Net VEX", _fmt_m(net_vex), _RED if net_vex < 0 else _GREEN, y); y += STAT_ROW_H
+
+    y += SECTION_GAP
+    section_label("KEY LEVELS", y)
+    y += SECTION_LABEL_H
+    cw_pct = r.get("call_wall_pct")
+    pw_pct = r.get("put_wall_pct")
+    stat_row("Call Wall", f"${call_wall:,.0f}  ({cw_pct:+.1f}%)" if call_wall else "N/A", _GREEN, y); y += STAT_ROW_H
+    stat_row("Put Wall", f"${put_wall:,.0f}  ({pw_pct:+.1f}%)" if put_wall else "N/A", _RED, y); y += STAT_ROW_H
+    mpg_strike, mpg_val = r.get("max_pos_gex_strike"), r.get("max_pos_gex_value")
+    mng_strike, mng_val = r.get("max_neg_gex_strike"), r.get("max_neg_gex_value")
+    stat_row("Max +GEX", f"${mpg_strike:,.0f}  {_fmt_m(mpg_val)}" if mpg_strike is not None else "N/A", _GREEN, y); y += STAT_ROW_H
+    stat_row("Max -GEX", f"${mng_strike:,.0f}  {_fmt_m(mng_val)}" if mng_strike is not None else "N/A", _RED, y); y += STAT_ROW_H
+
+    y += SECTION_GAP
+    section_label("EXPECTED MOVE", y)
+    y += SECTION_LABEL_H
+    if em:
+        stat_row("\u00b1 by Fri", f"\u00b1${em['dollar']} ({em['pct']}%)", _GOLD, y); y += STAT_ROW_H
+        stat_row("Range", f"${em['min']:,.2f} \u2013 ${em['max']:,.2f}", _TXT, y); y += STAT_ROW_H
+    else:
+        stat_row("\u00b1 by Fri", "N/A", _TXT_DIM, y); y += STAT_ROW_H
+        stat_row("Range", "N/A", _TXT_DIM, y); y += STAT_ROW_H
+
+    cur += CARD_H + GAP
+
+    rrect(MARGIN, cur, usable_w, KEY_H, "#0e1424", radius=0.05, z=2)
+    txt(MARGIN + usable_w / 2, cur + KEY_H / 2,
+        "GEX = gamma exposure (+dampens/-amplifies moves) \u00b7 VEX = vanna exposure \u00b7 "
+        "Walls = support/resistance \u00b7 Gamma Flip = regime-change level",
+        fs=6.6, color=_TXT_DIM, ha="center", font=_HEADER_FONT)
+    cur += KEY_H + GAP
+
+    txt(MARGIN + usable_w, cur + FOOTER_H / 2, "BlueMoonTrades", fs=9.5,
+        color=_TXT_DIM, bold=True, ha="right", font=_HEADER_FONT)
+    cur += FOOTER_H
+
+    fig.set_size_inches(FIG_W, cur + MARGIN)
+    plt.savefig(out_path, facecolor=_BG, bbox_inches="tight", pad_inches=0.2)
+    plt.close(fig)
+    print(f"[GEX] Single-ticker card ({ticker}) -> {out_path}")
+
+
 def render_gex_dashboard_card(results: list, week_label: str, out_path: str):
     """Renders the GEX/VEX dashboard as a Discord-ready PNG.
 
