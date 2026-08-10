@@ -597,13 +597,23 @@ def get_company_name(ticker: str) -> str:
 # NEW: rich, subscriber-ready post generation (single long-form prompt)
 # ─────────────────────────────────────────────────────────────────────
 
-# The exact editor-style template supplied by the user. Kept verbatim
-# so the requested structure/wording is preserved exactly.
+# Editor-style template, revised (2026-08-09) to produce a MUCH more
+# compact, scannable post. The original version of this template
+# (full paragraphs for "why it made the list" / "why choose this over
+# the others" / "plain-English risk" per setup, plus a separate
+# five-block "Card Copy" section) rendered as 8 sequential Discord
+# messages in testing and was confirmed too long for a subscriber to
+# realistically read. This version keeps every decision-relevant data
+# point but folds each setup into one tight scannable block, and drops
+# the "Card Copy" section entirely -- the final contract list is now
+# built deterministically in Python (see build_contract_list_section())
+# instead of being written by the model, which also guarantees it's
+# byte-for-byte accurate to the actual selected contracts.
 RICH_POST_TEMPLATE = r"""You are an expert options-trading newsletter editor and trade-plan designer.
 
-Your job is to convert my nightly “Top 5 Options Trade Ideas” scan output into a clear, practical, subscriber-ready post that both experienced traders and laymen can understand and act on.
+Your job is to convert my nightly "Top 5 Options Trade Ideas" scan output into a clear, practical, subscriber-ready post that both experienced traders and laymen can understand and act on IN UNDER 3 MINUTES OF READING. Readers will not read a long document -- density and scannability matter as much as accuracy.
 
-The audience receives these ideas after market close for trading the next session. These are short-dated options setups, typically 1–3 weeks to expiration. The goal is not to create hype or imply certainty. The goal is to help subscribers choose the setup that best fits their risk tolerance and execute it with discipline.
+The audience receives these ideas after market close for trading the next session. These are short-dated options setups, typically 1–3 weeks to expiration. The goal is not to create hype or imply certainty. The goal is to help subscribers choose the setup that best fits their risk tolerance and execute it with discipline, in one quick read.
 
 ## Core Rules
 
@@ -617,157 +627,89 @@ The audience receives these ideas after market close for trading the next sessio
      - Speculative / High-Risk Breakout Setup
    - If the supplied data does not support one of these labels, use the closest truthful label.
 
-2. Use plain English.
-   - Translate technical language into what it means for the trader.
-   - For example:
-     - “Cheap implied volatility” → “The option premium looks relatively inexpensive compared with how much the stock has recently moved.”
-     - “Bullish flow” → “Large traders recently positioned bullishly; it supports the setup but does not guarantee a move.”
-     - “Higher lows” → “Buyers have repeatedly stepped in at higher prices, which is constructive until the stop breaks.”
-   - Define unavoidable jargon briefly the first time it appears.
+2. Use plain English, but be BRIEF about it.
+   - Translate technical language into what it means for the trader, in as few words as possible.
+   - For example: "cheap implied volatility" becomes something like "options are priced cheap for how much this stock moves" -- not a full explanatory sentence every time.
+   - Do not define jargon at length; a short parenthetical or half-sentence is enough.
 
-3. Focus on decision-making and execution.
-   For every trade, clearly answer:
-   - Why is this a setup now?
-   - Why should a subscriber choose this trade over the other four?
-   - What price action confirms entry?
-   - How much does the stock need to move to reach the strike?
-   - What makes the idea invalid?
-   - What should the trader do at Target 1 and Target 2?
-   - What makes the setup higher or lower risk?
+3. Every setup must let a reader answer, in one glance:
+   - Why this setup, why now (one line, not a paragraph)
+   - What confirms entry vs. what invalidates it
+   - How far the stock needs to move
+   - What to do at each target
+   - Why it's higher or lower risk than the others
+   Answer all of these, but COMBINED into the fewest lines possible -- do not give each question its own paragraph.
 
 4. Never imply that a trade is guaranteed.
-   - State that bullish flow, analyst targets, technical patterns, and model rankings are supportive evidence—not certainty.
+   - State that bullish flow, analyst targets, technical patterns, and model rankings are supportive evidence, not certainty -- but say this ONCE for the whole post (in Execution Rules), not repeated per setup.
    - Avoid hype, exaggerated language, and unsupported claims.
    - Do not frame analyst price targets as the main reason to buy a short-dated call.
 
-5. Emphasize short-dated option risk.
-   - Include days to expiration.
-   - Remind readers that time decay accelerates as expiration approaches.
-   - Include a time-stop guideline: if the stock fails to show momentum within a defined number of sessions, consider reducing or exiting.
-   - State that all stops are based on the underlying stock price unless explicitly specified otherwise.
+5. Emphasize short-dated option risk, briefly.
+   - Include days to expiration for each setup (one number, inline).
+   - The time-decay warning and "stops are on the underlying stock price" note belong ONCE in Execution Rules, not repeated five times.
+   - Include a short time-stop guideline per setup (e.g. "no move in 3 sessions -> reassess"), as a few words, not a sentence.
 
-6. Make it actionable for a layman.
-   - Clearly distinguish “entry trigger” from “entry price.”
-   - Explain that traders should not automatically buy at the open.
-   - Include a no-chase rule: if price gaps materially above entry, wait for a pullback/hold or skip the trade.
-   - Include a concise risk-management note: do not allocate so much to one idea that a stopped-out trade materially damages the account.
+6. Make it actionable for a layman, concisely.
+   - Distinguish "entry trigger" from "entry price" in a few words, not an explanatory sentence, per setup.
+   - The no-chase rule and position-sizing reminder belong ONCE in Execution Rules, not repeated per setup.
 
 ## Required Output Format
 
-Create the post in this exact structure:
+Create the post in this exact structure. Follow the line-by-line density shown -- this is not a suggestion, it is the target format:
 
 # TRADE IDEAS — [DAY, DATE]
 
-**Expiry:** [DATE]
-**Direction:** Calls / Puts
-**Market backdrop:** [1–2 plain-English sentences about SPY/QQQ/IWM and the market environment.]
-**How to use tonight’s list:** [1–2 sentences explaining that these are independent setups and subscribers should select trades based on setup quality, risk, and triggered entry—not buy all five automatically.]
+**Expiry:** [DATE] · **Direction:** Calls / Puts
+**Market backdrop:** [ONE plain-English sentence about SPY/QQQ/IWM.]
+**How to use this list:** [ONE sentence: these are independent triggered setups, pick what fits your risk, don't buy all five blindly.]
 
-## Tonight’s Trade Map
+## Tonight's Trade Map
 
-Create a concise table:
-
-| Role | Ticker / Contract | Why Choose It | Risk Level |
+| Role | Ticker / Contract | Why Choose It | Risk |
 |---|---|---|---|
-| Best Overall | | | |
-| Lowest-Move Setup | | | |
-| Best Balanced Setup | | | |
-| Flow-Backed Setup | | | |
-| Speculative Breakout | | | |
-
-Use the available data only. If a role cannot be assigned honestly, use a more accurate label.
+| Best Overall | | [max ~8 words] | |
+| Lowest-Move | | [max ~8 words] | |
+| Best Balanced | | [max ~8 words] | |
+| Flow-Backed | | [max ~8 words] | |
+| Speculative | | [max ~8 words] | |
 
 ## Best Choice Tonight
 
-Write 2–4 concise sentences naming the best overall setup and explaining why it ranks first. Include the strongest combination of:
-- Technical structure
-- Options-flow support
-- Required move to strike
-- Option pricing/value
-- Catalyst or relative strength, if available
+[2-3 SHORT sentences max naming the best overall setup and the single strongest reason.]
 
-Then add:
-
-**If choosing one trade tonight:** [TICKER / CONTRACT]
-**Why:** [one-sentence explanation]
+**If choosing one trade tonight:** [TICKER / CONTRACT] — [one short clause why]
 
 ## The Five Setups
 
-Use this exact layout for each idea:
+Use this EXACT compact layout for each idea -- 4 lines per setup, nothing more:
 
-### [Rank]. [TICKER] — [EXPIRY] [STRIKE][C/P]
-**Role:** [Best Overall / Lower-Move Setup / Balanced / Flow-Backed / Speculative Breakout]
-**Risk level:** [Low / Moderate / High / Speculative]
-**Best for:** [one concise sentence describing the kind of trader or objective this suits.]
+### [Rank]. $TICKER — [EXPIRY] $[STRIKE][C/P] · [Role] · Risk: [Level]
+**Setup:** [ONE, at most TWO, plain-English sentences combining chart structure + flow + pricing/value + catalyst if any. This replaces "why it made the list" AND "why choose this over the others" AND "plain-English risk" -- do not write those as separate paragraphs, fold the single most important differentiator and the single main risk into this one line.]
+**Plan:** Entry above $[X] (skip if it gaps past $[Y], wait for a pullback/hold) · Stop $[X] · T1 $[X] (partial profits) · T2 $[X] (trail rest) · Needs +[X]% in [N] days · Time-stop: no move in [N] sessions, reassess
 
-**Why it made the list:**
-[2–3 plain-English sentences combining chart structure, options flow, volatility/value, sector strength, catalyst, analyst context, or other provided evidence. Explain what each data point means rather than merely listing it.]
-
-**Why choose this over the others:**
-[One sentence highlighting the key differentiator.]
-
-**Trade plan:**
-- **Entry trigger:** [Example: “Enter only if price holds above $X” or “Enter on a confirmed break and hold above $X.”]
-- **Avoid chasing:** [Specific instruction based on supplied levels; if unavailable, say not to chase a sharp opening gap and wait for confirmation.]
-- **Underlying entry zone:** [price/range]
-- **Stop / invalidation:** [price; clarify it is based on underlying stock price]
-- **Target 1:** [price and action, e.g., “Consider taking partial profits.”]
-- **Target 2:** [price and action, e.g., “Hold remaining position only if momentum remains intact.”]
-- **Move needed to strike:** [X% and/or $X]
-- **Days to expiration:** [X]
-- **Time-stop:** [Example: “If it has not begun moving in your favor within 3–4 trading sessions, reassess or reduce.”]
-
-**Plain-English risk:**
-[One sentence describing the primary risk. Example: “The stock needs a large move in limited time, so this is a smaller-size, confirmation-only trade.”]
+That's it -- two lines of substance per setup (a header line and two labeled lines). Do not add extra paragraphs, extra headers, or restate numbers already in the Tonight's Trade Map table.
 
 ## Execution Rules
 
-Include 5–7 concise bullets:
-
-- These are triggered setups, not automatic buy-at-open alerts.
-- Use the underlying stock entry and stop levels; option premiums can move differently because of implied volatility and time decay.
-- Do not chase a large opening gap; wait for the price to hold above the trigger or pull back constructively.
-- Consider taking partial profits at Target 1 and managing the remaining position toward Target 2.
-- Use smaller size for high-risk or speculative trades.
-- If the trade does not develop within a few sessions, time decay can become a major headwind.
-- Broad-market strength can help, but each setup needs its own chart and/or catalyst to work.
+5 concise bullets, covering (once, for all five setups together): these are triggered setups not auto-buys; stops/entries are on the underlying stock price, option premiums move differently due to IV and time decay; don't chase a gap, wait for a hold or pullback; take partials at T1, manage the rest toward T2; size down on High/Speculative setups since nothing here is guaranteed and time decay accelerates near expiration.
 
 ## Risk Disclosure
 
-Write one short, plain-English paragraph:
+One short, plain-English paragraph (reuse this exact wording):
 
-“These are informational trade ideas, not financial advice. Options can lose value quickly, especially near expiration. Use position sizing, follow stops, and only take trades that fit your own risk tolerance.”
+"These are informational trade ideas, not financial advice. Options can lose value quickly, especially near expiration. Use position sizing, follow stops, and only take trades that fit your own risk tolerance."
 
-## Card Copy
-
-After the written post, create concise copy for a visual trade card for each ticker. Use this exact structure:
-
-### Card: [TICKER]
-
-**[Rank Label, e.g., #1 TOP PICK]**
-**[CALL/PUT] | [EXPIRY] | $[STRIKE] Strike**
-**Risk:** [Low / Moderate / High / Speculative]
-**Why now:** [One short sentence]
-**Trigger:** [Enter only above/below $X]
-**Stop:** [$X underlying price]
-**Target 1:** [$X — take partials]
-**Target 2:** [$X — trail remaining position]
-**Move to strike:** [X%]
-**Time remaining:** [X DTE]
-**Key note:** [One short, simple risk or execution reminder]
+Do NOT add a "Card Copy" section or anything after Risk Disclosure -- the post ends there. A separate, code-generated contract list is appended after your output automatically; do not attempt to write one yourself.
 
 ## Style Requirements
 
-- Write like a disciplined professional trader, not a marketer.
-- Keep paragraphs short.
-- Use direct language.
-- Make all numbers easy to scan.
-- Do not over-explain every metric.
-- Do not say “this is guaranteed,” “easy money,” “cannot lose,” or similar language.
+- Write like a disciplined professional trader texting the key facts to a friend, not a newsletter writer.
+- Every sentence must earn its place. If a sentence only restates a number already shown elsewhere, cut it.
+- Do not say "this is guaranteed," "easy money," "cannot lose," or similar language.
 - Do not invent catalysts, data, prices, or reasoning not included in the source data.
-- If data is missing, label it “Not provided” rather than guessing.
-- Preserve all supplied entry, stop, target, flow, option pricing, and expiration data accurately.
-- Prioritize clarity over sophistication.
+- If data is missing, label it "Not provided" rather than guessing.
+- Preserve all supplied entry, stop, target, flow, option pricing, and expiration data accurately -- brevity in prose, never in numbers.
 
 ## Source Data
 
@@ -781,17 +723,18 @@ I will provide:
 7. Required move / expected move / implied volatility data
 8. Analyst target or catalyst information when available
 
-Using only that information, generate the complete subscriber-ready post and the five card-copy blocks."""
+Using only that information, generate the complete subscriber-ready post in the exact compact format above, ending at Risk Disclosure."""
 
 # Non-negotiable operational rules from the production script, layered
 # on top of the template above without changing its requested
 # structure. These exist because of real Discord-formatting and
 # accuracy bugs already fixed in bmt_nightly_setups.py.
-ADDITIONAL_OPERATIONAL_RULES = """- Every single ticker mention, anywhere in the post or the card copy blocks, must be prefixed with a dollar sign (e.g. "$AXTI", "$SPY"), every time it appears -- not just on first mention.
+ADDITIONAL_OPERATIONAL_RULES = """- Every single ticker mention, anywhere in the post, must be prefixed with a dollar sign (e.g. "$AXTI", "$SPY"), every time it appears -- not just on first mention.
 - Do NOT include any URLs, website names, or "according to [source]" citations anywhere in the output -- write facts in plain prose without naming or linking sources. Discord auto-generates broken-looking link preview embeds from any URL or domain-like text, so citing a source by name or link breaks the formatting badly.
 - If you reference any event or date found via search, you MUST state whether it falls BEFORE or AFTER that specific contract's expiry date. An event after expiry is not a direct catalyst for that trade -- omit it or frame it explicitly as pre-positioning context only.
 - The five setups supplied below have ALREADY been screened for reasonable option pricing and a clean chart pattern before you saw them -- do not write as if reconsidering whether they are worth trading; lead with what supports each idea, not doubt about it, unless something genuinely concerning turns up in search.
-- Return ONLY the post and the five card-copy blocks, starting directly with "# TRADE IDEAS —". No preamble, no commentary, no markdown code fences before or after."""
+- Stop your output at Risk Disclosure. Do NOT write a "Card Copy" section or anything else after it -- that is appended separately by code.
+- Return ONLY the post described above, starting directly with "# TRADE IDEAS —". No preamble, no commentary, no markdown code fences before or after."""
 
 
 def build_source_data_block(selected: list, market_context: dict, target_date: datetime) -> str:
@@ -862,6 +805,20 @@ Now generate the complete output exactly as specified above (the full post, then
     content = re.sub(r"^```(?:markdown|md)?\s*", "", content)
     content = re.sub(r"```\s*$", "", content)
     return content.strip()
+
+
+def build_contract_list_section(selected: list) -> str:
+    """
+    Deterministic, code-generated replacement for the old LLM-written
+    "Card Copy" section (2026-08-09 fix). Guarantees the final contract
+    list is byte-for-byte accurate to what was actually selected --
+    same pattern as contract_lines in the production script's
+    format_discord_digest(). Not written by the model.
+    """
+    lines = ["## Tonight's Contracts", ""]
+    for c in selected:
+        lines.append(f"• ${c['ticker']} {c['next_expiry']} ${c['strike']:g}{c['direction'][0]}")
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1371,6 +1328,21 @@ def main():
     all_tickers = [c["ticker"] for c in selected] + list(MARKET_CONTEXT_TICKERS)
     rich_post = strip_urls_and_domains(rich_post)
     rich_post = ensure_dollar_prefixed_tickers(rich_post, all_tickers)
+
+    # Strip anything the model wrote past "Risk Disclosure" (e.g. if it
+    # ignored the instruction and added a Card Copy section anyway),
+    # then append the deterministic, code-built contract list.
+    disclosure_marker = re.search(r"(These are informational trade ideas[^\n]*\n?)", rich_post)
+    if disclosure_marker:
+        cutoff = disclosure_marker.end()
+        # allow the paragraph to run a little past the marker sentence
+        # in case the model added a closing clause, but drop anything
+        # that looks like a new "##" section after it.
+        remainder = rich_post[cutoff:]
+        next_header = re.search(r"\n#{1,3} ", remainder)
+        if next_header:
+            rich_post = rich_post[:cutoff] + remainder[:next_header.start()]
+    rich_post = rich_post.rstrip() + "\n\n" + build_contract_list_section(selected)
 
     print(f"\n=== RICH POST ({len(rich_post)} chars total) ===\n{rich_post}\n")
 
