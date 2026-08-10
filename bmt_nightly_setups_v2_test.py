@@ -1,11 +1,10 @@
 """
 bmt_nightly_setups_v2_test.py — EXPERIMENTAL / TEST BUILD
 
-Standalone sibling of bmt_nightly_setups.py, built to trial a much
-richer, subscriber-facing post format (ranking table, per-setup trade
-plans, execution rules, risk disclosure, card copy) driven by a single
-long-form editor-style prompt, instead of the short JSON-field digest
-the production script uses.
+Standalone sibling of bmt_nightly_setups.py, built to trial a richer,
+subscriber-facing post format driven by real Discord embeds (colored
+cards with structured fields) instead of the plain-text digest the
+production script uses.
 
 This is a SEPARATE Railway service pointed at a SEPARATE test webhook
 (NIGHTLY_SETUPS_V2_TEST_DISCORD_WEBHOOK). It does not touch, import,
@@ -20,24 +19,37 @@ earnings exclusion gate, deterministic chart-pattern matching, IV/RV
 pricing screen, strike selection, ATR-based trade-level math, analyst
 target lookup. None of the underlying setup-selection logic changes.
 
-WHAT'S NEW:
-- write_rich_post(): one LLM call that generates the ENTIRE
-  subscriber-ready post as raw text, in the exact structure supplied
-  by the user (ranking table, Best Choice Tonight, five full setup
-  write-ups with trade plans, Execution Rules, Risk Disclosure, and
-  per-ticker Card Copy blocks) -- not a JSON digest of a few fields.
-- Because that document is far longer than Discord's 2000-character
-  message limit, it is chunked on paragraph/section boundaries (never
-  mid-sentence) and posted as several sequential messages via
-  chunk_markdown_for_discord() / post_text_chunks_to_discord().
-- A handful of hard-won production rules are layered ON TOP of the
-  user's exact prompt (without altering its requested structure):
-  no URLs/source names in the output (breaks Discord's auto-embed
-  formatting), any catalyst date must be stated as before/after that
-  contract's expiry, and every ticker mention is prefixed with "$".
-- The card image (reusing the same renderer as production) is
+FORMAT HISTORY (locked 2026-08-10 after review via a standalone test
+script, test_v2_embed_sample.py, run directly against the test
+webhook before any of this was wired back into the pipeline):
+- v1 asked one LLM call for a single long markdown document (ranking
+  table, 5 full-paragraph setups, a "Card Copy" section). This posted
+  as 8 sequential Discord messages and the markdown table rendered as
+  broken literal pipe characters -- Discord's plain `content` field
+  does not render tables at all.
+- v2 compressed each setup to 2 lines to fix the length problem, but
+  lost the reasoning ("why it made the list" / "why choose this over
+  the others") that made the format useful in the first place.
+- v3 (this version) fixes both at once: write_setup_narratives() asks
+  for compact, plain-English JSON per setup instead of a markdown
+  document, and that JSON drives real Discord `embeds` -- colored
+  left-bar cards with a Role / Risk level / Best for / Why it made the
+  list / Why choose this over the others field grid. Embed color is
+  mapped to risk level consistently (green/blue/amber/red) so the
+  color always carries the same meaning; the top pick gets a star
+  instead of hijacking that color scale. The old markdown table is
+  gone entirely -- Role and Risk level already live on each setup's
+  own card, so a separate summary table was pure duplication. The
+  blanket "Expiry / Direction: Calls" header line is gone too, since a
+  given night isn't guaranteed to be all-calls or one expiry (each
+  setup's own title carries its own expiry and C/P). The final
+  contract list is still built deterministically in Python
+  (build_contract_list_embed()), not written by the model, guaranteeing
+  it's byte-for-byte accurate to what was actually selected.
+- The card image (reusing the same renderer as production) stays
   watermarked "V2 TEST -- INTERNAL REVIEW" so it can never be mistaken
-  for the live production card while this is being trialed.
+  for the live production card while this is being trialed. Sender
+  username on every post is explicitly set to "BMT".
 """
 
 import os
@@ -594,165 +606,76 @@ def get_company_name(ticker: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# NEW: rich, subscriber-ready post generation (single long-form prompt)
+# LOCKED FORMAT (2026-08-10): rich, subscriber-ready content, built as
+# real Discord embeds instead of a giant plain-text/markdown string.
+#
+# History: v1 of this generator asked the model for one long markdown
+# document (table + 5 full-paragraph setups + a "Card Copy" section).
+# That rendered as 8 sequential Discord messages and a broken markdown
+# table (Discord's plain `content` field does not render tables at
+# all -- it dumps the pipe characters literally). v2 compressed each
+# setup to 2 lines, which lost the reasoning that made the format
+# useful in the first place. This version -- confirmed and locked with
+# the user via a standalone test script -- fixes both: real Discord
+# `embeds` (colored left-bar cards with a field grid) replace the
+# table entirely, each setup keeps Role / Risk level / Best for / Why
+# it made the list / Why choose this over the others as distinct
+# fields (trimmed to plain, short, actionable language), and a
+# deterministic (not model-written) contract list closes it out.
+# Also dropped: the blanket "Expiry / Direction: Calls" line, since
+# not every night is all-calls or one expiry -- each setup's own
+# title already carries its own expiry and C/P.
 # ─────────────────────────────────────────────────────────────────────
 
-# Editor-style template, revised (2026-08-09) to produce a MUCH more
-# compact, scannable post. The original version of this template
-# (full paragraphs for "why it made the list" / "why choose this over
-# the others" / "plain-English risk" per setup, plus a separate
-# five-block "Card Copy" section) rendered as 8 sequential Discord
-# messages in testing and was confirmed too long for a subscriber to
-# realistically read. This version keeps every decision-relevant data
-# point but folds each setup into one tight scannable block, and drops
-# the "Card Copy" section entirely -- the final contract list is now
-# built deterministically in Python (see build_contract_list_section())
-# instead of being written by the model, which also guarantees it's
-# byte-for-byte accurate to the actual selected contracts.
-RICH_POST_TEMPLATE = r"""You are an expert options-trading newsletter editor and trade-plan designer.
+SENDER_USERNAME = "BMT"
 
-Your job is to convert my nightly "Top 5 Options Trade Ideas" scan output into a clear, practical, subscriber-ready post that both experienced traders and laymen can understand and act on IN UNDER 3 MINUTES OF READING. Readers will not read a long document -- density and scannability matter as much as accuracy.
+# Discord embed colors (decimal, not hex string), mapped to risk level
+# consistently across every setup -- the color always means the same
+# thing, with the legend implicit in the mapping itself (a reader sees
+# green/blue/amber/red enough nights running to learn it fast).
+COLOR_LOW = 0x3BA55D          # green
+COLOR_MODERATE = 0x5865F2     # blue
+COLOR_ELEVATED = 0xE5A012     # amber
+COLOR_SPECULATIVE = 0xED4245  # red
+COLOR_GOLD = 0xFBBF24         # Best Choice Tonight highlight
+COLOR_NEUTRAL = 0x2B2D31      # header / contract list / unrecognized risk label
 
-The audience receives these ideas after market close for trading the next session. These are short-dated options setups, typically 1–3 weeks to expiration. The goal is not to create hype or imply certainty. The goal is to help subscribers choose the setup that best fits their risk tolerance and execute it with discipline, in one quick read.
+RISK_COLOR_MAP = {
+    "Low": COLOR_LOW,
+    "Moderate": COLOR_MODERATE,
+    "Elevated": COLOR_ELEVATED,
+    "High": COLOR_SPECULATIVE,
+    "Speculative": COLOR_SPECULATIVE,
+}
 
-## Core Rules
+VALID_ROLES = [
+    "Best Overall",
+    "Lowest-Move Setup",
+    "Best Balanced Setup",
+    "Flow-Backed Momentum Setup",
+    "Speculative / High-Risk Breakout Setup",
+]
+VALID_RISK_LEVELS = ["Low", "Moderate", "Elevated", "High", "Speculative"]
 
-1. Do not treat all five setups as equal.
-   - Rank them by practical trade quality and explain the difference.
-   - Identify:
-     - Best Overall Setup
-     - Lowest-Move / Easiest Path Setup
-     - Best Balanced Setup
-     - Flow-Backed Momentum Setup
-     - Speculative / High-Risk Breakout Setup
-   - If the supplied data does not support one of these labels, use the closest truthful label.
-
-2. Use plain English, but be BRIEF about it.
-   - Translate technical language into what it means for the trader, in as few words as possible.
-   - For example: "cheap implied volatility" becomes something like "options are priced cheap for how much this stock moves" -- not a full explanatory sentence every time.
-   - Do not define jargon at length; a short parenthetical or half-sentence is enough.
-
-3. Every setup must let a reader answer, in one glance:
-   - Why this setup, why now (one line, not a paragraph)
-   - What confirms entry vs. what invalidates it
-   - How far the stock needs to move
-   - What to do at each target
-   - Why it's higher or lower risk than the others
-   Answer all of these, but COMBINED into the fewest lines possible -- do not give each question its own paragraph.
-
-4. Never imply that a trade is guaranteed.
-   - State that bullish flow, analyst targets, technical patterns, and model rankings are supportive evidence, not certainty -- but say this ONCE for the whole post (in Execution Rules), not repeated per setup.
-   - Avoid hype, exaggerated language, and unsupported claims.
-   - Do not frame analyst price targets as the main reason to buy a short-dated call.
-
-5. Emphasize short-dated option risk, briefly.
-   - Include days to expiration for each setup (one number, inline).
-   - The time-decay warning and "stops are on the underlying stock price" note belong ONCE in Execution Rules, not repeated five times.
-   - Include a short time-stop guideline per setup (e.g. "no move in 3 sessions -> reassess"), as a few words, not a sentence.
-
-6. Make it actionable for a layman, concisely.
-   - Distinguish "entry trigger" from "entry price" in a few words, not an explanatory sentence, per setup.
-   - The no-chase rule and position-sizing reminder belong ONCE in Execution Rules, not repeated per setup.
-
-## Required Output Format
-
-Create the post in this exact structure. Follow the line-by-line density shown -- this is not a suggestion, it is the target format:
-
-# TRADE IDEAS — [DAY, DATE]
-
-**Expiry:** [DATE] · **Direction:** Calls / Puts
-**Market backdrop:** [ONE plain-English sentence about SPY/QQQ/IWM.]
-**How to use this list:** [ONE sentence: these are independent triggered setups, pick what fits your risk, don't buy all five blindly.]
-
-## Tonight's Trade Map
-
-| Role | Ticker / Contract | Why Choose It | Risk |
-|---|---|---|---|
-| Best Overall | | [max ~8 words] | |
-| Lowest-Move | | [max ~8 words] | |
-| Best Balanced | | [max ~8 words] | |
-| Flow-Backed | | [max ~8 words] | |
-| Speculative | | [max ~8 words] | |
-
-## Best Choice Tonight
-
-[2-3 SHORT sentences max naming the best overall setup and the single strongest reason.]
-
-**If choosing one trade tonight:** [TICKER / CONTRACT] — [one short clause why]
-
-## The Five Setups
-
-Use this EXACT compact layout for each idea -- 4 lines per setup, nothing more:
-
-### [Rank]. $TICKER — [EXPIRY] $[STRIKE][C/P] · [Role] · Risk: [Level]
-**Setup:** [ONE, at most TWO, plain-English sentences combining chart structure + flow + pricing/value + catalyst if any. This replaces "why it made the list" AND "why choose this over the others" AND "plain-English risk" -- do not write those as separate paragraphs, fold the single most important differentiator and the single main risk into this one line.]
-**Plan:** Entry above $[X] (skip if it gaps past $[Y], wait for a pullback/hold) · Stop $[X] · T1 $[X] (partial profits) · T2 $[X] (trail rest) · Needs +[X]% in [N] days · Time-stop: no move in [N] sessions, reassess
-
-That's it -- two lines of substance per setup (a header line and two labeled lines). Do not add extra paragraphs, extra headers, or restate numbers already in the Tonight's Trade Map table.
-
-## Execution Rules
-
-5 concise bullets, covering (once, for all five setups together): these are triggered setups not auto-buys; stops/entries are on the underlying stock price, option premiums move differently due to IV and time decay; don't chase a gap, wait for a hold or pullback; take partials at T1, manage the rest toward T2; size down on High/Speculative setups since nothing here is guaranteed and time decay accelerates near expiration.
-
-## Risk Disclosure
-
-One short, plain-English paragraph (reuse this exact wording):
-
-"These are informational trade ideas, not financial advice. Options can lose value quickly, especially near expiration. Use position sizing, follow stops, and only take trades that fit your own risk tolerance."
-
-Do NOT add a "Card Copy" section or anything after Risk Disclosure -- the post ends there. A separate, code-generated contract list is appended after your output automatically; do not attempt to write one yourself.
-
-## Style Requirements
-
-- Write like a disciplined professional trader texting the key facts to a friend, not a newsletter writer.
-- Every sentence must earn its place. If a sentence only restates a number already shown elsewhere, cut it.
-- Do not say "this is guaranteed," "easy money," "cannot lose," or similar language.
-- Do not invent catalysts, data, prices, or reasoning not included in the source data.
-- If data is missing, label it "Not provided" rather than guessing.
-- Preserve all supplied entry, stop, target, flow, option pricing, and expiration data accurately -- brevity in prose, never in numbers.
-
-## Source Data
-
-I will provide:
-1. Market summary and index performance
-2. Five scanned trade ideas
-3. Contract details
-4. Chart setup details
-5. Entry, stop, Target 1, and Target 2
-6. Options-flow data
-7. Required move / expected move / implied volatility data
-8. Analyst target or catalyst information when available
-
-Using only that information, generate the complete subscriber-ready post in the exact compact format above, ending at Risk Disclosure."""
-
-# Non-negotiable operational rules from the production script, layered
-# on top of the template above without changing its requested
-# structure. These exist because of real Discord-formatting and
-# accuracy bugs already fixed in bmt_nightly_setups.py.
-ADDITIONAL_OPERATIONAL_RULES = """- Every single ticker mention, anywhere in the post, must be prefixed with a dollar sign (e.g. "$AXTI", "$SPY"), every time it appears -- not just on first mention.
-- Do NOT include any URLs, website names, or "according to [source]" citations anywhere in the output -- write facts in plain prose without naming or linking sources. Discord auto-generates broken-looking link preview embeds from any URL or domain-like text, so citing a source by name or link breaks the formatting badly.
-- If you reference any event or date found via search, you MUST state whether it falls BEFORE or AFTER that specific contract's expiry date. An event after expiry is not a direct catalyst for that trade -- omit it or frame it explicitly as pre-positioning context only.
-- The five setups supplied below have ALREADY been screened for reasonable option pricing and a clean chart pattern before you saw them -- do not write as if reconsidering whether they are worth trading; lead with what supports each idea, not doubt about it, unless something genuinely concerning turns up in search.
-- Stop your output at Risk Disclosure. Do NOT write a "Card Copy" section or anything else after it -- that is appended separately by code.
-- Return ONLY the post described above, starting directly with "# TRADE IDEAS —". No preamble, no commentary, no markdown code fences before or after."""
+HOW_TO_USE_LINE = "These are five independent triggered setups, not a basket to buy blindly \u2014 pick what fits your risk tolerance."
 
 
-def build_source_data_block(selected: list, market_context: dict, target_date: datetime) -> str:
+def build_narrative_source_data(selected: list, market_context: dict, target_date: datetime) -> str:
     lines = []
-    lines.append(f"### 1. Market summary and index performance (as of last close)")
+    lines.append("Market summary and index performance (as of last close):")
     for t in MARKET_CONTEXT_TICKERS:
         m = market_context.get(t, {})
         lines.append(f"- ${t}: ${m.get('price', 'N/A')} ({m.get('pct', 'N/A')}%) -- {get_tone_phrase(m)}")
     lines.append("")
     lines.append(f"Ideas are for the next trading session: {target_date.strftime('%A, %B %d, %Y')}.")
     lines.append("")
-    lines.append("### 2-8. Five scanned trade ideas, in descending conviction/ranking-score order (setup #1 scored highest by the deterministic flow-intensity/pricing model; this ordering is a useful input to your ranking but you should still evaluate and re-rank based on the full picture, per the Core Rules above)")
+    lines.append(f"Five scanned trade ideas, in descending conviction/ranking-score order (setup #1 scored highest by the deterministic flow-intensity/pricing model -- a useful input, but re-rank based on the full picture if the data supports it):")
     lines.append("")
     for i, c in enumerate(selected):
         tp = c.get("time_pressure") or build_time_pressure(c)
-        lines.append(f"---- SETUP #{i+1} (model rank order, not necessarily your final rank) ----")
+        lines.append(f"---- SETUP #{i+1} (model rank order, not necessarily final rank) ----")
         lines.append(f"Ticker: ${c['ticker']}   Company: {c.get('company_name', 'Not provided')}")
-        lines.append(f"Contract: {c['direction']} ${c['strike']:g} strike, expiring {c['next_expiry']} ({tp['dte']} calendar days / days to expiration from today)")
+        lines.append(f"Contract: {c['direction']} ${c['strike']:g} strike, expiring {c['next_expiry']} ({tp['dte']} calendar days to expiration)")
         lines.append(f"Chart setup: {build_price_narrative(c)} Pattern classification: {build_quality_tag(c.get('pattern', ''))}.")
         lines.append(f"Entry zone (underlying stock price): ${c['entry_low']}-${c['entry_high']}")
         lines.append(f"Stop / invalidation (underlying stock price): ${c['stop']}")
@@ -765,60 +688,159 @@ def build_source_data_block(selected: list, market_context: dict, target_date: d
     return "\n".join(lines)
 
 
-def write_rich_post(selected: list, market_context: dict, target_date: datetime) -> str:
-    source_data = build_source_data_block(selected, market_context, target_date)
-    prompt = f"""{RICH_POST_TEMPLATE}
+NARRATIVE_PROMPT_TEMPLATE = """You are an expert options-trading newsletter editor. Convert tonight's scanned trade ideas into short, plain-English content for a Discord post that a complete beginner can read and act on in under a minute per setup. This is NOT a long-form document -- every field below is going into a compact, colored embed card, so brevity is a hard requirement, not a style preference.
 
----
+## What to produce, per setup
 
-ADDITIONAL OPERATIONAL RULES (apply on top of everything above -- do not deviate from these, and do not let them change the structure/format requested above):
-{ADDITIONAL_OPERATIONAL_RULES}
+1. **role** -- assign each of the five setups exactly one of these five roles, no duplicates: "Best Overall", "Lowest-Move Setup", "Best Balanced Setup", "Flow-Backed Momentum Setup", "Speculative / High-Risk Breakout Setup". If the data doesn't cleanly support one of these for every setup, still assign the closest truthful match -- every setup needs exactly one role and every role is used exactly once.
+2. **risk** -- exactly one of: "Low", "Moderate", "Elevated", "High", "Speculative". Base this on required move size, how far out the option is, and how much conviction the data supports -- not on the role name.
+3. **best_for** -- ONE short sentence: what kind of trader or objective this setup suits.
+4. **why_made_list** -- ONE, at most TWO, SHORT plain-English sentences. This is the single most important field -- combine chart structure + options flow + option pricing/value + catalyst (if any) into one tight, beginner-friendly explanation. NO jargon: never write "IV/RV", "implied volatility", "realized volatility", "call-weighted", "OTM/ATM", "Higher Lows Base", "conviction rank", or similar. Translate instead -- e.g. "the options are priced cheap for how much this stock actually moves" instead of an IV/RV ratio; "big options traders have been buying calls" instead of "call-weighted flow"; "the stock has been climbing steadily" instead of "Higher Lows Base". Do not restate exact dollar flow figures or percentages already implied elsewhere -- keep this readable, not data-dense.
+5. **why_choose** -- ONE short sentence: the single clearest reason to pick this over the other four tonight.
 
----
+## Also produce
 
-SOURCE DATA FOR TONIGHT ({target_date.strftime('%A, %B %d, %Y')}):
+- **market_backdrop**: ONE plain-English sentence citing real $SPY/$QQQ/$IWM levels and moves by number.
+- **top_pick_ticker**: the ticker of whichever setup should be the single best pick tonight (usually, but not required to be, the "Best Overall" role).
+- **top_pick_why**: ONE short sentence on why that's the top pick.
+
+## Non-negotiable rules
+
+- Every ticker mention anywhere in your output must be prefixed with "$" (e.g. "$AXTI"), every time.
+- Do NOT include any URLs, website names, or "according to [source]" citations anywhere -- write facts in plain prose without naming or linking sources.
+- If you reference any event/date found via search, state whether it falls BEFORE or AFTER that contract's expiry -- an event after expiry is not a direct catalyst.
+- These five setups have ALREADY been screened for reasonable option pricing and a clean chart pattern -- do not write as if reconsidering whether they're worth trading.
+- Never say "guaranteed", "easy money", "cannot lose", or similar.
+- Do not invent catalysts, data, or reasoning not in the source data below. If something is missing, write "Not provided".
+
+## Source data for tonight ({target_date_str})
 
 {source_data}
 
-Now generate the complete output exactly as specified above (the full post, then the five card-copy blocks). Return ONLY that content."""
+## Output format
+
+Return ONLY valid JSON, nothing else, no markdown code fences, in exactly this shape (ticker keys must match the source data tickers exactly):
+
+{{
+  "market_backdrop": "...",
+  "top_pick_ticker": "TICKER",
+  "top_pick_why": "...",
+  "setups": {{
+    "TICKER1": {{"role": "...", "risk": "...", "best_for": "...", "why_made_list": "...", "why_choose": "..."}},
+    "TICKER2": {{"role": "...", "risk": "...", "best_for": "...", "why_made_list": "...", "why_choose": "..."}},
+    "TICKER3": {{"role": "...", "risk": "...", "best_for": "...", "why_made_list": "...", "why_choose": "..."}},
+    "TICKER4": {{"role": "...", "risk": "...", "best_for": "...", "why_made_list": "...", "why_choose": "..."}},
+    "TICKER5": {{"role": "...", "risk": "...", "best_for": "...", "why_made_list": "...", "why_choose": "..."}}
+  }}
+}}"""
+
+
+def write_setup_narratives(selected: list, market_context: dict, target_date: datetime) -> dict:
+    source_data = build_narrative_source_data(selected, market_context, target_date)
+    prompt = NARRATIVE_PROMPT_TEMPLATE.format(
+        target_date_str=target_date.strftime('%A, %B %d, %Y'),
+        source_data=source_data,
+    )
 
     resp = requests.post(
         f"{OPENROUTER_BASE}/chat/completions",
         headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-        json={"model": "moonshotai/kimi-k2.6", "max_tokens": 16000, "temperature": 0,
+        json={"model": "moonshotai/kimi-k2.6", "max_tokens": 8000, "temperature": 0,
               "plugins": [{"id": "web"}],
               "messages": [{"role": "user", "content": prompt}]},
         timeout=180
     )
     raw = resp.json()
     if "choices" not in raw:
-        print("  [RICH POST ERROR] unexpected response (no 'choices' key):")
+        print("  [NARRATIVE ERROR] unexpected response (no 'choices' key):")
         print(f"  {json.dumps(raw, indent=2)[:1000]}")
-        raise ValueError("write_rich_post: unexpected API response shape")
+        raise ValueError("write_setup_narratives: unexpected API response shape")
     message = raw["choices"][0]["message"]
     content = message.get("content")
     if not content:
-        print("  [RICH POST ERROR] empty/None content -- likely an incomplete tool call:")
+        print("  [NARRATIVE ERROR] empty/None content -- likely an incomplete tool call:")
         print(f"  {json.dumps(message, indent=2)[:1000]}")
-        raise ValueError("write_rich_post: empty content in API response")
+        raise ValueError("write_setup_narratives: empty content in API response")
     content = content.strip()
-    content = re.sub(r"^```(?:markdown|md)?\s*", "", content)
+    content = re.sub(r"^```(?:json)?\s*", "", content)
     content = re.sub(r"```\s*$", "", content)
-    return content.strip()
+    return json.loads(content.strip())
 
 
-def build_contract_list_section(selected: list) -> str:
+def clean_text_field(text: str, tickers: list) -> str:
+    if not text:
+        return "Not provided"
+    text = strip_urls_and_domains(text)
+    text = ensure_dollar_prefixed_tickers(text, tickers)
+    return text.strip()
+
+
+def build_header_embed(market_backdrop: str, target_date: datetime) -> dict:
+    return {
+        "title": f"TRADE IDEAS \u2014 {target_date.strftime('%A, %B %d').upper()}",
+        "description": f"{market_backdrop}\n\n{HOW_TO_USE_LINE}",
+        "color": COLOR_NEUTRAL,
+    }
+
+
+def build_best_choice_embed(top_pick_ticker: str, top_pick_why: str) -> dict:
+    return {
+        "title": "Best Choice Tonight",
+        "color": COLOR_GOLD,
+        "description": f"**${top_pick_ticker}**\n{top_pick_why}",
+    }
+
+
+def build_setup_embed(c: dict, rank: int, is_top_pick: bool) -> dict:
+    risk = c.get("risk", "Moderate")
+    color = RISK_COLOR_MAP.get(risk, COLOR_NEUTRAL)
+    star = "\u2b50 " if is_top_pick else ""
+    return {
+        "title": f"{star}{rank}. ${c['ticker']} \u2014 {c['next_expiry']} ${c['strike']:g}{c['direction'][0]}",
+        "color": color,
+        "fields": [
+            {"name": "Role", "value": c.get("role", "Not provided"), "inline": True},
+            {"name": "Risk level", "value": risk, "inline": True},
+            {"name": "Best for", "value": c.get("best_for", "Not provided"), "inline": False},
+            {"name": "Why it made the list", "value": c.get("why_made_list", "Not provided"), "inline": False},
+            {"name": "Why choose this over the others", "value": c.get("why_choose", "Not provided"), "inline": False},
+        ],
+    }
+
+
+def build_contract_list_embed(selected: list) -> dict:
     """
-    Deterministic, code-generated replacement for the old LLM-written
-    "Card Copy" section (2026-08-09 fix). Guarantees the final contract
-    list is byte-for-byte accurate to what was actually selected --
-    same pattern as contract_lines in the production script's
-    format_discord_digest(). Not written by the model.
+    Deterministic, code-generated contract list -- not written by the
+    model, so it is guaranteed byte-for-byte accurate to what was
+    actually selected. Same pattern as contract_lines in the
+    production script's format_discord_digest().
     """
-    lines = ["## Tonight's Contracts", ""]
-    for c in selected:
-        lines.append(f"• ${c['ticker']} {c['next_expiry']} ${c['strike']:g}{c['direction'][0]}")
-    return "\n".join(lines)
+    lines = "\n".join(f"\u2022 ${c['ticker']} {c['next_expiry']} ${c['strike']:g}{c['direction'][0]}" for c in selected)
+    return {
+        "title": "Tonight's Contracts",
+        "color": COLOR_NEUTRAL,
+        "description": lines,
+        "footer": {"text": "Not financial advice. See card image for entry/stop/target levels."},
+    }
+
+
+def post_embeds_to_discord(embeds: list) -> bool:
+    """
+    Discord allows up to 10 embeds and ~6000 combined characters per
+    message. This payload is header + best-choice + up to 5 setups +
+    contract list = 8 embeds, comfortably under both limits, so it
+    goes out as a single POST.
+    """
+    payload = {"username": SENDER_USERNAME, "embeds": embeds}
+    try:
+        r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=30)
+        print(f"  [DISCORD] embeds post: {r.status_code} ({len(embeds)} embeds)")
+        if r.status_code not in (200, 204):
+            print(f"    body: {r.text[:500]}")
+        return r.status_code in (200, 204)
+    except Exception as e:
+        print(f"  [DISCORD] embeds post FAILED: {e}")
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1098,62 +1120,6 @@ def ensure_dollar_prefixed_tickers(text: str, tickers: list) -> str:
     return text
 
 
-def chunk_markdown_for_discord(text: str, limit: int = 1900) -> list:
-    """
-    Splits the rich post into Discord-safe (<=2000 char) chunks,
-    breaking only on paragraph (blank-line) boundaries so no sentence,
-    bullet, or table row is ever cut mid-way. Falls back to line-level
-    splitting only for a single paragraph that itself exceeds the
-    limit (shouldn't normally happen given the template's structure).
-    """
-    paragraphs = re.split(r"\n\s*\n", text.strip())
-    chunks = []
-    current = ""
-    for p in paragraphs:
-        candidate = f"{current}\n\n{p}" if current else p
-        if len(candidate) <= limit:
-            current = candidate
-            continue
-        if current:
-            chunks.append(current)
-            current = ""
-        if len(p) <= limit:
-            current = p
-            continue
-        sub_current = ""
-        for line in p.split("\n"):
-            sub_candidate = f"{sub_current}\n{line}" if sub_current else line
-            if len(sub_candidate) <= limit:
-                sub_current = sub_candidate
-            else:
-                if sub_current:
-                    chunks.append(sub_current)
-                sub_current = line[:limit]
-        current = sub_current
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-def post_text_chunks_to_discord(chunks: list) -> bool:
-    ok_all = True
-    n = len(chunks)
-    for i, chunk in enumerate(chunks, start=1):
-        content = chunk if n == 1 else f"{chunk}\n\n_(part {i}/{n})_"
-        try:
-            r = requests.post(DISCORD_WEBHOOK, json={"content": content}, timeout=30)
-            ok = r.status_code in (200, 204)
-            print(f"  [DISCORD] part {i}/{n}: {r.status_code} ({len(content)} chars)")
-            if not ok:
-                print(f"    body: {r.text[:300]}")
-            ok_all = ok_all and ok
-        except Exception as e:
-            print(f"  [DISCORD] part {i}/{n} FAILED: {e}")
-            ok_all = False
-        time.sleep(1)
-    return ok_all
-
-
 def main():
     et_now = datetime.now(ET)
     print(f"[{et_now.isoformat()}] BMT Nightly Setups V2 TEST")
@@ -1322,53 +1288,70 @@ def main():
         c["flow_note"] = build_flow_note_display(c["flow"])
         print(f"  {c['ticker']}: {c['time_pressure']['summary']} | {c['analyst_target']}")
 
-    print(f"\nGenerating rich subscriber-ready post for {len(selected)} setup(s) (V2 TEST format)...")
-    rich_post = write_rich_post(selected, market_context, target_date)
+    print(f"\nGenerating narrative content for {len(selected)} setup(s) (locked embed format)...")
+    narrative_result = write_setup_narratives(selected, market_context, target_date)
 
     all_tickers = [c["ticker"] for c in selected] + list(MARKET_CONTEXT_TICKERS)
-    rich_post = strip_urls_and_domains(rich_post)
-    rich_post = ensure_dollar_prefixed_tickers(rich_post, all_tickers)
+    market_backdrop = clean_text_field(narrative_result.get("market_backdrop", ""), all_tickers)
+    top_pick_ticker = narrative_result.get("top_pick_ticker", "").upper().lstrip("$")
+    top_pick_why = clean_text_field(narrative_result.get("top_pick_why", ""), all_tickers)
+    setups_by_ticker = narrative_result.get("setups", {})
 
-    # Strip anything the model wrote past "Risk Disclosure" (e.g. if it
-    # ignored the instruction and added a Card Copy section anyway),
-    # then append the deterministic, code-built contract list.
-    disclosure_marker = re.search(r"(These are informational trade ideas[^\n]*\n?)", rich_post)
-    if disclosure_marker:
-        cutoff = disclosure_marker.end()
-        # allow the paragraph to run a little past the marker sentence
-        # in case the model added a closing clause, but drop anything
-        # that looks like a new "##" section after it.
-        remainder = rich_post[cutoff:]
-        next_header = re.search(r"\n#{1,3} ", remainder)
-        if next_header:
-            rich_post = rich_post[:cutoff] + remainder[:next_header.start()]
-    rich_post = rich_post.rstrip() + "\n\n" + build_contract_list_section(selected)
+    # Merge model output onto each selected setup, validating role/risk
+    # against the fixed vocab -- fall back to a safe neutral value
+    # rather than letting an unexpected label silently break the color
+    # mapping or leave a field blank.
+    used_roles = set()
+    for c in selected:
+        s = setups_by_ticker.get(c["ticker"], {})
+        role = s.get("role", "")
+        if role not in VALID_ROLES or role in used_roles:
+            role = next((r for r in VALID_ROLES if r not in used_roles), "Best Balanced Setup")
+        used_roles.add(role)
+        risk = s.get("risk", "")
+        if risk not in VALID_RISK_LEVELS:
+            risk = "Moderate"
+        c["role"] = role
+        c["risk"] = risk
+        c["best_for"] = clean_text_field(s.get("best_for", ""), all_tickers)
+        c["why_made_list"] = clean_text_field(s.get("why_made_list", ""), all_tickers)
+        c["why_choose"] = clean_text_field(s.get("why_choose", ""), all_tickers)
+        print(f"  {c['ticker']}: {c['role']} | {c['risk']}")
 
-    print(f"\n=== RICH POST ({len(rich_post)} chars total) ===\n{rich_post}\n")
+    if top_pick_ticker not in {c["ticker"] for c in selected}:
+        top_pick_ticker = selected[0]["ticker"]
+        top_pick_why = top_pick_why if top_pick_why != "Not provided" else "Top-ranked setup tonight by the model."
+
+    embeds = [
+        build_header_embed(market_backdrop, target_date),
+        build_best_choice_embed(top_pick_ticker, top_pick_why),
+    ]
+    for i, c in enumerate(selected):
+        embeds.append(build_setup_embed(c, rank=i + 1, is_top_pick=(c["ticker"] == top_pick_ticker)))
+    embeds.append(build_contract_list_embed(selected))
+
+    print(f"\n=== EMBEDS PREVIEW ===\n{json.dumps(embeds, indent=2)}\n")
 
     # Simple market_theme/risk_notes for the card image -- kept short,
-    # separate from (and much simpler than) the rich post above.
+    # separate from the embeds above.
     spy = market_context.get("SPY", {})
     qqq = market_context.get("QQQ", {})
     market_theme = (f"$SPY closed at ${spy.get('price', 'N/A')} ({spy.get('pct', 'N/A')}%) and "
                      f"$QQQ at ${qqq.get('price', 'N/A')} ({qqq.get('pct', 'N/A')}%).")
-    risk_notes = "See the full write-up below for entry triggers, stops, and risk notes on each setup."
+    risk_notes = "See the write-up below for the reasoning, and this image for exact entry/stop/target levels."
 
     out_path = "bmt_nightly_setups_v2_test.png"
     render_card(selected, market_theme, risk_notes, market_context, target_date, data_date, out_path)
     print(f"\nCard saved to {out_path}")
 
     posted_card = post_image_to_discord(out_path, message="🧪 **V2 TEST BUILD** — internal review only, not the live production post")
+    posted_embeds = post_embeds_to_discord(embeds)
 
-    chunks = chunk_markdown_for_discord(rich_post, limit=1900)
-    print(f"\nPosting rich post as {len(chunks)} Discord message(s)...")
-    posted_text = post_text_chunks_to_discord(chunks)
-
-    if posted_text and posted_card:
-        print("✓ V2 TEST: card + rich post posted to Discord!")
+    if posted_embeds and posted_card:
+        print("✓ V2 TEST: card + embeds posted to Discord!")
     else:
-        if not posted_text:
-            print("✗ V2 TEST: rich post FAILED")
+        if not posted_embeds:
+            print("✗ V2 TEST: embeds post FAILED")
         if not posted_card:
             print("✗ V2 TEST: card image post FAILED")
 
