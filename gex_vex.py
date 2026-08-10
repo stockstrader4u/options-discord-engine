@@ -68,6 +68,52 @@ only the INSTRUCTION given to the model changed. The full detailed
 dashboard card (render_gex_dashboard_card) is completely untouched --
 this only affects the shorter "What To Watch" text in the Discord
 embed and its data-derived fallback.
+
+STRIKE-DISPLAY PRECISION BUGFIX (2026-08-10): confirmed in a real
+production run that NVDA's card showed "Put Wall $212 (-2.7%)" -- but
+(212-218.49)/218.49 = -2.97%, not -2.7%. The dollar figure was being
+displayed rounded to the nearest whole dollar (":,.0f") everywhere,
+while the percentage next to it was computed from the ticker's REAL,
+unrounded strike (e.g. $212.50, common on higher-priced underlyings'
+weeklies) -- so the two numbers on the same line came from different
+precision and didn't reconcile, for any strike that wasn't already a
+whole dollar. AAPL/MSFT/GOOGL/AMZN/META/TSLA/SPY/QQQ/IWM all happened to
+have whole-dollar walls this run, which is why only NVDA exposed it.
+Fixed with format_strike() (new, see below) -- shows a strike with
+whatever precision it actually has (whole dollars stay whole, a $212.50
+strike now DISPLAYS as $212.50) instead of always truncating to zero
+decimals, so the displayed dollar and the percentage next to it are
+always computed from the exact same number. Applied everywhere a
+call_wall/put_wall/max_pos_gex_strike/max_neg_gex_strike dollar value is
+shown -- both card renderers, the embed builders, and the "What To
+Watch" narrative text (format_gex_card, render_single_ticker_gex_card,
+render_gex_dashboard_card, build_gex_embed, _fallback_watch_line,
+_consolidated_watch_line, generate_gex_watch_lines' data lines).
+
+SINGLE-TICKER CONSOLIDATED-LINE BUGFIX (2026-08-10): confirmed in the
+same production run that GOOGL and AMZN's "What To Watch" text read
+"GOOGL could ALL realistically drift lower toward THEIR nearby support
+levels..." -- plural language on a card for one ticker, and
+one-sided (only ever mentions the put wall, never the call wall, unlike
+every other ticker's card). Root cause: the Mag 7 pipeline
+(gex_vex_combined_daily.py's run_mag7_section) calls
+generate_gex_watch_lines([r]) once PER TICKER, with a single-element
+list. _consolidated_watch_line() -- designed for the 3-ticker SPY/QQQ/
+IWM dashboard, where "could all... their... one of these" genuinely
+describes several tickers sharing one pattern -- was being selected
+even for n=1, because both generate_gex_watch_lines()'s same_pattern
+check and build_watch_lines_fallback()'s equivalent check only tested
+whether the (trivially single) classification was consistent, never
+whether there was more than one ticker to begin with. This is also
+exactly why the LLM-rejected line fell back to the SAME contradicting
+text: build_watch_lines_fallback() was returning the consolidated
+plural template as "the fallback" too. Fixed by requiring len(valid) > 1
+before either function will use the consolidated path -- a single-
+ticker call now always uses _fallback_watch_line()'s per-ticker,
+singular-voice template (which already correctly mentions BOTH the
+call wall and put wall when available) as its fallback, and the LLM
+prompt path for n=1 goes through the per-ticker "TICKER | sentence"
+branch instead of the shared-paragraph branch.
 """
 
 import math
@@ -587,6 +633,29 @@ def pct_from_spot(strike, spot):
     return round((strike - spot) / spot * 100, 2)
 
 
+def format_strike(v) -> str:
+    """
+    STRIKE-DISPLAY PRECISION BUGFIX (2026-08-10): see the module
+    docstring for the full production-confirmed diagnosis (NVDA's
+    "$212 (-2.7%)" not reconciling because the dollar figure was always
+    truncated to zero decimals while the percentage used the real,
+    unrounded strike). Shows a strike/wall dollar value at whatever
+    precision it actually has -- a whole-dollar strike still displays
+    with zero decimals ($212), but a half-dollar strike now correctly
+    shows as such ($212.50) instead of silently rounding away the part
+    that made the adjacent percentage true. Use this EVERYWHERE a
+    call_wall / put_wall / max_pos_gex_strike / max_neg_gex_strike
+    dollar value is rendered, in cards, embeds, or narrative text --
+    never format one of these with a bare ":,.0f" again.
+    """
+    if v is None:
+        return "N/A"
+    v = float(v)
+    if v == int(v):
+        return f"${v:,.0f}"
+    return f"${v:,.2f}"
+
+
 def find_gamma_flip(per_strike: dict, spot: float = None, band_pct: float = 0.30,
                      min_materiality_pct: float = 0.005):
     if not per_strike:
@@ -674,8 +743,11 @@ def format_gex_card(result: dict) -> str:
     # None (see compute_gex_vex()'s side-of-spot fix) if no strike
     # exists on the correct side of spot within the band -- format
     # defensively instead of assuming a numeric value is always present.
-    call_wall_str = f"${call_wall:,.0f}  ({call_wall_pct:+.1f}%)" if call_wall is not None else "N/A (no strike above spot in band)"
-    put_wall_str = f"${put_wall:,.0f}  ({put_wall_pct:+.1f}%)" if put_wall is not None else "N/A (no strike below spot in band)"
+    # STRIKE-DISPLAY PRECISION FIX (2026-08-10): uses format_strike()
+    # now, not a bare ":,.0f", so the dollar figure always matches the
+    # percentage next to it. See module docstring.
+    call_wall_str = f"{format_strike(call_wall)}  ({call_wall_pct:+.1f}%)" if call_wall is not None else "N/A (no strike above spot in band)"
+    put_wall_str = f"{format_strike(put_wall)}  ({put_wall_pct:+.1f}%)" if put_wall is not None else "N/A (no strike below spot in band)"
 
     lines = [
         f"\U0001F4CA **{t}**  ${spot:,.2f}   (exp {exp_label})",
@@ -684,8 +756,8 @@ def format_gex_card(result: dict) -> str:
         f"  NET VEX  ${result['net_vex']/1e6:,.2f}M",
         f"  CALL WALL  {call_wall_str}",
         f"  PUT WALL   {put_wall_str}",
-        f"  MAX +GEX   ${result['max_pos_gex_strike']:,.0f}   +${result['max_pos_gex_value']/1e6:,.2f}M",
-        f"  MAX -GEX   ${result['max_neg_gex_strike']:,.0f}   -${abs(result['max_neg_gex_value'])/1e6:,.2f}M",
+        f"  MAX +GEX   {format_strike(result['max_pos_gex_strike'])}   +${result['max_pos_gex_value']/1e6:,.2f}M",
+        f"  MAX -GEX   {format_strike(result['max_neg_gex_strike'])}   -${abs(result['max_neg_gex_value'])/1e6:,.2f}M",
     ]
     em = result["expected_move"]
     if em:
@@ -746,6 +818,11 @@ def _fallback_watch_line(r: dict) -> str:
     move hasn't been large so far. Fixed by threading is_long_gamma
     through every branch and writing genuinely different, mechanism-
     correct text for each case rather than one shared "calm" framing.
+
+    This is the CORRECT per-ticker, singular-voice template -- see the
+    2026-08-10 module docstring note for why this (not
+    _consolidated_watch_line()) must be what a single-ticker call falls
+    back to.
     """
     em = r.get("expected_move") or {}
     em_pct = em.get("pct")
@@ -765,20 +842,20 @@ def _fallback_watch_line(r: dict) -> str:
                 f"there's no strong lean either way, so keep positions small and stay flexible.")
     if call_wall is None:
         return (f"{ticker} doesn't have a clear ceiling level above the current price this week, "
-                f"so a move higher has room to run — but if it drops back toward ${put_wall:,.0f}, "
+                f"so a move higher has room to run — but if it drops back toward {format_strike(put_wall)}, "
                 f"that level has previously acted as a floor.")
     if put_wall is None:
         return (f"{ticker} doesn't have a clear floor level below the current price this week, "
-                f"so a move lower has room to run — but if it rallies toward ${call_wall:,.0f}, "
+                f"so a move lower has room to run — but if it rallies toward {format_strike(call_wall)}, "
                 f"that level has previously acted as a ceiling.")
 
     if em_pct is None or call_pct is None or put_pct is None:
         if is_long:
-            return (f"{ticker} will likely stay somewhere between ${put_wall:,.0f} and "
-                    f"${call_wall:,.0f} this week — expect back-and-forth trading that tends "
+            return (f"{ticker} will likely stay somewhere between {format_strike(put_wall)} and "
+                    f"{format_strike(call_wall)} this week — expect back-and-forth trading that tends "
                     f"to get pulled back toward the middle rather than a big breakout.")
-        return (f"{ticker} will likely stay somewhere between ${put_wall:,.0f} and "
-                f"${call_wall:,.0f} this week, but keep in mind there's less of a cushion here "
+        return (f"{ticker} will likely stay somewhere between {format_strike(put_wall)} and "
+                f"{format_strike(call_wall)} this week, but keep in mind there's less of a cushion here "
                 f"than usual — if it does break past either level, the move could extend "
                 f"further than a typical week.")
 
@@ -787,38 +864,38 @@ def _fallback_watch_line(r: dict) -> str:
 
     if reaches_call and reaches_put:
         if is_long:
-            return (f"{ticker} could realistically swing toward either ${put_wall:,.0f} "
-                    f"or ${call_wall:,.0f} this week, but it tends to get pulled back toward "
+            return (f"{ticker} could realistically swing toward either {format_strike(put_wall)} "
+                    f"or {format_strike(call_wall)} this week, but it tends to get pulled back toward "
                     f"the middle rather than break through cleanly. Keep position sizes modest "
                     f"and don't chase either move.")
-        return (f"{ticker} could realistically swing all the way to either ${put_wall:,.0f} "
-                f"or ${call_wall:,.0f} this week, and with less cushion than usual, a move past "
+        return (f"{ticker} could realistically swing all the way to either {format_strike(put_wall)} "
+                f"or {format_strike(call_wall)} this week, and with less cushion than usual, a move past "
                 f"either level could run further than expected. Keep position sizes modest and "
                 f"be ready for it to go either direction.")
     if reaches_call:
         if is_long:
-            return (f"{ticker} could realistically reach ${call_wall:,.0f} this week. If it "
+            return (f"{ticker} could realistically reach {format_strike(call_wall)} this week. If it "
                     f"gets there, expect it to get pulled back rather than break out — that's a "
                     f"reasonable spot to take some profit rather than assume it keeps climbing.")
-        return (f"{ticker} could realistically reach ${call_wall:,.0f} this week. If it clears "
+        return (f"{ticker} could realistically reach {format_strike(call_wall)} this week. If it clears "
                 f"that level, the move could extend further than usual since there's less "
                 f"cushion above it — take some profit there rather than assume it keeps "
                 f"climbing without a pause.")
     if reaches_put:
         if is_long:
-            return (f"{ticker} could realistically drop to ${put_wall:,.0f} this week. If it "
+            return (f"{ticker} could realistically drop to {format_strike(put_wall)} this week. If it "
                     f"gets there, expect it to get pulled back rather than break down further — "
                     f"that's a reasonable spot to take some profit on a bearish position.")
-        return (f"{ticker} could realistically drop to ${put_wall:,.0f} this week. If it clears "
+        return (f"{ticker} could realistically drop to {format_strike(put_wall)} this week. If it clears "
                 f"that level, the move could extend further than usual since there's less "
                 f"cushion below it — take some profit on a bearish position rather than assume "
                 f"it keeps falling without a pause.")
     if is_long:
         return (f"{ticker}'s likely range this week probably won't stretch all the way to "
-                f"${put_wall:,.0f} or ${call_wall:,.0f} — expect a calmer, more contained week, "
+                f"{format_strike(put_wall)} or {format_strike(call_wall)} — expect a calmer, more contained week, "
                 f"so it's better to trade the back-and-forth than to bet on a big breakout.")
     return (f"{ticker}'s likely range this week probably won't stretch all the way to "
-            f"${put_wall:,.0f} or ${call_wall:,.0f} on paper, but keep in mind there's less of "
+            f"{format_strike(put_wall)} or {format_strike(call_wall)} on paper, but keep in mind there's less of "
             f"a cushion here than usual — if something does push it past either level, the move "
             f"could pick up speed quickly, so don't assume it stays this quiet all week.")
 
@@ -865,40 +942,70 @@ def _consolidated_watch_line(results: list, classification: str) -> str:
     None) -- so by the time execution reaches here, every wall value
     used below is already guaranteed present. Documented explicitly so
     this isn't mistaken for a missed case during a future audit.
+
+    MULTI-TICKER-ONLY NOTE (2026-08-10): this function's language
+    ("could all... their... one of these") is deliberately written in
+    PLURAL, shared voice -- it is only ever meant to describe several
+    tickers that share the same pattern this week (the real use case:
+    the 3-ticker SPY/QQQ/IWM dashboard). build_watch_lines_fallback()
+    and generate_gex_watch_lines() now both gate the call to this
+    function on len(valid) > 1, so it should never again be invoked for
+    a single ticker -- see their matching 2026-08-10 bugfix notes for
+    the production incident (GOOGL/AMZN's Mag 7 cards) this guards
+    against.
     """
     valid = [r for r in results if "error" not in r]
     tickers_str = "/".join(r["ticker"] for r in valid)
 
     if classification == "put_only":
-        levels = " · ".join(f"{r['ticker']} ${r['put_wall']:,.0f}" for r in valid)
+        levels = " · ".join(f"{r['ticker']} {format_strike(r['put_wall'])}" for r in valid)
         return (f"{tickers_str} could all realistically drift lower toward their nearby "
                 f"support levels this week ({levels}). If you're holding a bearish position "
                 f"and one of these gets there, that's a sensible spot to take profit rather "
                 f"than assume the drop keeps going.")
     if classification == "call_only":
-        levels = " · ".join(f"{r['ticker']} ${r['call_wall']:,.0f}" for r in valid)
+        levels = " · ".join(f"{r['ticker']} {format_strike(r['call_wall'])}" for r in valid)
         return (f"{tickers_str} could all realistically climb toward their nearby resistance "
                 f"levels this week ({levels}). If one gets there, that's a sensible spot to "
                 f"take profit rather than assume it keeps climbing.")
     if classification == "both":
-        levels = " · ".join(f"{r['ticker']} ${r['put_wall']:,.0f}/${r['call_wall']:,.0f}" for r in valid)
+        levels = " · ".join(f"{r['ticker']} {format_strike(r['put_wall'])}/{format_strike(r['call_wall'])}" for r in valid)
         return (f"{tickers_str} all have enough room to swing to either their upper or lower "
                 f"levels this week ({levels}) — expect a wider, more volatile range, so keep "
                 f"position sizes modest.")
-    levels = " · ".join(f"{r['ticker']} ${r['put_wall']:,.0f}/${r['call_wall']:,.0f}" for r in valid)
+    levels = " · ".join(f"{r['ticker']} {format_strike(r['put_wall'])}/{format_strike(r['call_wall'])}" for r in valid)
     return (f"{tickers_str} all look likely to stay contained within their usual range this "
             f"week ({levels}) — expect a calmer, more back-and-forth week rather than a big "
             f"move, so trading the range makes more sense than betting on a breakout.")
 
 
 def build_watch_lines_fallback(results: list) -> dict:
+    """
+    SINGLE-TICKER BUGFIX (2026-08-10): previously used the consolidated
+    (plural, shared-voice) template whenever every ticker in `results`
+    happened to share the same classification -- which, for a
+    single-element `results` list, is ALWAYS trivially true (there's
+    only one classification to compare against itself). This meant
+    every single-ticker call (the Mag 7 pipeline calls this with one
+    ticker at a time) fell back to text like "GOOGL could all
+    realistically drift lower toward their nearby support levels" --
+    plural language on a one-ticker card, confirmed in a real
+    production run. Now requires len(valid) > 1 before using the
+    consolidated path at all; a single ticker always gets
+    _fallback_watch_line()'s correct, singular-voice template, which
+    also correctly mentions BOTH the call wall and put wall when
+    available (the consolidated template only mentions whichever side
+    the shared classification refers to, which is fine across several
+    tickers with a genuinely shared pattern, but wrong for a single
+    ticker's own card).
+    """
     valid = [r for r in results if "error" not in r]
     if not valid:
         return {}
     classifications = {r["ticker"]: _classify_wall_reach(r) for r in valid}
     unique_patterns = set(classifications.values())
 
-    if len(unique_patterns) == 1 and "unknown" not in unique_patterns:
+    if len(valid) > 1 and len(unique_patterns) == 1 and "unknown" not in unique_patterns:
         shared = _consolidated_watch_line(results, next(iter(unique_patterns)))
         return {r["ticker"]: shared for r in valid}
 
@@ -1022,6 +1129,15 @@ def generate_gex_watch_lines(results: list, api_key: str = None) -> dict:
     regime check, and swapped for the guaranteed-correct fallback line
     if it fails. This applies whether the batch went through the
     same-pattern (consolidated paragraph) path or the per-ticker path.
+
+    SINGLE-TICKER BUGFIX (2026-08-10): `same_pattern` now also requires
+    len(valid) > 1 -- see build_watch_lines_fallback()'s matching
+    2026-08-10 note for the full production incident this fixes (the
+    Mag 7 pipeline calls this function once per ticker with a
+    single-element list, which previously always satisfied the old
+    "all classifications equal" check trivially and routed through the
+    plural, multi-ticker consolidated-paragraph prompt/fallback even
+    for one ticker).
     """
     valid = [r for r in results if "error" not in r]
     fallback = build_watch_lines_fallback(results)
@@ -1034,7 +1150,7 @@ def generate_gex_watch_lines(results: list, api_key: str = None) -> dict:
 
     classifications = {r["ticker"]: _classify_wall_reach(r) for r in valid}
     unique_patterns = set(classifications.values())
-    same_pattern = len(unique_patterns) == 1 and "unknown" not in unique_patterns
+    same_pattern = len(valid) > 1 and len(unique_patterns) == 1 and "unknown" not in unique_patterns
 
     # DETERMINISTIC REGIME-BEHAVIOR FIX (2026-08-08): confirmed via 5
     # real test runs (2 in the original actionability-only version, 3
@@ -1090,9 +1206,13 @@ def generate_gex_watch_lines(results: list, api_key: str = None) -> dict:
         # production (see that function's matching bugfix note). Same
         # fix pattern: format each side independently with an explicit
         # None check, rather than assuming both walls always exist.
-        put_wall_str = (f"${r['put_wall']:,.0f} ({r['put_wall_pct']:+.1f}%)"
+        # STRIKE-DISPLAY PRECISION FIX (2026-08-10): uses
+        # format_strike() so the number shown to the model (and thus
+        # what it may echo back in its output) matches what's actually
+        # displayed on the card. See module docstring.
+        put_wall_str = (f"{format_strike(r['put_wall'])} ({r['put_wall_pct']:+.1f}%)"
                          if r.get("put_wall") is not None else "no clear level nearby")
-        call_wall_str = (f"${r['call_wall']:,.0f} ({r['call_wall_pct']:+.1f}%)"
+        call_wall_str = (f"{format_strike(r['call_wall'])} ({r['call_wall_pct']:+.1f}%)"
                           if r.get("call_wall") is not None else "no clear level nearby")
         data_lines.append(
             f"{r['ticker']}: spot ${r['spot']:,.2f}, {regime}, "
@@ -1282,8 +1402,11 @@ def build_gex_embed(results: list, week_label: str, watch_lines: dict = None) ->
         # a ticker missing ONE wall still shows the other correctly,
         # rather than the whole line falling back to "N/A" over a
         # single missing side.
-        put_str = f"${r['put_wall']:,.0f}" if r.get("put_wall") is not None else "N/A"
-        call_str = f"${r['call_wall']:,.0f}" if r.get("call_wall") is not None else "N/A"
+        # STRIKE-DISPLAY PRECISION FIX (2026-08-10): uses
+        # format_strike() so this matches the card image exactly. See
+        # module docstring.
+        put_str = format_strike(r.get("put_wall"))
+        call_str = format_strike(r.get("call_wall"))
         levels_lines.append(
             f"**{r['ticker']}**  Put {put_str} \u00b7 Call {call_str}"
         )
@@ -1633,10 +1756,10 @@ def render_single_ticker_gex_card(r: dict, week_label: str, out_path: str):
 
         if collision:
             mid_x = (pw_x + cw_x) / 2
-            txt(mid_x, bar_y - 0.18, f"P/C \u2248 ${put_wall:,.0f}", fs=7.2, color=_TXT, bold=True, ha="center", font=_HEADER_FONT)
+            txt(mid_x, bar_y - 0.18, f"P/C \u2248 {format_strike(put_wall)}", fs=7.2, color=_TXT, bold=True, ha="center", font=_HEADER_FONT)
         else:
-            txt(pw_x, bar_y - 0.18, f"P ${put_wall:,.0f}", fs=7.2, color=_RED, bold=True, ha="center", font=_HEADER_FONT)
-            txt(cw_x, bar_y - 0.18, f"C ${call_wall:,.0f}", fs=7.2, color=_GREEN, bold=True, ha="center", font=_HEADER_FONT)
+            txt(pw_x, bar_y - 0.18, f"P {format_strike(put_wall)}", fs=7.2, color=_RED, bold=True, ha="center", font=_HEADER_FONT)
+            txt(cw_x, bar_y - 0.18, f"C {format_strike(call_wall)}", fs=7.2, color=_GREEN, bold=True, ha="center", font=_HEADER_FONT)
 
     if gamma_flip is not None and range_min <= gamma_flip <= range_max:
         gf_x = to_x(gamma_flip)
@@ -1668,12 +1791,12 @@ def render_single_ticker_gex_card(r: dict, week_label: str, out_path: str):
     y += SECTION_LABEL_H
     cw_pct = r.get("call_wall_pct")
     pw_pct = r.get("put_wall_pct")
-    stat_row("Call Wall", f"${call_wall:,.0f}  ({cw_pct:+.1f}%)" if call_wall else "N/A", _GREEN, y); y += STAT_ROW_H
-    stat_row("Put Wall", f"${put_wall:,.0f}  ({pw_pct:+.1f}%)" if put_wall else "N/A", _RED, y); y += STAT_ROW_H
+    stat_row("Call Wall", f"{format_strike(call_wall)}  ({cw_pct:+.1f}%)" if call_wall else "N/A", _GREEN, y); y += STAT_ROW_H
+    stat_row("Put Wall", f"{format_strike(put_wall)}  ({pw_pct:+.1f}%)" if put_wall else "N/A", _RED, y); y += STAT_ROW_H
     mpg_strike, mpg_val = r.get("max_pos_gex_strike"), r.get("max_pos_gex_value")
     mng_strike, mng_val = r.get("max_neg_gex_strike"), r.get("max_neg_gex_value")
-    stat_row("Max +GEX", f"${mpg_strike:,.0f}  {_fmt_m(mpg_val)}" if mpg_strike is not None else "N/A", _GREEN, y); y += STAT_ROW_H
-    stat_row("Max -GEX", f"${mng_strike:,.0f}  {_fmt_m(mng_val)}" if mng_strike is not None else "N/A", _RED, y); y += STAT_ROW_H
+    stat_row("Max +GEX", f"{format_strike(mpg_strike)}  {_fmt_m(mpg_val)}" if mpg_strike is not None else "N/A", _GREEN, y); y += STAT_ROW_H
+    stat_row("Max -GEX", f"{format_strike(mng_strike)}  {_fmt_m(mng_val)}" if mng_strike is not None else "N/A", _RED, y); y += STAT_ROW_H
 
     y += SECTION_GAP
     section_label("EXPECTED MOVE", y)
@@ -1927,10 +2050,10 @@ def render_gex_dashboard_card(results: list, week_label: str, out_path: str):
 
             if collision:
                 mid_x = (pw_x + cw_x) / 2
-                txt(mid_x, bar_y - 0.16, f"P/C \u2248 ${put_wall:,.0f}", fs=6.6, color=_TXT, bold=True, ha="center", font=_HEADER_FONT)
+                txt(mid_x, bar_y - 0.16, f"P/C \u2248 {format_strike(put_wall)}", fs=6.6, color=_TXT, bold=True, ha="center", font=_HEADER_FONT)
             else:
-                txt(pw_x, bar_y - 0.16, f"P ${put_wall:,.0f}", fs=6.6, color=_RED, bold=True, ha="center", font=_HEADER_FONT)
-                txt(cw_x, bar_y - 0.16, f"C ${call_wall:,.0f}", fs=6.6, color=_GREEN, bold=True, ha="center", font=_HEADER_FONT)
+                txt(pw_x, bar_y - 0.16, f"P {format_strike(put_wall)}", fs=6.6, color=_RED, bold=True, ha="center", font=_HEADER_FONT)
+                txt(cw_x, bar_y - 0.16, f"C {format_strike(call_wall)}", fs=6.6, color=_GREEN, bold=True, ha="center", font=_HEADER_FONT)
 
         if gamma_flip is not None and range_min <= gamma_flip <= range_max:
             gf_x = to_x(gamma_flip)
@@ -1962,12 +2085,12 @@ def render_gex_dashboard_card(results: list, week_label: str, out_path: str):
         y += SECTION_LABEL_H
         cw_pct = r.get("call_wall_pct")
         pw_pct = r.get("put_wall_pct")
-        stat_row("Call Wall", f"${call_wall:,.0f}  ({cw_pct:+.1f}%)" if call_wall else "N/A", _GREEN, y); y += STAT_ROW_H
-        stat_row("Put Wall", f"${put_wall:,.0f}  ({pw_pct:+.1f}%)" if put_wall else "N/A", _RED, y); y += STAT_ROW_H
+        stat_row("Call Wall", f"{format_strike(call_wall)}  ({cw_pct:+.1f}%)" if call_wall else "N/A", _GREEN, y); y += STAT_ROW_H
+        stat_row("Put Wall", f"{format_strike(put_wall)}  ({pw_pct:+.1f}%)" if put_wall else "N/A", _RED, y); y += STAT_ROW_H
         mpg_strike, mpg_val = r.get("max_pos_gex_strike"), r.get("max_pos_gex_value")
         mng_strike, mng_val = r.get("max_neg_gex_strike"), r.get("max_neg_gex_value")
-        stat_row("Max +GEX", f"${mpg_strike:,.0f}  {_fmt_m(mpg_val)}" if mpg_strike is not None else "N/A", _GREEN, y); y += STAT_ROW_H
-        stat_row("Max -GEX", f"${mng_strike:,.0f}  {_fmt_m(mng_val)}" if mng_strike is not None else "N/A", _RED, y); y += STAT_ROW_H
+        stat_row("Max +GEX", f"{format_strike(mpg_strike)}  {_fmt_m(mpg_val)}" if mpg_strike is not None else "N/A", _GREEN, y); y += STAT_ROW_H
+        stat_row("Max -GEX", f"{format_strike(mng_strike)}  {_fmt_m(mng_val)}" if mng_strike is not None else "N/A", _RED, y); y += STAT_ROW_H
 
         y += SECTION_GAP
         section_label("EXPECTED MOVE", y)

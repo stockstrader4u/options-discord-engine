@@ -52,6 +52,15 @@ PRODUCTION HARDENING:
     combined summary, so a glance at Railway's log viewer tells you
     exactly what happened without digging through interleaved output.
 
+STRIKE-DISPLAY PRECISION BUGFIX (2026-08-10): build_single_ticker_embed()
+below now uses gex_vex.format_strike() instead of a bare ":,.0f" for
+put_str/call_str -- same fix as gex_vex.py's card renderers and
+build_gex_embed(), for the same reason: a wall that isn't a whole
+dollar (e.g. $212.50) was being displayed rounded to $212 while the
+percentage next to it was computed from the real, unrounded value,
+producing a reader-visible mismatch (confirmed in production on NVDA).
+See gex_vex.py's module docstring for the full diagnosis.
+
 Deploy this file alongside the unchanged gex_vex.py in the same
 service. Point the Railway cron trigger at this file instead of the
 two old ones:
@@ -179,8 +188,12 @@ def build_single_ticker_embed(r: dict, week_label: str, watch_line: str) -> dict
     # more common (correctly) than before. Fixed by formatting each
     # side independently, matching the same fix already applied to
     # gex_vex.py's build_gex_embed() for the SPY/QQQ/IWM dashboard.
-    put_str = f"${r['put_wall']:,.0f}" if r.get("put_wall") is not None else "N/A"
-    call_str = f"${r['call_wall']:,.0f}" if r.get("call_wall") is not None else "N/A"
+    # STRIKE-DISPLAY PRECISION FIX (2026-08-10): uses
+    # gex_vex.format_strike() instead of a bare ":,.0f" -- see module
+    # docstring for the full diagnosis (NVDA's put wall showing $212
+    # while its percentage was computed from the real $212.50).
+    put_str = gex_vex.format_strike(r.get("put_wall"))
+    call_str = gex_vex.format_strike(r.get("call_wall"))
     fields = [
         {"name": "\U0001F4CA Regime", "value": f"{dot} **{regime_word}**", "inline": True},
         {"name": "\U0001F3AF Key Levels",
@@ -236,6 +249,15 @@ def run_mag7_section(week_label: str) -> int:
     valid_results = [r for r in results if "error" not in r]
     watch_lines_by_ticker = {}
     for r in valid_results:
+        # NOTE (2026-08-10): this is a single-element list on purpose
+        # (one ticker at a time) -- generate_gex_watch_lines() and
+        # build_watch_lines_fallback() were fixed this same date to
+        # require more than one ticker before using the plural,
+        # multi-ticker consolidated-paragraph template, specifically
+        # because THIS call site was feeding it single-ticker batches
+        # and getting plural "could all... their" text back for one
+        # ticker. See gex_vex.py's module docstring for the full
+        # production incident (GOOGL/AMZN) this fixes.
         lines = gex_vex.generate_gex_watch_lines([r])
         watch_lines_by_ticker[r["ticker"]] = lines.get(r["ticker"], "")
 
