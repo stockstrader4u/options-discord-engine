@@ -53,6 +53,7 @@ webhook before any of this was wired back into the pipeline):
 """
 
 import os
+import sys
 import json
 import re
 import time
@@ -60,6 +61,17 @@ import threading
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+# Force line-buffered stdout. When output is piped rather than
+# attached to a real terminal (e.g. `railway run ... | ...`, or some
+# IDE integrated terminals), Python silently switches from
+# line-buffered to block-buffered stdout -- prints sit in a buffer and
+# don't appear until it fills or the process exits, which looks
+# exactly like the script hanging even though it's running normally.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 import matplotlib
 matplotlib.use("Agg")
@@ -708,7 +720,7 @@ NARRATIVE_PROMPT_TEMPLATE = """You are an expert options-trading newsletter edit
 
 - Every ticker mention anywhere in your output must be prefixed with "$" (e.g. "$AXTI"), every time.
 - Do NOT include any URLs, website names, or "according to [source]" citations anywhere -- write facts in plain prose without naming or linking sources.
-- If you reference any event/date found via search, state whether it falls BEFORE or AFTER that contract's expiry -- an event after expiry is not a direct catalyst.
+- Base every claim only on the source data provided below -- you do not have web search for this task, so do not reference any external event, date, or catalyst you were not explicitly given.
 - These five setups have ALREADY been screened for reasonable option pricing and a clean chart pattern -- do not write as if reconsidering whether they're worth trading.
 - Never say "guaranteed", "easy money", "cannot lose", or similar.
 - Do not invent catalysts, data, or reasoning not in the source data below. If something is missing, write "Not provided".
@@ -742,14 +754,23 @@ def write_setup_narratives(selected: list, market_context: dict, target_date: da
         source_data=source_data,
     )
 
+    # NOTE (2026-08-10 fix): the web-search plugin was removed from
+    # this call. This task only rephrases data ALREADY supplied in
+    # source_data (flow, pricing, targets) into plain English -- it
+    # doesn't need to research new facts, and the web plugin could
+    # trigger several search round-trips before returning, which was
+    # making this step look "stuck" for minutes at a time. Timeout
+    # dropped accordingly now that there's no open-ended search step.
+    print("  [NARRATIVE] calling OpenRouter (no web search, should be well under a minute)...", flush=True)
+    call_started = time.time()
     resp = requests.post(
         f"{OPENROUTER_BASE}/chat/completions",
         headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
         json={"model": "moonshotai/kimi-k2.6", "max_tokens": 8000, "temperature": 0,
-              "plugins": [{"id": "web"}],
               "messages": [{"role": "user", "content": prompt}]},
-        timeout=180
+        timeout=90
     )
+    print(f"  [NARRATIVE] response received after {time.time() - call_started:.1f}s", flush=True)
     raw = resp.json()
     if "choices" not in raw:
         print("  [NARRATIVE ERROR] unexpected response (no 'choices' key):")
