@@ -759,29 +759,72 @@ def write_setup_narratives(selected: list, market_context: dict, target_date: da
     # source_data (flow, pricing, targets) into plain English -- it
     # doesn't need to research new facts, and the web plugin could
     # trigger several search round-trips before returning, which was
-    # making this step look "stuck" for minutes at a time. Timeout
-    # dropped accordingly now that there's no open-ended search step.
-    print("  [NARRATIVE] calling OpenRouter (no web search, should be well under a minute)...", flush=True)
-    call_started = time.time()
-    resp = requests.post(
-        f"{OPENROUTER_BASE}/chat/completions",
-        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-        json={"model": "moonshotai/kimi-k2.6", "max_tokens": 8000, "temperature": 0,
-              "messages": [{"role": "user", "content": prompt}]},
-        timeout=90
-    )
-    print(f"  [NARRATIVE] response received after {time.time() - call_started:.1f}s", flush=True)
-    raw = resp.json()
-    if "choices" not in raw:
-        print("  [NARRATIVE ERROR] unexpected response (no 'choices' key):")
-        print(f"  {json.dumps(raw, indent=2)[:1000]}")
-        raise ValueError("write_setup_narratives: unexpected API response shape")
-    message = raw["choices"][0]["message"]
-    content = message.get("content")
-    if not content:
-        print("  [NARRATIVE ERROR] empty/None content -- likely an incomplete tool call:")
+    # making this step look "stuck" for minutes at a time.
+    #
+    # REASONING-BUDGET BUGFIX (2026-08-11): confirmed in a real
+    # production run that this call failed with "empty content in API
+    # response" -- the logged message showed content: null alongside a
+    # non-empty `reasoning` field that was cut off MID-SENTENCE ("...I
+    # should avoid exact dollar amounts or percentages in why_m"). Kimi
+    # K2.6 is a reasoning model, and OpenRouter counts reasoning tokens
+    # against the same max_tokens budget as the actual answer by
+    # default -- it spent the ENTIRE 8000-token budget working through
+    # the rules in the prompt and ran out of room before writing a
+    # single character of the actual JSON answer. This wasn't a fluke
+    # of that one run's input; it's a structural risk any time the
+    # model's reasoning happens to run long, since nothing was capping
+    # it.
+    #
+    # FIX, two parts:
+    #   1. `reasoning.max_tokens` explicitly caps how many tokens the
+    #      model can spend thinking before it must move on to the
+    #      actual answer -- this task is a straightforward "rephrase
+    #      already-supplied data into plain JSON" job, not one that
+    #      needs deep reasoning, so a modest cap is appropriate.
+    #   2. Overall max_tokens raised well above the reasoning cap, so
+    #      even a run that uses its full reasoning allowance still has
+    #      generous room left over for the 5-setup JSON response.
+    #   3. If content still comes back empty (belt-and-suspenders), one
+    #      automatic retry with an even tighter reasoning cap runs
+    #      before giving up -- a single bad reasoning-length roll no
+    #      longer crashes the entire nightly run.
+    REASONING_MAX_TOKENS_ATTEMPTS = [3000, 1200]
+    TOTAL_MAX_TOKENS = 16000
+
+    raw = None
+    message = None
+    content = None
+    for attempt, reasoning_cap in enumerate(REASONING_MAX_TOKENS_ATTEMPTS, start=1):
+        print(f"  [NARRATIVE] calling OpenRouter, attempt {attempt}/{len(REASONING_MAX_TOKENS_ATTEMPTS)} "
+              f"(reasoning capped at {reasoning_cap} tokens, {TOTAL_MAX_TOKENS} total budget)...", flush=True)
+        call_started = time.time()
+        resp = requests.post(
+            f"{OPENROUTER_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+            json={"model": "moonshotai/kimi-k2.6", "max_tokens": TOTAL_MAX_TOKENS, "temperature": 0,
+                  "reasoning": {"max_tokens": reasoning_cap},
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=120
+        )
+        print(f"  [NARRATIVE] response received after {time.time() - call_started:.1f}s", flush=True)
+        raw = resp.json()
+        if "choices" not in raw:
+            print("  [NARRATIVE ERROR] unexpected response (no 'choices' key):")
+            print(f"  {json.dumps(raw, indent=2)[:1000]}")
+            raise ValueError("write_setup_narratives: unexpected API response shape")
+        message = raw["choices"][0]["message"]
+        content = message.get("content")
+        if content:
+            break
+        print(f"  [NARRATIVE WARN] attempt {attempt}: empty/None content -- likely the model used its "
+              f"whole reasoning budget before writing an answer:")
         print(f"  {json.dumps(message, indent=2)[:1000]}")
-        raise ValueError("write_setup_narratives: empty content in API response")
+        if attempt < len(REASONING_MAX_TOKENS_ATTEMPTS):
+            print("  [NARRATIVE] retrying with a tighter reasoning cap...", flush=True)
+
+    if not content:
+        raise ValueError("write_setup_narratives: empty content in API response after all retry attempts")
+
     content = content.strip()
     content = re.sub(r"^```(?:json)?\s*", "", content)
     content = re.sub(r"```\s*$", "", content)
