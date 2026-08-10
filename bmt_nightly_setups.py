@@ -41,6 +41,18 @@ future") that is run as a mandatory additional gate on every candidate
 BEFORE ranking/selection -- not just relying on the existing forward-
 looking date-vs-expiry comparison. See that function and its call site
 in main() for the full mechanism.
+
+SIMPLIFIED-DIGEST FIX (2026-08-09): the Discord text digest was
+confirmed too technical/jargon-heavy for the subscriber base (IV/RV
+ratios, "volatility discount", "cheaply/richly priced" language). The
+JOB 2 prompt in write_narratives() has been rewritten to require
+plain-English output a layman can follow -- explain the same
+underlying facts (relative option pricing, required move, flow
+strength, analyst target) in everyday terms, no jargon, no formulas.
+Also, every ticker mention in the digest (thesis/body/risk) and in the
+plain-text contract list must now be prefixed with "$" (e.g. "$AXTI"),
+per direct user request -- format_discord_digest() now enforces this
+with a regex safety net in case the model forgets.
 """
 
 import os
@@ -647,24 +659,34 @@ CRITICAL RULE ON LINKS: do NOT include any URLs, website names, or "according to
 
 CRITICAL RULE ON DIRECTION: these setups may be CALLS, PUTS, or a mix -- use direction-neutral language ("positions," "trades," "setups"), never assume "calls."
 
+CRITICAL RULE ON TICKERS: every single time you mention a ticker anywhere in market_theme, risk_notes, digest_thesis, digest_body, or digest_risk, prefix it with a dollar sign -- "$AXTI", "$SPY", "$QQQ", never bare "AXTI" or "SPY". This applies every time, not just first mention.
+
+CRITICAL RULE ON LANGUAGE -- WRITE FOR A COMPLETE BEGINNER, NOT A TRADER:
+The subscriber base has told us the digest is too technical to follow. Do NOT use any of these terms or anything like them: "IV/RV", "IV/RV ratio", "implied volatility", "realized volatility", "volatility discount/premium", "richly/cheaply/fairly priced", "skew", "call-weighted", "OTM/ATM", "conviction rank", "flow intensity", "structural breakout", "hurdle". These are jargon and must be translated into plain everyday language every time, using ideas like:
+- Instead of an IV/RV ratio number, say whether the options are "priced cheap" or "priced expensive" for how much the stock has actually been moving lately -- e.g. "the options here are unusually cheap for how much this stock has been swinging" or "you're paying a bit of a premium for these options right now."
+- Instead of "X% call-weighted" or "OTM/ATM bullish flow", say something like "a lot of money has been flowing into bullish bets" or "traders have been buying calls on this one."
+- Instead of "needs a +X% move by expiry", say "needs to climb about X% in the next N days" (or "fall" for puts).
+- Instead of "consensus target" / "analyst target", say "Wall Street's price target" or "analysts expect it could reach $X."
+- Keep sentences short and conversational, like you're explaining it to a friend who's new to options, not writing a research note. No formulas, no ratios, no numbers-as-jargon (e.g. never write "0.57x" -- describe it in words instead, only using the plain dollar/percent figures a beginner already understands).
+
 You have TWO separate writing jobs:
 
-JOB 1 -- for the card image (keep these SHORT, as before):
-- market_theme: ONE sentence, cites actual SPY/QQQ closing prices and % moves by number.
-- risk_notes: ONE short sentence on risk for tomorrow.
+JOB 1 -- for the card image (keep these SHORT, as before, same plain-language rules apply, tickers prefixed with $):
+- market_theme: ONE sentence, cites actual SPY/QQQ closing prices and % moves by number, in plain language.
+- risk_notes: ONE short, plain-language sentence on risk for tomorrow.
 
-JOB 2 -- for the Discord text digest, a SEPARATE, cohesive multi-paragraph write-up covering ALL {len(selected)} setups TOGETHER as one connected piece, NOT independent per-ticker bullets:
-- digest_thesis: 2-3 sentences. DO NOT describe the screening methodology itself (bullish flow, IV/RV pricing, pattern matching) -- that filter is IDENTICAL every single night by construction, so describing it produces near-duplicate text night after night regardless of wording. Instead, identify what's DISTINCTIVE about TONIGHT'S SPECIFIC group: is there a real sector concentration (e.g. multiple names in the same industry)? A genuine connecting thread you found via search? Something notable about tonight's actual numbers (an unusually tight or wide spread of required moves, a standout IV/RV reading)? If nothing genuinely distinctive stands out beyond the standard screen, say that plainly and briefly rather than re-describing the mechanical filter in different words.
-- digest_body: flowing prose (not a bullet list) covering ALL {len(selected)} tickers IN THE CONVICTION ORDER GIVEN. Give more detail/reasoning to the higher-ranked setups (#1 should anchor and lead the paragraph), and group the lower-conviction ones together more briefly toward the end -- but EVERY ticker must be mentioned at least briefly, since this needs to fit in a single Discord message. Prioritize mentioning all {len(selected)} tickers briefly over writing extensively about only the top 2-3 and running out of room. Reference each ticker and its strike explicitly. Keep total length tight -- aim for roughly 1-2 sentences per ticker on average, erring short rather than long.
-- digest_risk: 1-2 sentences. DO NOT cite "these all share the same expiry so they all face theta/gap risk together" -- ALL setups in this pipeline always share one weekly expiry by construction, so this is true every single night and isn't distinctive information. Instead find a risk SPECIFIC to tonight: real sector concentration risk (if multiple names share an industry), a specific real macro event this particular week (use search -- FOMC, CPI, jobs report, a sector-specific data release) that could hit these positions, or something else genuinely tied to tonight's actual context. If truly nothing beyond the generic timing risk applies, say so plainly rather than restating the generic mechanic.
+JOB 2 -- for the Discord text digest, a SEPARATE, cohesive multi-paragraph write-up covering ALL {len(selected)} setups TOGETHER as one connected piece, NOT independent per-ticker bullets, written entirely in the beginner-friendly language described above:
+- digest_thesis: 2-3 short, simple sentences. DO NOT describe the screening methodology itself (bullish flow, IV/RV pricing, pattern matching) -- that filter is IDENTICAL every single night by construction, so describing it produces near-duplicate text night after night regardless of wording. Instead, identify what's DISTINCTIVE about TONIGHT'S SPECIFIC group in plain terms: is there a real sector concentration (e.g. multiple names in the same industry)? A genuine connecting thread you found via search? Something notable about tonight's actual numbers (an unusually small or big move needed, a standout "cheap options" name)? If nothing genuinely distinctive stands out beyond the standard screen, say that plainly and briefly rather than re-describing the mechanical filter in different words.
+- digest_body: flowing, conversational prose (not a bullet list, not technical) covering ALL {len(selected)} tickers IN THE CONVICTION ORDER GIVEN, every ticker written as "$TICKER". Give more detail/reasoning to the higher-ranked setups (#1 should anchor and lead the paragraph), and group the lower-conviction ones together more briefly toward the end -- but EVERY ticker must be mentioned at least briefly, since this needs to fit in a single Discord message. Prioritize mentioning all {len(selected)} tickers briefly over writing extensively about only the top 2-3 and running out of room. Keep total length tight -- aim for roughly 1-2 short sentences per ticker on average, erring short rather than long. Write like you're texting a friend the highlights, not filing a report.
+- digest_risk: 1-2 short, plain sentences. DO NOT cite "these all share the same expiry so they all face theta/gap risk together" -- ALL setups in this pipeline always share one weekly expiry by construction, so this is true every single night and isn't distinctive information. Instead find a risk SPECIFIC to tonight, explained simply: real sector concentration risk (if multiple names share an industry), a specific real macro event this particular week (use search -- FOMC, CPI, jobs report, a sector-specific data release) that could hit these positions, or something else genuinely tied to tonight's actual context, phrased so a beginner understands why it matters. If truly nothing beyond the generic timing risk applies, say so plainly (e.g. "these are unrelated to each other, so there's no single story that moves them all together") rather than restating the generic mechanic.
 
 Return ONLY valid JSON, nothing else:
 {{
-  "market_theme": "one sentence, cites real SPY/QQQ numbers by value",
-  "risk_notes": "one short sentence, brief",
-  "digest_thesis": "2-3 sentences, the real shared thread",
-  "digest_body": "flowing prose covering all tickers in conviction order",
-  "digest_risk": "1-2 sentences, one shared risk"
+  "market_theme": "one plain-language sentence, cites real SPY/QQQ numbers by value, tickers as $SPY/$QQQ",
+  "risk_notes": "one short plain-language sentence, brief",
+  "digest_thesis": "2-3 short plain-language sentences, the real shared thread, tickers as $TICKER",
+  "digest_body": "flowing conversational prose covering all tickers in conviction order, tickers as $TICKER",
+  "digest_risk": "1-2 short plain-language sentences, one shared risk, tickers as $TICKER"
 }}"""
 
     resp = requests.post(
@@ -774,7 +796,7 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
         pct = m.get("pct")
         color = GREEN if (pct or 0) >= 0 else RED
         arrow = "\u2191" if (pct or 0) >= 0 else "\u2193"
-        ax.text(x, ctx_y, t, fontsize=13, fontweight="bold", color=TEXT_SECONDARY, va="top", zorder=5)
+        ax.text(x, ctx_y, f"${t}", fontsize=13, fontweight="bold", color=TEXT_SECONDARY, va="top", zorder=5)
         ax.text(x, ctx_y + 0.4, f"${m.get('price', '?')}", fontsize=20, fontweight="bold", color=TEXT_PRIMARY, va="top", zorder=5)
         ax.text(x, ctx_y + 0.88, get_tone_phrase(m), fontsize=9, color=TEXT_TERTIARY, va="top", zorder=5)
         ax.text(x + ctx_w, ctx_y, f"{arrow} {abs(pct):.2f}%" if pct is not None else "N/A",
@@ -847,7 +869,7 @@ def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: s
         cx = x + PAD_L
         yy = cards_top + PAD_TOP
 
-        ax.text(cx, yy, s["ticker"], fontsize=21, fontweight="bold", color=TEXT_PRIMARY, va="top", zorder=5)
+        ax.text(cx, yy, f"${s['ticker']}", fontsize=21, fontweight="bold", color=TEXT_PRIMARY, va="top", zorder=5)
         arrow = "\u25b2" if is_call else "\u25bc"
         ax.text(x + card_w - 0.3, yy + 0.02, f"{arrow} {s['direction']} ${s['strike']:g}",
                 fontsize=13, fontweight="bold", color=accent, va="top", ha="right", zorder=5)
@@ -967,6 +989,21 @@ def strip_urls_and_domains(text: str) -> str:
     return text
 
 
+def ensure_dollar_prefixed_tickers(text: str, tickers: list) -> str:
+    """
+    SIMPLIFIED-DIGEST FIX (2026-08-09): safety net in case the model
+    forgets the "$TICKER" instruction for one or more names. Runs a
+    word-boundary replace for each known ticker in this digest, turning
+    a bare mention into a "$"-prefixed one without double-prefixing
+    ones the model already got right.
+    """
+    if not text:
+        return text
+    for t in sorted(set(tickers), key=len, reverse=True):
+        text = re.sub(rf"(?<!\$)\b{re.escape(t)}\b", f"${t}", text)
+    return text
+
+
 def truncate_at_word_boundary(text: str, max_len: int) -> str:
     if not text or len(text) <= max_len:
         return text
@@ -997,14 +1034,22 @@ def format_discord_digest(accepted, market_context, digest_thesis, digest_body, 
     CONNECTS THESE 5 TRADES"), confirmed confusing to subscribers.
     Replaced with a plain dated header using the actual target trading
     date these setups are FOR, per direct user request.
+
+    SIMPLIFIED-DIGEST FIX (2026-08-09): every ticker mention (in the
+    thesis/body/risk text AND in the plain "• TICKER EXPIRY $STRIKEC"
+    contract list) is now guaranteed to carry a "$" prefix -- the
+    prompt asks the model to do this, and ensure_dollar_prefixed_tickers()
+    catches anything it misses.
     """
     header = f"📋 **TRADE IDEAS — {target_date.strftime('%a, %b %d').upper()}**"
 
-    thesis = strip_urls_and_domains(digest_thesis.strip())
-    risk = strip_urls_and_domains(digest_risk.strip())
-    body_raw = strip_urls_and_domains(digest_body.strip())
+    all_tickers = [c["ticker"] for c in accepted] + list(MARKET_CONTEXT_TICKERS)
 
-    contract_lines = "\n".join(f"• {c['ticker']} {c['next_expiry']} ${c['strike']:g}{c['direction'][0]}" for c in accepted)
+    thesis = ensure_dollar_prefixed_tickers(strip_urls_and_domains(digest_thesis.strip()), all_tickers)
+    risk = ensure_dollar_prefixed_tickers(strip_urls_and_domains(digest_risk.strip()), all_tickers)
+    body_raw = ensure_dollar_prefixed_tickers(strip_urls_and_domains(digest_body.strip()), all_tickers)
+
+    contract_lines = "\n".join(f"• ${c['ticker']} {c['next_expiry']} ${c['strike']:g}{c['direction'][0]}" for c in accepted)
 
     def _build(body_text):
         return f"""{header}
