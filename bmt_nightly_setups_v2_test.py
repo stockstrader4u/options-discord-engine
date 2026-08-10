@@ -1224,7 +1224,11 @@ def main():
             c["flow_intensity"] = c["flow"]["premium"] / c["avg_dollar_vol"]
         else:
             c["flow_intensity"] = 0.0
-        if c["iv_rv_ratio"] is not None:
+        # Guard against iv_rv_ratio being exactly 0.0 (not None) --
+        # this happens when atm_iv rounds to a very small number
+        # relative to realized_vol and round(..., 2) lands on 0.0.
+        # "is not None" alone lets 0.0 through, and 1.0 / 0.0 crashes.
+        if c["iv_rv_ratio"]:
             pricing_multiplier = max(0.4, 1.0 / c["iv_rv_ratio"])
         else:
             pricing_multiplier = 0.75
