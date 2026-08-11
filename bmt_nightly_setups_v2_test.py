@@ -50,6 +50,31 @@ webhook before any of this was wired back into the pipeline):
   watermarked "V2 TEST -- INTERNAL REVIEW" so it can never be mistaken
   for the live production card while this is being trialed. Sender
   username on every post is explicitly set to "BMT".
+
+BUGFIX (2026-08-11): every setup posted with "Not provided" for
+best_for/why_made_list/why_choose, risk defaulted to "Moderate", and
+roles assigned in flat VALID_ROLES order for every ticker -- the
+telltale signature of setups_by_ticker.get(c["ticker"], {}) missing
+on every single lookup. market_backdrop and top_pick_why (top-level
+JSON fields) came through fine, so the response was valid JSON and
+the API call succeeded -- only the nested "setups" object's keys
+failed to match. Root cause: the prompt's blanket instruction to
+prefix every ticker mention with "$" was being over-applied by the
+model to the JSON object keys themselves (returning "$AXTI" instead
+of "AXTI" as the key), while c["ticker"] is always the bare symbol,
+so every dict lookup silently missed and fell through to the {}
+default -- no exception, no visible error, just silent full-fallback
+for every field on every setup.
+
+Fix, two parts:
+  1. Prompt now explicitly carves out an exception for JSON keys /
+     top_pick_ticker: those must be the bare ticker, no "$" prefix.
+     The "$" prefix rule is scoped to ticker mentions inside prose.
+  2. Defensive normalization on the Python side regardless -- keys
+     under "setups" are stripped of any leading "$" and uppercased
+     before lookup, so a future run where the model ignores the
+     prompt instruction degrades gracefully instead of silently
+     falling back on every field again.
 """
 
 import os
@@ -718,7 +743,8 @@ NARRATIVE_PROMPT_TEMPLATE = """You are an expert options-trading newsletter edit
 
 ## Non-negotiable rules
 
-- Every ticker mention anywhere in your output must be prefixed with "$" (e.g. "$AXTI"), every time.
+- Every ticker mention INSIDE SENTENCE TEXT (market_backdrop, top_pick_why, best_for, why_made_list, why_choose) must be prefixed with "$" (e.g. "$AXTI"), every time.
+- EXCEPTION -- do NOT apply the "$" prefix to the JSON object keys under "setups", or to the value of "top_pick_ticker". Those must be the bare ticker symbol with no "$" and no other punctuation (e.g. the key "AXTI", not "$AXTI"; top_pick_ticker: "AXTI", not "$AXTI"). The "$" prefix rule applies only to prose sentences, never to JSON keys or to top_pick_ticker's value.
 - Do NOT include any URLs, website names, or "according to [source]" citations anywhere -- write facts in plain prose without naming or linking sources.
 - Base every claim only on the source data provided below -- you do not have web search for this task, so do not reference any external event, date, or catalyst you were not explicitly given.
 - These five setups have ALREADY been screened for reasonable option pricing and a clean chart pattern -- do not write as if reconsidering whether they're worth trading.
@@ -731,7 +757,7 @@ NARRATIVE_PROMPT_TEMPLATE = """You are an expert options-trading newsletter edit
 
 ## Output format
 
-Return ONLY valid JSON, nothing else, no markdown code fences, in exactly this shape (ticker keys must match the source data tickers exactly):
+Return ONLY valid JSON, nothing else, no markdown code fences, in exactly this shape (ticker keys must match the source data tickers exactly, bare with no "$" prefix -- see the non-negotiable rules above):
 
 {{
   "market_backdrop": "...",
@@ -1363,7 +1389,22 @@ def main():
     market_backdrop = clean_text_field(narrative_result.get("market_backdrop", ""), all_tickers)
     top_pick_ticker = narrative_result.get("top_pick_ticker", "").upper().lstrip("$")
     top_pick_why = clean_text_field(narrative_result.get("top_pick_why", ""), all_tickers)
-    setups_by_ticker = narrative_result.get("setups", {})
+
+    # BUGFIX (2026-08-11): normalize "setups" dict keys defensively --
+    # strip any leading "$" and uppercase, regardless of what the
+    # model actually returned. Previously a plain
+    # narrative_result.get("setups", {}) lookup against c["ticker"]
+    # (always bare, e.g. "AXTI") silently missed on every single
+    # ticker whenever the model prefixed its JSON keys with "$" (e.g.
+    # "$AXTI"), because dict.get() with a default doesn't raise -- it
+    # just quietly returned {} for every setup, and every text field
+    # fell through to "Not provided" with risk defaulting to
+    # "Moderate" and roles assigned in flat VALID_ROLES order. The
+    # prompt above now explicitly tells the model not to prefix JSON
+    # keys, but this normalization is a second, independent layer so
+    # a stray future response can't reproduce the same silent failure.
+    raw_setups = narrative_result.get("setups", {})
+    setups_by_ticker = {k.lstrip("$").upper(): v for k, v in raw_setups.items()}
 
     # Merge model output onto each selected setup, validating role/risk
     # against the fixed vocab -- fall back to a safe neutral value
@@ -1371,7 +1412,10 @@ def main():
     # mapping or leave a field blank.
     used_roles = set()
     for c in selected:
-        s = setups_by_ticker.get(c["ticker"], {})
+        s = setups_by_ticker.get(c["ticker"].upper(), {})
+        if not s:
+            print(f"  [NARRATIVE WARN] {c['ticker']}: no matching entry in model's 'setups' output "
+                  f"(keys returned: {list(raw_setups.keys())}) -- falling back to defaults for this setup")
         role = s.get("role", "")
         if role not in VALID_ROLES or role in used_roles:
             role = next((r for r in VALID_ROLES if r not in used_roles), "Best Balanced Setup")
