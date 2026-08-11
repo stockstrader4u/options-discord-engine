@@ -1,61 +1,100 @@
 """
-bmt_nightly_setups.py — Nightly top-5 trade-ideas digest.
+bmt_nightly_setups.py — Nightly top-5 trade-ideas digest (PRODUCTION).
 
-HEADER FIX (2026-08-04): Discord digest header changed from the
-confusing "{EXPIRY} POSITIONS — WHAT CONNECTS THESE N TRADES" to a
-plain dated header "TRADE IDEAS — {DAY, MON DD}" using the actual
-target trading date. format_discord_digest() now takes target_date.
+PROMOTED TO PRODUCTION (2026-08-11): this file was developed and
+trialed as bmt_nightly_setups_v2_test.py, a richer, subscriber-facing
+post format driven by real Discord embeds (colored cards with
+structured fields) instead of the older plain-text digest format. It
+has now been promoted to be the live production script running on the
+bmt-trade-ideas Railway service.
 
-EARNINGS-EXCLUSION BUGFIX (2026-08-07): confirmed in production --
-$TEAM and $CLSK, both reporting earnings THE SAME NIGHT this script
-ran, were selected and published anyway, despite this pipeline being
-specifically designed to exclude any candidate reporting earnings
-before its suggested contract's expiry.
+Changes made specifically for this promotion, vs. the v2 test file:
+  1. DISCORD_WEBHOOK now reads NIGHTLY_SETUPS_DISCORD_WEBHOOK (the
+     variable actually configured on the bmt-trade-ideas service),
+     not NIGHTLY_SETUPS_V2_TEST_DISCORD_WEBHOOK.
+  2. The "V2 TEST -- INTERNAL REVIEW" watermark on the card image and
+     the "internal review only, not the live production post" message
+     prefix on the image post have both been removed -- this output
+     now goes straight to subscribers.
+  3. Scheduler moved from 6:10pm ET (offset to avoid colliding with
+     the old separate prod script) back to 6:00pm ET, matching what
+     the previous plain-text production script ran at, since this is
+     now the only nightly setups job.
+  4. File renamed to bmt_nightly_setups.py to match the Railway
+     service's configured Custom Start Command
+     ("python bmt_nightly_setups.py").
 
-ROOT CAUSE: get_upcoming_earnings_date() (yfinance) only ever looks at
-FUTURE earnings dates ("idx.replace(tzinfo=None) > now") -- a same-day
-report can fall out of that forward-only window by the time this
-script runs in the evening, either because yfinance's cached "next
-earnings" field hasn't rolled over yet post-report, or because a
-same-day AMC report is no longer strictly "future" relative to `now`.
-Combined with Finnhub's calendar having KNOWN gaps for specific tickers
-(the exact same class of gap already documented and worked around in
-er_lotto_scanner.py's Grok/yfinance cross-check merge), a ticker whose
-earnings happen tonight can slip past BOTH sources simultaneously:
-Finnhub simply doesn't have it, and yfinance no longer considers it
-"future". When that happens, er_dates ends up empty, er_date is None,
-and the entire exclusion block is skipped -- the candidate is selected
-as if it had no earnings event at all.
+Everything else -- the full data pipeline, the embed format, and the
+two bugfixes below -- is unchanged from what was tested as v2.
 
-This is also structurally concerning upstream of the exclusion check:
-a ticker reporting earnings that same evening will often show unusual
-options flow SPECIFICALLY BECAUSE of the earnings event, meaning
-exactly the tickers this filter most needs to catch are also the ones
-most likely to score highly on the flow-intensity ranking that
-determines which candidates reach the exclusion check in the first
-place.
+WHAT'S REUSED, UNCHANGED, FROM the original plain-text
+bmt_nightly_setups.py:
+All data-layer logic is copied verbatim -- flow scanning, the same-day
+earnings exclusion gate, deterministic chart-pattern matching, IV/RV
+pricing screen, strike selection, ATR-based trade-level math, analyst
+target lookup. None of the underlying setup-selection logic changes.
 
-FIX: added get_earnings_today_and_recent() as an explicit, independent
-SAME-DAY-OR-VERY-RECENT check (does not rely on "is this in the
-future") that is run as a mandatory additional gate on every candidate
-BEFORE ranking/selection -- not just relying on the existing forward-
-looking date-vs-expiry comparison. See that function and its call site
-in main() for the full mechanism.
+FORMAT HISTORY (locked 2026-08-10 after review via a standalone test
+script, test_v2_embed_sample.py, run directly against the test
+webhook before any of this was wired back into the pipeline):
+- v1 asked one LLM call for a single long markdown document (ranking
+  table, 5 full-paragraph setups, a "Card Copy" section). This posted
+  as 8 sequential Discord messages and the markdown table rendered as
+  broken literal pipe characters -- Discord's plain `content` field
+  does not render tables at all.
+- v2 compressed each setup to 2 lines to fix the length problem, but
+  lost the reasoning ("why it made the list" / "why choose this over
+  the others") that made the format useful in the first place.
+- v3 (this version) fixes both at once: write_setup_narratives() asks
+  for compact, plain-English JSON per setup instead of a markdown
+  document, and that JSON drives real Discord `embeds` -- colored
+  left-bar cards with a Role / Risk level / Best for / Why it made the
+  list / Why choose this over the others field grid. Embed color is
+  mapped to risk level consistently (green/blue/amber/red) so the
+  color always carries the same meaning; the top pick gets a star
+  instead of hijacking that color scale. The old markdown table is
+  gone entirely -- Role and Risk level already live on each setup's
+  own card, so a separate summary table was pure duplication. The
+  blanket "Expiry / Direction: Calls" header line is gone too, since a
+  given night isn't guaranteed to be all-calls or one expiry (each
+  setup's own title carries its own expiry and C/P). The final
+  contract list is still built deterministically in Python
+  (build_contract_list_embed()), not written by the model, guaranteeing
+  it's byte-for-byte accurate to what was actually selected.
+- During the trial period, the card image carried a "V2 TEST --
+  INTERNAL REVIEW" watermark so it could never be mistaken for the
+  live production card. That watermark has been removed now that this
+  format IS production (see the PROMOTED TO PRODUCTION note above).
+  Sender username on every post is explicitly set to "BMT".
 
-SIMPLIFIED-DIGEST FIX (2026-08-09): the Discord text digest was
-confirmed too technical/jargon-heavy for the subscriber base (IV/RV
-ratios, "volatility discount", "cheaply/richly priced" language). The
-JOB 2 prompt in write_narratives() has been rewritten to require
-plain-English output a layman can follow -- explain the same
-underlying facts (relative option pricing, required move, flow
-strength, analyst target) in everyday terms, no jargon, no formulas.
-Also, every ticker mention in the digest (thesis/body/risk) and in the
-plain-text contract list must now be prefixed with "$" (e.g. "$AXTI"),
-per direct user request -- format_discord_digest() now enforces this
-with a regex safety net in case the model forgets.
+BUGFIX (2026-08-11): every setup posted with "Not provided" for
+best_for/why_made_list/why_choose, risk defaulted to "Moderate", and
+roles assigned in flat VALID_ROLES order for every ticker -- the
+telltale signature of setups_by_ticker.get(c["ticker"], {}) missing
+on every single lookup. market_backdrop and top_pick_why (top-level
+JSON fields) came through fine, so the response was valid JSON and
+the API call succeeded -- only the nested "setups" object's keys
+failed to match. Root cause: the prompt's blanket instruction to
+prefix every ticker mention with "$" was being over-applied by the
+model to the JSON object keys themselves (returning "$AXTI" instead
+of "AXTI" as the key), while c["ticker"] is always the bare symbol,
+so every dict lookup silently missed and fell through to the {}
+default -- no exception, no visible error, just silent full-fallback
+for every field on every setup.
+
+Fix, two parts:
+  1. Prompt now explicitly carves out an exception for JSON keys /
+     top_pick_ticker: those must be the bare ticker, no "$" prefix.
+     The "$" prefix rule is scoped to ticker mentions inside prose.
+  2. Defensive normalization on the Python side regardless -- keys
+     under "setups" are stripped of any leading "$" and uppercased
+     before lookup, so a future run where the model ignores the
+     prompt instruction degrades gracefully instead of silently
+     falling back on every field again.
 """
 
 import os
+import sys
 import json
 import re
 import time
@@ -63,6 +102,17 @@ import threading
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+# Force line-buffered stdout. When output is piped rather than
+# attached to a real terminal (e.g. `railway run ... | ...`, or some
+# IDE integrated terminals), Python silently switches from
+# line-buffered to block-buffered stdout -- prints sit in a buffer and
+# don't appear until it fills or the process exits, which looks
+# exactly like the script hanging even though it's running normally.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 import matplotlib
 matplotlib.use("Agg")
@@ -113,6 +163,11 @@ CANDIDATE_UNIVERSE = [t for t in FULL_WATCHLIST if t not in EXCLUDE_FROM_CANDIDA
 
 EARNINGS_LOOKAHEAD_DAYS = 14
 
+
+# ─────────────────────────────────────────────────────────────────────
+# DATA LAYER -- copied verbatim from bmt_nightly_setups.py. No changes.
+# ─────────────────────────────────────────────────────────────────────
+
 def get_upcoming_earnings_map() -> dict:
     today = datetime.now(ET).strftime("%Y-%m-%d")
     end = (datetime.now(ET) + timedelta(days=EARNINGS_LOOKAHEAD_DAYS)).strftime("%Y-%m-%d")
@@ -155,32 +210,6 @@ def get_upcoming_earnings_date(ticker: str) -> str:
 
 
 def get_earnings_today_and_recent(ticker: str, lookback_days: int = 2) -> str:
-    """
-    NEW (2026-08-07 bugfix): explicit, independent same-day-or-very-
-    recent earnings check -- deliberately does NOT rely on "is this
-    date in the future", unlike get_upcoming_earnings_date(). This is
-    the direct fix for $TEAM and $CLSK both reporting earnings the same
-    evening this script ran and still getting selected: their earnings
-    date fell OUT of get_upcoming_earnings_date()'s forward-only window
-    (a same-day report may no longer count as "future" by evening, or
-    yfinance's cached next-earnings field may not have rolled over yet)
-    while Finnhub's calendar simply didn't have them for this ticker
-    (a known, already-documented gap -- see er_lotto_scanner.py's
-    Grok/yfinance cross-check merge for the same class of issue).
-
-    Checks yfinance's earnings-dates history directly for ANY date
-    within [today - lookback_days, today] -- i.e. "did this ticker
-    report earnings today, or within the last couple of days" --
-    completely independent of whether that date is technically "in the
-    future" from get_upcoming_earnings_date()'s point of view. A
-    lookback (not just today) is used because a stock that just
-    reported yesterday can still be in an elevated-volatility, elevated-
-    flow state that isn't a genuine multi-day swing setup, which is
-    exactly the kind of candidate this exclusion exists to filter out.
-
-    Returns the earnings date string (YYYY-MM-DD) if found within the
-    window, else None.
-    """
     try:
         import yfinance as yf
         edf = yf.Ticker(ticker).get_earnings_dates(limit=8)
@@ -610,108 +639,347 @@ def get_analyst_target(ticker: str) -> str:
         current = info.get("regularMarketPrice") or info.get("currentPrice")
         rec_key = info.get("recommendationKey", "")
         if not target_mean or not current:
-            return "N/A"
+            return "Not provided"
         upside_pct = round((target_mean - current) / current * 100, 1)
-        consensus = rec_key.replace("_", " ").title() if rec_key else "N/A"
+        consensus = rec_key.replace("_", " ").title() if rec_key else "Not provided"
         return f"Analyst target ${target_mean:.2f} ({upside_pct:+.1f}% from current), consensus: {consensus}"
     except Exception as e:
         print(f"  [ANALYST WARN] {ticker}: {e}")
-        return "N/A"
+        return "Not provided"
 
 
-def write_narratives(selected: list, rejected_summary: list, market_context: dict) -> dict:
-    context_block = "\n".join(
-        f"{t}: ${market_context[t]['price']} ({market_context[t]['pct']:+.2f}%)"
-        for t in MARKET_CONTEXT_TICKERS if market_context.get(t, {}).get("price")
-    )
-    setup_blocks = []
+def get_company_name(ticker: str) -> str:
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info
+        return info.get("shortName") or info.get("longName") or "Not provided"
+    except Exception as e:
+        print(f"  [NAME WARN] {ticker}: {e}")
+        return "Not provided"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# LOCKED FORMAT (2026-08-10): rich, subscriber-ready content, built as
+# real Discord embeds instead of a giant plain-text/markdown string.
+#
+# History: v1 of this generator asked the model for one long markdown
+# document (table + 5 full-paragraph setups + a "Card Copy" section).
+# That rendered as 8 sequential Discord messages and a broken markdown
+# table (Discord's plain `content` field does not render tables at
+# all -- it dumps the pipe characters literally). v2 compressed each
+# setup to 2 lines, which lost the reasoning that made the format
+# useful in the first place. This version -- confirmed and locked with
+# the user via a standalone test script -- fixes both: real Discord
+# `embeds` (colored left-bar cards with a field grid) replace the
+# table entirely, each setup keeps Role / Risk level / Best for / Why
+# it made the list / Why choose this over the others as distinct
+# fields (trimmed to plain, short, actionable language), and a
+# deterministic (not model-written) contract list closes it out.
+# Also dropped: the blanket "Expiry / Direction: Calls" line, since
+# not every night is all-calls or one expiry -- each setup's own
+# title already carries its own expiry and C/P.
+# ─────────────────────────────────────────────────────────────────────
+
+SENDER_USERNAME = "BMT"
+
+# Discord embed colors (decimal, not hex string), mapped to risk level
+# consistently across every setup -- the color always means the same
+# thing, with the legend implicit in the mapping itself (a reader sees
+# green/blue/amber/red enough nights running to learn it fast).
+COLOR_LOW = 0x3BA55D          # green
+COLOR_MODERATE = 0x5865F2     # blue
+COLOR_ELEVATED = 0xE5A012     # amber
+COLOR_SPECULATIVE = 0xED4245  # red
+COLOR_GOLD = 0xFBBF24         # Best Choice Tonight highlight
+COLOR_NEUTRAL = 0x2B2D31      # header / contract list / unrecognized risk label
+
+RISK_COLOR_MAP = {
+    "Low": COLOR_LOW,
+    "Moderate": COLOR_MODERATE,
+    "Elevated": COLOR_ELEVATED,
+    "High": COLOR_SPECULATIVE,
+    "Speculative": COLOR_SPECULATIVE,
+}
+
+VALID_ROLES = [
+    "Best Overall",
+    "Lowest-Move Setup",
+    "Best Balanced Setup",
+    "Flow-Backed Momentum Setup",
+    "Speculative / High-Risk Breakout Setup",
+]
+VALID_RISK_LEVELS = ["Low", "Moderate", "Elevated", "High", "Speculative"]
+
+HOW_TO_USE_LINE = "These are five independent triggered setups, not a basket to buy blindly \u2014 pick what fits your risk tolerance."
+
+
+def build_narrative_source_data(selected: list, market_context: dict, target_date: datetime) -> str:
+    lines = []
+    lines.append("Market summary and index performance (as of last close):")
+    for t in MARKET_CONTEXT_TICKERS:
+        m = market_context.get(t, {})
+        lines.append(f"- ${t}: ${m.get('price', 'N/A')} ({m.get('pct', 'N/A')}%) -- {get_tone_phrase(m)}")
+    lines.append("")
+    lines.append(f"Ideas are for the next trading session: {target_date.strftime('%A, %B %d, %Y')}.")
+    lines.append("")
+    lines.append(f"Five scanned trade ideas, in descending conviction/ranking-score order (setup #1 scored highest by the deterministic flow-intensity/pricing model -- a useful input, but re-rank based on the full picture if the data supports it):")
+    lines.append("")
     for i, c in enumerate(selected):
         tp = c.get("time_pressure") or build_time_pressure(c)
-        setup_blocks.append(
-            f"### CONVICTION RANK #{i+1} of {len(selected)}: {c['ticker']} "
-            f"({c['direction']}, strike ${c.get('strike', '?'):g}, "
-            f"EXPIRES {c['next_expiry']} = {tp['dte']} calendar days from today)\n"
-            f"Flow: {build_flow_note_display(c['flow'])}\n"
-            f"IV vs Realized Vol: {c.get('iv_rv_str', 'N/A')} (this has ALREADY been screened -- "
-            f"anything over 2.5x was excluded before you saw this setup, so do not re-litigate "
-            f"whether the premium is 'too expensive' as if reconsidering the trade's validity)\n"
-            f"Analyst Target: {c.get('analyst_target', 'N/A')}\n"
-            f"Time pressure: {tp['summary']}\n"
-        )
-    setups_text = "\n".join(setup_blocks)
-    rejected_text = "; ".join(rejected_summary) if rejected_summary else "none notable"
+        lines.append(f"---- SETUP #{i+1} (model rank order, not necessarily final rank) ----")
+        lines.append(f"Ticker: ${c['ticker']}   Company: {c.get('company_name', 'Not provided')}")
+        lines.append(f"Contract: {c['direction']} ${c['strike']:g} strike, expiring {c['next_expiry']} ({tp['dte']} calendar days to expiration)")
+        lines.append(f"Chart setup: {build_price_narrative(c)} Pattern classification: {build_quality_tag(c.get('pattern', ''))}.")
+        lines.append(f"Entry zone (underlying stock price): ${c['entry_low']}-${c['entry_high']}")
+        lines.append(f"Stop / invalidation (underlying stock price): ${c['stop']}")
+        lines.append(f"Target 1 (underlying stock price): ${c['target1']}")
+        lines.append(f"Target 2 (underlying stock price): ${c['target2']}")
+        lines.append(f"Options-flow data: {build_flow_note_display(c['flow'])}")
+        lines.append(f"Required move / implied volatility data: {tp['summary']}. {c.get('iv_rv_str', 'Not provided')}")
+        lines.append(f"Analyst target / catalyst info: {c.get('analyst_target', 'Not provided')}")
+        lines.append("")
+    return "\n".join(lines)
 
-    prompt = f"""These options setups have ALREADY been selected AND already screened for reasonable pricing (see each setup's IV/RV note) -- you are NOT deciding whether they're worth trading, that's already been decided. Your job is genuine synthesis.
 
-MARKET: {context_block}
-TODAY'S DATE: {datetime.now(ET).strftime('%Y-%m-%d')}
+NARRATIVE_PROMPT_TEMPLATE = """You are an expert options-trading newsletter editor. Convert tonight's scanned trade ideas into short, plain-English content for a Discord post that a complete beginner can read and act on in under a minute per setup. This is NOT a long-form document -- every field below is going into a compact, colored embed card, so brevity is a hard requirement, not a style preference.
 
-SETUPS, IN CONVICTION ORDER (#1 = highest conviction, #{len(selected)} = lowest of this group -- still genuinely good, only pricing-screened setups reach this list):
-{setups_text}
+## What to produce, per setup
 
-TICKERS THE DETERMINISTIC SCREEN REJECTED (minor context only): {rejected_text}
+1. **role** -- assign each of the five setups exactly one of these five roles, no duplicates: "Best Overall", "Lowest-Move Setup", "Best Balanced Setup", "Flow-Backed Momentum Setup", "Speculative / High-Risk Breakout Setup". If the data doesn't cleanly support one of these for every setup, still assign the closest truthful match -- every setup needs exactly one role and every role is used exactly once.
+2. **risk** -- exactly one of: "Low", "Moderate", "Elevated", "High", "Speculative". Base this on required move size, how far out the option is, and how much conviction the data supports -- not on the role name.
+3. **best_for** -- ONE short sentence: what kind of trader or objective this setup suits.
+4. **why_made_list** -- ONE, at most TWO, SHORT plain-English sentences. This is the single most important field -- combine chart structure + options flow + option pricing/value + catalyst (if any) into one tight, beginner-friendly explanation. NO jargon: never write "IV/RV", "implied volatility", "realized volatility", "call-weighted", "OTM/ATM", "Higher Lows Base", "conviction rank", or similar. Translate instead -- e.g. "the options are priced cheap for how much this stock actually moves" instead of an IV/RV ratio; "big options traders have been buying calls" instead of "call-weighted flow"; "the stock has been climbing steadily" instead of "Higher Lows Base". Do not restate exact dollar flow figures or percentages already implied elsewhere -- keep this readable, not data-dense.
+5. **why_choose** -- ONE short sentence: the single clearest reason to pick this over the other four tonight.
 
-CRITICAL RULE ON DATES: if you mention ANY event/date via search, you MUST state whether it falls BEFORE or AFTER that specific contract's expiry date. An event after expiry is not a direct catalyst for that trade -- omit it or explicitly frame it as pre-positioning context only.
+## Also produce
 
-CRITICAL RULE ON TONE: these ideas already passed a real pricing bar -- do not write as if reconsidering whether they're worth trading. Lead with what supports each idea, not doubt about it, unless something genuinely concerning shows up in search.
+- **market_backdrop**: ONE plain-English sentence citing real $SPY/$QQQ/$IWM levels and moves by number.
+- **top_pick_ticker**: the ticker of whichever setup should be the single best pick tonight (usually, but not required to be, the "Best Overall" role).
+- **top_pick_why**: ONE short sentence on why that's the top pick.
 
-CRITICAL RULE ON LINKS: do NOT include any URLs, website names, or "according to [source]" citations anywhere in your output -- write facts in plain prose without naming or linking sources. Discord auto-generates ugly, unrelated-looking link preview embeds from any URL or domain-like text (e.g. "tikr.com"), so citing a source by name or link breaks the formatting badly.
+## Non-negotiable rules
 
-CRITICAL RULE ON DIRECTION: these setups may be CALLS, PUTS, or a mix -- use direction-neutral language ("positions," "trades," "setups"), never assume "calls."
+- Every ticker mention INSIDE SENTENCE TEXT (market_backdrop, top_pick_why, best_for, why_made_list, why_choose) must be prefixed with "$" (e.g. "$AXTI"), every time.
+- EXCEPTION -- do NOT apply the "$" prefix to the JSON object keys under "setups", or to the value of "top_pick_ticker". Those must be the bare ticker symbol with no "$" and no other punctuation (e.g. the key "AXTI", not "$AXTI"; top_pick_ticker: "AXTI", not "$AXTI"). The "$" prefix rule applies only to prose sentences, never to JSON keys or to top_pick_ticker's value.
+- Do NOT include any URLs, website names, or "according to [source]" citations anywhere -- write facts in plain prose without naming or linking sources.
+- Base every claim only on the source data provided below -- you do not have web search for this task, so do not reference any external event, date, or catalyst you were not explicitly given.
+- These five setups have ALREADY been screened for reasonable option pricing and a clean chart pattern -- do not write as if reconsidering whether they're worth trading.
+- Never say "guaranteed", "easy money", "cannot lose", or similar.
+- Do not invent catalysts, data, or reasoning not in the source data below. If something is missing, write "Not provided".
 
-CRITICAL RULE ON TICKERS: every single time you mention a ticker anywhere in market_theme, risk_notes, digest_thesis, digest_body, or digest_risk, prefix it with a dollar sign -- "$AXTI", "$SPY", "$QQQ", never bare "AXTI" or "SPY". This applies every time, not just first mention.
+## Source data for tonight ({target_date_str})
 
-CRITICAL RULE ON LANGUAGE -- WRITE FOR A COMPLETE BEGINNER, NOT A TRADER:
-The subscriber base has told us the digest is too technical to follow. Do NOT use any of these terms or anything like them: "IV/RV", "IV/RV ratio", "implied volatility", "realized volatility", "volatility discount/premium", "richly/cheaply/fairly priced", "skew", "call-weighted", "OTM/ATM", "conviction rank", "flow intensity", "structural breakout", "hurdle". These are jargon and must be translated into plain everyday language every time, using ideas like:
-- Instead of an IV/RV ratio number, say whether the options are "priced cheap" or "priced expensive" for how much the stock has actually been moving lately -- e.g. "the options here are unusually cheap for how much this stock has been swinging" or "you're paying a bit of a premium for these options right now."
-- Instead of "X% call-weighted" or "OTM/ATM bullish flow", say something like "a lot of money has been flowing into bullish bets" or "traders have been buying calls on this one."
-- Instead of "needs a +X% move by expiry", say "needs to climb about X% in the next N days" (or "fall" for puts).
-- Instead of "consensus target" / "analyst target", say "Wall Street's price target" or "analysts expect it could reach $X."
-- Keep sentences short and conversational, like you're explaining it to a friend who's new to options, not writing a research note. No formulas, no ratios, no numbers-as-jargon (e.g. never write "0.57x" -- describe it in words instead, only using the plain dollar/percent figures a beginner already understands).
+{source_data}
 
-You have TWO separate writing jobs:
+## Output format
 
-JOB 1 -- for the card image (keep these SHORT, as before, same plain-language rules apply, tickers prefixed with $):
-- market_theme: ONE sentence, cites actual SPY/QQQ closing prices and % moves by number, in plain language.
-- risk_notes: ONE short, plain-language sentence on risk for tomorrow.
+Return ONLY valid JSON, nothing else, no markdown code fences, in exactly this shape (ticker keys must match the source data tickers exactly, bare with no "$" prefix -- see the non-negotiable rules above):
 
-JOB 2 -- for the Discord text digest, a SEPARATE, cohesive multi-paragraph write-up covering ALL {len(selected)} setups TOGETHER as one connected piece, NOT independent per-ticker bullets, written entirely in the beginner-friendly language described above:
-- digest_thesis: 2-3 short, simple sentences. DO NOT describe the screening methodology itself (bullish flow, IV/RV pricing, pattern matching) -- that filter is IDENTICAL every single night by construction, so describing it produces near-duplicate text night after night regardless of wording. Instead, identify what's DISTINCTIVE about TONIGHT'S SPECIFIC group in plain terms: is there a real sector concentration (e.g. multiple names in the same industry)? A genuine connecting thread you found via search? Something notable about tonight's actual numbers (an unusually small or big move needed, a standout "cheap options" name)? If nothing genuinely distinctive stands out beyond the standard screen, say that plainly and briefly rather than re-describing the mechanical filter in different words.
-- digest_body: flowing, conversational prose (not a bullet list, not technical) covering ALL {len(selected)} tickers IN THE CONVICTION ORDER GIVEN, every ticker written as "$TICKER". Give more detail/reasoning to the higher-ranked setups (#1 should anchor and lead the paragraph), and group the lower-conviction ones together more briefly toward the end -- but EVERY ticker must be mentioned at least briefly, since this needs to fit in a single Discord message. Prioritize mentioning all {len(selected)} tickers briefly over writing extensively about only the top 2-3 and running out of room. Keep total length tight -- aim for roughly 1-2 short sentences per ticker on average, erring short rather than long. Write like you're texting a friend the highlights, not filing a report.
-- digest_risk: 1-2 short, plain sentences. DO NOT cite "these all share the same expiry so they all face theta/gap risk together" -- ALL setups in this pipeline always share one weekly expiry by construction, so this is true every single night and isn't distinctive information. Instead find a risk SPECIFIC to tonight, explained simply: real sector concentration risk (if multiple names share an industry), a specific real macro event this particular week (use search -- FOMC, CPI, jobs report, a sector-specific data release) that could hit these positions, or something else genuinely tied to tonight's actual context, phrased so a beginner understands why it matters. If truly nothing beyond the generic timing risk applies, say so plainly (e.g. "these are unrelated to each other, so there's no single story that moves them all together") rather than restating the generic mechanic.
-
-Return ONLY valid JSON, nothing else:
 {{
-  "market_theme": "one plain-language sentence, cites real SPY/QQQ numbers by value, tickers as $SPY/$QQQ",
-  "risk_notes": "one short plain-language sentence, brief",
-  "digest_thesis": "2-3 short plain-language sentences, the real shared thread, tickers as $TICKER",
-  "digest_body": "flowing conversational prose covering all tickers in conviction order, tickers as $TICKER",
-  "digest_risk": "1-2 short plain-language sentences, one shared risk, tickers as $TICKER"
+  "market_backdrop": "...",
+  "top_pick_ticker": "TICKER",
+  "top_pick_why": "...",
+  "setups": {{
+    "TICKER1": {{"role": "...", "risk": "...", "best_for": "...", "why_made_list": "...", "why_choose": "..."}},
+    "TICKER2": {{"role": "...", "risk": "...", "best_for": "...", "why_made_list": "...", "why_choose": "..."}},
+    "TICKER3": {{"role": "...", "risk": "...", "best_for": "...", "why_made_list": "...", "why_choose": "..."}},
+    "TICKER4": {{"role": "...", "risk": "...", "best_for": "...", "why_made_list": "...", "why_choose": "..."}},
+    "TICKER5": {{"role": "...", "risk": "...", "best_for": "...", "why_made_list": "...", "why_choose": "..."}}
+  }}
 }}"""
 
-    resp = requests.post(
-        f"{OPENROUTER_BASE}/chat/completions",
-        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-        json={"model": "moonshotai/kimi-k2.6", "max_tokens": 16000, "temperature": 0,
-              "plugins": [{"id": "web"}],
-              "messages": [{"role": "user", "content": prompt}]},
-        timeout=120
-    )
-    raw = resp.json()
-    if "choices" not in raw:
-        print("  [NARRATIVE ERROR] unexpected response (no 'choices' key):")
-        print(f"  {json.dumps(raw, indent=2)[:1000]}")
-        raise ValueError("write_narratives: unexpected API response shape")
-    message = raw["choices"][0]["message"]
-    content = message.get("content")
-    if not content:
-        print("  [NARRATIVE ERROR] empty/None content -- likely an incomplete tool call:")
-        print(f"  {json.dumps(message, indent=2)[:1000]}")
-        raise ValueError("write_narratives: empty content in API response")
-    content = content.strip()
-    content = content.replace("```json", "").replace("```", "").strip()
-    return json.loads(content)
 
+def write_setup_narratives(selected: list, market_context: dict, target_date: datetime) -> dict:
+    source_data = build_narrative_source_data(selected, market_context, target_date)
+    prompt = NARRATIVE_PROMPT_TEMPLATE.format(
+        target_date_str=target_date.strftime('%A, %B %d, %Y'),
+        source_data=source_data,
+    )
+
+    # NOTE (2026-08-10 fix): the web-search plugin was removed from
+    # this call. This task only rephrases data ALREADY supplied in
+    # source_data (flow, pricing, targets) into plain English -- it
+    # doesn't need to research new facts, and the web plugin could
+    # trigger several search round-trips before returning, which was
+    # making this step look "stuck" for minutes at a time.
+    #
+    # REASONING-BUDGET BUGFIX (2026-08-11): confirmed in a real
+    # production run that this call failed with "empty content in API
+    # response" -- the logged message showed content: null alongside a
+    # non-empty `reasoning` field that was cut off MID-SENTENCE ("...I
+    # should avoid exact dollar amounts or percentages in why_m"). Kimi
+    # K2.6 is a reasoning model, and OpenRouter counts reasoning tokens
+    # against the same max_tokens budget as the actual answer by
+    # default -- it spent the ENTIRE 8000-token budget working through
+    # the rules in the prompt and ran out of room before writing a
+    # single character of the actual JSON answer. This wasn't a fluke
+    # of that one run's input; it's a structural risk any time the
+    # model's reasoning happens to run long, since nothing was capping
+    # it.
+    #
+    # FIX, two parts:
+    #   1. `reasoning.max_tokens` explicitly caps how many tokens the
+    #      model can spend thinking before it must move on to the
+    #      actual answer -- this task is a straightforward "rephrase
+    #      already-supplied data into plain JSON" job, not one that
+    #      needs deep reasoning, so a modest cap is appropriate.
+    #   2. Overall max_tokens raised well above the reasoning cap, so
+    #      even a run that uses its full reasoning allowance still has
+    #      generous room left over for the 5-setup JSON response.
+    #   3. If content still comes back empty (belt-and-suspenders), one
+    #      automatic retry with an even tighter reasoning cap runs
+    #      before giving up -- a single bad reasoning-length roll no
+    #      longer crashes the entire nightly run.
+    REASONING_MAX_TOKENS_ATTEMPTS = [3000, 1200]
+    TOTAL_MAX_TOKENS = 16000
+
+    raw = None
+    message = None
+    content = None
+    for attempt, reasoning_cap in enumerate(REASONING_MAX_TOKENS_ATTEMPTS, start=1):
+        print(f"  [NARRATIVE] calling OpenRouter, attempt {attempt}/{len(REASONING_MAX_TOKENS_ATTEMPTS)} "
+              f"(reasoning capped at {reasoning_cap} tokens, {TOTAL_MAX_TOKENS} total budget)...", flush=True)
+        call_started = time.time()
+        # NETWORK-HANG BUGFIX (2026-08-11): confirmed via direct curl
+        # test that OpenRouter itself responds instantly -- the hang
+        # was specifically inside `railway run`'s local proxy/tunnel
+        # layer, which can stall a connection in a way that a single
+        # float `timeout=` doesn't reliably bound (it can behave
+        # inconsistently if the stall happens at connect/handshake
+        # time rather than mid-read). Splitting into an explicit
+        # (connect_timeout, read_timeout) tuple guarantees a hard
+        # failure within connect_timeout seconds if the connection
+        # can't even be established, regardless of what's stalling
+        # underneath requests -- this protects both local `railway
+        # run` testing and the actual deployed Railway service from
+        # hanging forever on a bad network layer.
+        try:
+            resp = requests.post(
+                f"{OPENROUTER_BASE}/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+                json={"model": "moonshotai/kimi-k2.6", "max_tokens": TOTAL_MAX_TOKENS, "temperature": 0,
+                      "reasoning": {"max_tokens": reasoning_cap},
+                      "messages": [{"role": "user", "content": prompt}]},
+                timeout=(10, 120)
+            )
+        except requests.exceptions.RequestException as e:
+            # A connect/read timeout (or any other network failure) is
+            # now caught explicitly instead of crashing the run with
+            # an uncaught traceback -- treated the same as an
+            # empty-content response: log it and fall through to the
+            # retry-with-tighter-cap attempt (or raise cleanly if this
+            # was the last attempt).
+            print(f"  [NARRATIVE WARN] attempt {attempt}: network error after "
+                  f"{time.time() - call_started:.1f}s: {type(e).__name__}: {e}")
+            if attempt < len(REASONING_MAX_TOKENS_ATTEMPTS):
+                print("  [NARRATIVE] retrying with a tighter reasoning cap...", flush=True)
+                continue
+            raise ValueError(f"write_setup_narratives: network error on final attempt: {e}") from e
+        print(f"  [NARRATIVE] response received after {time.time() - call_started:.1f}s", flush=True)
+        raw = resp.json()
+        if "choices" not in raw:
+            print("  [NARRATIVE ERROR] unexpected response (no 'choices' key):")
+            print(f"  {json.dumps(raw, indent=2)[:1000]}")
+            raise ValueError("write_setup_narratives: unexpected API response shape")
+        message = raw["choices"][0]["message"]
+        content = message.get("content")
+        if content:
+            break
+        print(f"  [NARRATIVE WARN] attempt {attempt}: empty/None content -- likely the model used its "
+              f"whole reasoning budget before writing an answer:")
+        print(f"  {json.dumps(message, indent=2)[:1000]}")
+        if attempt < len(REASONING_MAX_TOKENS_ATTEMPTS):
+            print("  [NARRATIVE] retrying with a tighter reasoning cap...", flush=True)
+
+    if not content:
+        raise ValueError("write_setup_narratives: empty content in API response after all retry attempts")
+
+    content = content.strip()
+    content = re.sub(r"^```(?:json)?\s*", "", content)
+    content = re.sub(r"```\s*$", "", content)
+    return json.loads(content.strip())
+
+
+def clean_text_field(text: str, tickers: list) -> str:
+    if not text:
+        return "Not provided"
+    text = strip_urls_and_domains(text)
+    text = ensure_dollar_prefixed_tickers(text, tickers)
+    return text.strip()
+
+
+def build_header_embed(market_backdrop: str, target_date: datetime) -> dict:
+    return {
+        "title": f"TRADE IDEAS \u2014 {target_date.strftime('%A, %B %d').upper()}",
+        "description": f"{market_backdrop}\n\n{HOW_TO_USE_LINE}",
+        "color": COLOR_NEUTRAL,
+    }
+
+
+def build_best_choice_embed(top_pick_ticker: str, top_pick_why: str) -> dict:
+    return {
+        "title": "Best Choice Tonight",
+        "color": COLOR_GOLD,
+        "description": f"**${top_pick_ticker}**\n{top_pick_why}",
+    }
+
+
+def build_setup_embed(c: dict, rank: int, is_top_pick: bool) -> dict:
+    risk = c.get("risk", "Moderate")
+    color = RISK_COLOR_MAP.get(risk, COLOR_NEUTRAL)
+    star = "\u2b50 " if is_top_pick else ""
+    return {
+        "title": f"{star}{rank}. ${c['ticker']} \u2014 {c['next_expiry']} ${c['strike']:g}{c['direction'][0]}",
+        "color": color,
+        "fields": [
+            {"name": "Role", "value": c.get("role", "Not provided"), "inline": True},
+            {"name": "Risk level", "value": risk, "inline": True},
+            {"name": "Best for", "value": c.get("best_for", "Not provided"), "inline": False},
+            {"name": "Why it made the list", "value": c.get("why_made_list", "Not provided"), "inline": False},
+            {"name": "Why choose this over the others", "value": c.get("why_choose", "Not provided"), "inline": False},
+        ],
+    }
+
+
+def build_contract_list_embed(selected: list) -> dict:
+    """
+    Deterministic, code-generated contract list -- not written by the
+    model, so it is guaranteed byte-for-byte accurate to what was
+    actually selected. Same pattern as contract_lines in the
+    production script's format_discord_digest().
+    """
+    lines = "\n".join(f"\u2022 ${c['ticker']} {c['next_expiry']} ${c['strike']:g}{c['direction'][0]}" for c in selected)
+    return {
+        "title": "Tonight's Contracts",
+        "color": COLOR_NEUTRAL,
+        "description": lines,
+        "footer": {"text": "Not financial advice. See card image for entry/stop/target levels."},
+    }
+
+
+def post_embeds_to_discord(embeds: list) -> bool:
+    """
+    Discord allows up to 10 embeds and ~6000 combined characters per
+    message. This payload is header + best-choice + up to 5 setups +
+    contract list = 8 embeds, comfortably under both limits, so it
+    goes out as a single POST.
+    """
+    payload = {"username": SENDER_USERNAME, "embeds": embeds}
+    try:
+        r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=30)
+        print(f"  [DISCORD] embeds post: {r.status_code} ({len(embeds)} embeds)")
+        if r.status_code not in (200, 204):
+            print(f"    body: {r.text[:500]}")
+        return r.status_code in (200, 204)
+    except Exception as e:
+        print(f"  [DISCORD] embeds post FAILED: {e}")
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Card image renderer -- reused from the original plain-text
+# bmt_nightly_setups.py, adapted for this embed-format version.
+# ─────────────────────────────────────────────────────────────────────
 
 import textwrap
 
@@ -736,16 +1004,7 @@ def escape_dollars_for_matplotlib(text: str) -> str:
     return text.replace("$", r"\$") if text else text
 
 
-def compute_rr(entry_low, entry_high, target1, stop) -> float:
-    entry_mid = (entry_low + entry_high) / 2
-    reward = abs(target1 - entry_mid)
-    risk = abs(entry_mid - stop)
-    if risk == 0:
-        return 0.0
-    return round(reward / risk, 1)
-
-
-def render_card(accepted: list, rejected: list, market_theme: str, risk_notes: str,
+def render_card(accepted: list, market_theme: str, risk_notes: str,
                  market_context: dict, target_date: datetime, data_date: datetime, out_path: str):
     BG = "#0a0a0f"
     SURFACE = "#131318"
@@ -926,7 +1185,7 @@ def post_image_to_discord(image_path: str, message: str = ""):
         files = {"file": (os.path.basename(image_path), f, "image/png")}
         data = {"content": message}
         r = requests.post(DISCORD_WEBHOOK, data=data, files=files, timeout=30)
-        print(f"Discord post: {r.status_code}")
+        print(f"Discord image post: {r.status_code}")
         return r.status_code in (200, 204)
 
 
@@ -976,131 +1235,21 @@ def get_last_completed_trading_day() -> datetime:
     return d
 
 
-import re
-
-
 def strip_urls_and_domains(text: str) -> str:
     if not text:
         return text
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"\b[a-zA-Z0-9][a-zA-Z0-9-]*\.(com|net|org|io|ai|co|gov)\b", "", text)
-    text = re.sub(r"\s{2,}", " ", text).strip()
-    text = re.sub(r"\s+([.,;:])", r"\1", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
     return text
 
 
 def ensure_dollar_prefixed_tickers(text: str, tickers: list) -> str:
-    """
-    SIMPLIFIED-DIGEST FIX (2026-08-09): safety net in case the model
-    forgets the "$TICKER" instruction for one or more names. Runs a
-    word-boundary replace for each known ticker in this digest, turning
-    a bare mention into a "$"-prefixed one without double-prefixing
-    ones the model already got right.
-    """
     if not text:
         return text
     for t in sorted(set(tickers), key=len, reverse=True):
         text = re.sub(rf"(?<!\$)\b{re.escape(t)}\b", f"${t}", text)
     return text
-
-
-def truncate_at_word_boundary(text: str, max_len: int) -> str:
-    if not text or len(text) <= max_len:
-        return text
-    truncated = text[:max_len].rsplit(" ", 1)[0]
-    return truncated.rstrip(",.;:") + "..."
-
-
-def truncate_at_sentence_boundary(text: str, max_len: int) -> str:
-    if not text or len(text) <= max_len:
-        return text
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    result = ""
-    for s in sentences:
-        candidate = f"{result} {s}".strip() if result else s
-        if len(candidate) <= max_len:
-            result = candidate
-        else:
-            break
-    if result:
-        return result
-    return truncate_at_word_boundary(text, max_len)
-
-
-def format_discord_digest(accepted, market_context, digest_thesis, digest_body, digest_risk, target_date: datetime):
-    """
-    HEADER FIX (2026-08-04): header previously read "{EXPIRY} POSITIONS
-    — WHAT CONNECTS THESE N TRADES" (e.g. "AUG 14 POSITIONS — WHAT
-    CONNECTS THESE 5 TRADES"), confirmed confusing to subscribers.
-    Replaced with a plain dated header using the actual target trading
-    date these setups are FOR, per direct user request.
-
-    SIMPLIFIED-DIGEST FIX (2026-08-09): every ticker mention (in the
-    thesis/body/risk text AND in the plain "• TICKER EXPIRY $STRIKEC"
-    contract list) is now guaranteed to carry a "$" prefix -- the
-    prompt asks the model to do this, and ensure_dollar_prefixed_tickers()
-    catches anything it misses.
-    """
-    header = f"📋 **TRADE IDEAS — {target_date.strftime('%a, %b %d').upper()}**"
-
-    all_tickers = [c["ticker"] for c in accepted] + list(MARKET_CONTEXT_TICKERS)
-
-    thesis = ensure_dollar_prefixed_tickers(strip_urls_and_domains(digest_thesis.strip()), all_tickers)
-    risk = ensure_dollar_prefixed_tickers(strip_urls_and_domains(digest_risk.strip()), all_tickers)
-    body_raw = ensure_dollar_prefixed_tickers(strip_urls_and_domains(digest_body.strip()), all_tickers)
-
-    contract_lines = "\n".join(f"• ${c['ticker']} {c['next_expiry']} ${c['strike']:g}{c['direction'][0]}" for c in accepted)
-
-    def _build(body_text):
-        return f"""{header}
-
-{thesis}
-
-{body_text}
-
-⚠️ {risk}
-
-_See card for entry/stop/target levels._
-
-{contract_lines}
-"""
-
-    shell_length = len(_build(""))
-    safety_margin = 15
-    available_for_body = max(100, 2000 - shell_length - safety_margin)
-
-    if len(body_raw) > available_for_body:
-        print(f"  [DIGEST TRUNCATION] body is {len(body_raw)} chars, only {available_for_body} available -- trimming")
-        body_final = truncate_at_sentence_boundary(body_raw, available_for_body)
-    else:
-        body_final = body_raw
-
-    post = _build(body_final)
-
-    digest_len = len(post)
-    print(f"  [DIGEST LENGTH] {digest_len} / 2000 characters", end="")
-    if digest_len > 2000:
-        print(f" — [ERROR] STILL exceeds limit by {digest_len - 2000} even after truncation — investigate prompt output")
-    else:
-        print(f" — OK, {2000 - digest_len} chars headroom")
-
-    return post
-
-
-def post_text_to_discord(text_content: str) -> bool:
-    char_count = len(text_content)
-    print(f"  Text digest length: {char_count} characters (Discord limit: 2000)")
-    if char_count > 2000:
-        print(f"  [WARNING] Digest exceeds Discord's 2000-char limit by {char_count - 2000} — this post WILL be rejected.")
-    try:
-        r = requests.post(DISCORD_WEBHOOK, json={"content": text_content}, timeout=30)
-        print(f"Text summary posted: {r.status_code}")
-        if r.status_code not in (200, 204):
-            print(f"  [DISCORD ERROR BODY] {r.text[:500]}")
-        return r.status_code in (200, 204)
-    except Exception as e:
-        print(f"Text summary post FAILED: {e}")
-        return False
 
 
 def main():
@@ -1144,22 +1293,12 @@ def main():
         print("Nothing qualifies tonight — no digest to post.")
         return
 
-    # ── SAME-DAY EARNINGS GATE (2026-08-07 bugfix) ────────────────────
-    # Runs BEFORE any other processing, on every ticker that cleared the
-    # flow filter -- deliberately independent of, and in ADDITION to,
-    # the existing expiry-vs-earnings-date exclusion further down in
-    # this function. See get_earnings_today_and_recent()'s docstring
-    # for the full root-cause explanation ($TEAM, $CLSK both reporting
-    # earnings the same night and still getting published).
     print(f"\nChecking {len(qualifying)} qualifying candidate(s) for same-day/recent earnings...")
-    rejected_summary = []
     still_qualifying = []
     for q in qualifying:
         same_day_er = get_earnings_today_and_recent(q["ticker"])
         if same_day_er:
-            print(f"  [SAME-DAY ER EXCLUDE] {q['ticker']}: reported/reports earnings {same_day_er} — "
-                  f"excluded regardless of flow strength (elevated flow is likely earnings-driven, not a genuine swing setup)")
-            rejected_summary.append(f"{q['ticker']} (earnings {same_day_er} — too recent/same-day, excluded before ranking)")
+            print(f"  [SAME-DAY ER EXCLUDE] {q['ticker']}: reported/reports earnings {same_day_er} — excluded regardless of flow strength")
             continue
         still_qualifying.append(q)
     qualifying = still_qualifying
@@ -1194,10 +1333,6 @@ def main():
             c["pattern"] = pattern["pattern"]
             pattern_matched.append(c)
             print(f"  [PATTERN OK] {c['ticker']}: {pattern['direction']} — {pattern['pattern']}")
-        else:
-            reason = (f"{c['flow']['bias']} flow but no clean structural pattern"
-                      if c["flow"]["bias"] != "Neutral" else "neutral flow, no clear direction")
-            rejected_summary.append(f"{c['ticker']} ({reason})")
 
     IV_RV_HARD_EXCLUDE_RATIO = 2.5
 
@@ -1211,7 +1346,6 @@ def main():
     for c in pattern_matched:
         if c["iv_rv_ratio"] is not None and c["iv_rv_ratio"] > IV_RV_HARD_EXCLUDE_RATIO:
             print(f"  [IV/RV EXCLUDE] {c['ticker']}: IV/RV at {c['iv_rv_ratio']}x — premium too rich to justify entry")
-            rejected_summary.append(f"{c['ticker']} (IV/RV at {c['iv_rv_ratio']}x — premium too rich versus recent realized movement)")
         else:
             still_viable.append(c)
     pattern_matched = still_viable
@@ -1222,8 +1356,11 @@ def main():
             c["flow_intensity"] = c["flow"]["premium"] / c["avg_dollar_vol"]
         else:
             c["flow_intensity"] = 0.0
-            print(f"  [RANK WARN] {c['ticker']}: no volume data — flow intensity set to 0")
-        if c["iv_rv_ratio"] is not None:
+        # Guard against iv_rv_ratio being exactly 0.0 (not None) --
+        # this happens when atm_iv rounds to a very small number
+        # relative to realized_vol and round(..., 2) lands on 0.0.
+        # "is not None" alone lets 0.0 through, and 1.0 / 0.0 crashes.
+        if c["iv_rv_ratio"]:
             pricing_multiplier = max(0.4, 1.0 / c["iv_rv_ratio"])
         else:
             pricing_multiplier = 0.75
@@ -1246,9 +1383,7 @@ def main():
                 cutoff = (datetime.now(ET) + timedelta(days=7)).strftime("%Y-%m-%d")
                 blocks = er_date <= cutoff
             if blocks:
-                src = "yfinance" if er_date == yf_er else "Finnhub"
-                print(f"  [ER EXCLUDE] {c['ticker']}: reports earnings {er_date} (per {src})")
-                rejected_summary.append(f"{c['ticker']} (reports earnings {er_date}, before expiry — excluded as an earnings play)")
+                print(f"  [ER EXCLUDE] {c['ticker']}: reports earnings {er_date}")
                 continue
         selected.append(c)
 
@@ -1279,51 +1414,98 @@ def main():
         c["premium"] = premium
     selected = [c for c in selected if "strike" in c]
 
-    print("\nComputing analyst target + time-pressure context for final selections...")
+    print("\nComputing analyst target + company name + time-pressure context for final selections...")
     for c in selected:
         c["analyst_target"] = get_analyst_target(c["ticker"])
+        c["company_name"] = get_company_name(c["ticker"])
         c["time_pressure"] = build_time_pressure(c)
-        print(f"  {c['ticker']}: {c['time_pressure']['summary']} | {c['analyst_target']}")
-
-    print(f"\nSending {len(selected)} pre-selected setup(s) to Kimi K2.6, in conviction order, for narrative...")
-    narrative_result = write_narratives(selected, rejected_summary, market_context)
-    market_theme = narrative_result.get("market_theme", "")
-    risk_notes = narrative_result.get("risk_notes", "")
-    digest_thesis = narrative_result.get("digest_thesis", "")
-    digest_body = narrative_result.get("digest_body", "")
-    digest_risk = narrative_result.get("digest_risk", "")
-
-    accepted = []
-    for c in selected:
         c["quality_tag"] = build_quality_tag(c.get("pattern", ""))
         c["narrative"] = build_price_narrative(c)
         c["flow_note"] = build_flow_note_display(c["flow"])
-        c["company_name"] = c.get("company_name", "")
-        accepted.append(c)
+        print(f"  {c['ticker']}: {c['time_pressure']['summary']} | {c['analyst_target']}")
 
-    print(f"\n=== MARKET THEME (card) ===\n{market_theme}\n")
-    print(f"=== RISK NOTES (card) ===\n{risk_notes}\n")
-    print(f"=== DIGEST THESIS ===\n{digest_thesis}\n")
-    print(f"=== DIGEST BODY ===\n{digest_body}\n")
-    print(f"=== DIGEST RISK ===\n{digest_risk}\n")
-    print(f"=== SELECTED, CONVICTION ORDER ({len(accepted)}) ===")
-    for i, s in enumerate(accepted):
-        print(f"  #{i+1}: {s['ticker']} {s['direction']} ${s['strike']}")
+    print(f"\nGenerating narrative content for {len(selected)} setup(s) (locked embed format)...")
+    narrative_result = write_setup_narratives(selected, market_context, target_date)
+
+    all_tickers = [c["ticker"] for c in selected] + list(MARKET_CONTEXT_TICKERS)
+    market_backdrop = clean_text_field(narrative_result.get("market_backdrop", ""), all_tickers)
+    top_pick_ticker = narrative_result.get("top_pick_ticker", "").upper().lstrip("$")
+    top_pick_why = clean_text_field(narrative_result.get("top_pick_why", ""), all_tickers)
+
+    # BUGFIX (2026-08-11): normalize "setups" dict keys defensively --
+    # strip any leading "$" and uppercase, regardless of what the
+    # model actually returned. Previously a plain
+    # narrative_result.get("setups", {}) lookup against c["ticker"]
+    # (always bare, e.g. "AXTI") silently missed on every single
+    # ticker whenever the model prefixed its JSON keys with "$" (e.g.
+    # "$AXTI"), because dict.get() with a default doesn't raise -- it
+    # just quietly returned {} for every setup, and every text field
+    # fell through to "Not provided" with risk defaulting to
+    # "Moderate" and roles assigned in flat VALID_ROLES order. The
+    # prompt above now explicitly tells the model not to prefix JSON
+    # keys, but this normalization is a second, independent layer so
+    # a stray future response can't reproduce the same silent failure.
+    raw_setups = narrative_result.get("setups", {})
+    setups_by_ticker = {k.lstrip("$").upper(): v for k, v in raw_setups.items()}
+
+    # Merge model output onto each selected setup, validating role/risk
+    # against the fixed vocab -- fall back to a safe neutral value
+    # rather than letting an unexpected label silently break the color
+    # mapping or leave a field blank.
+    used_roles = set()
+    for c in selected:
+        s = setups_by_ticker.get(c["ticker"].upper(), {})
+        if not s:
+            print(f"  [NARRATIVE WARN] {c['ticker']}: no matching entry in model's 'setups' output "
+                  f"(keys returned: {list(raw_setups.keys())}) -- falling back to defaults for this setup")
+        role = s.get("role", "")
+        if role not in VALID_ROLES or role in used_roles:
+            role = next((r for r in VALID_ROLES if r not in used_roles), "Best Balanced Setup")
+        used_roles.add(role)
+        risk = s.get("risk", "")
+        if risk not in VALID_RISK_LEVELS:
+            risk = "Moderate"
+        c["role"] = role
+        c["risk"] = risk
+        c["best_for"] = clean_text_field(s.get("best_for", ""), all_tickers)
+        c["why_made_list"] = clean_text_field(s.get("why_made_list", ""), all_tickers)
+        c["why_choose"] = clean_text_field(s.get("why_choose", ""), all_tickers)
+        print(f"  {c['ticker']}: {c['role']} | {c['risk']}")
+
+    if top_pick_ticker not in {c["ticker"] for c in selected}:
+        top_pick_ticker = selected[0]["ticker"]
+        top_pick_why = top_pick_why if top_pick_why != "Not provided" else "Top-ranked setup tonight by the model."
+
+    embeds = [
+        build_header_embed(market_backdrop, target_date),
+        build_best_choice_embed(top_pick_ticker, top_pick_why),
+    ]
+    for i, c in enumerate(selected):
+        embeds.append(build_setup_embed(c, rank=i + 1, is_top_pick=(c["ticker"] == top_pick_ticker)))
+    embeds.append(build_contract_list_embed(selected))
+
+    print(f"\n=== EMBEDS PREVIEW ===\n{json.dumps(embeds, indent=2)}\n")
+
+    # Simple market_theme/risk_notes for the card image -- kept short,
+    # separate from the embeds above.
+    spy = market_context.get("SPY", {})
+    qqq = market_context.get("QQQ", {})
+    market_theme = (f"$SPY closed at ${spy.get('price', 'N/A')} ({spy.get('pct', 'N/A')}%) and "
+                     f"$QQQ at ${qqq.get('price', 'N/A')} ({qqq.get('pct', 'N/A')}%).")
+    risk_notes = "See the write-up below for the reasoning, and this image for exact entry/stop/target levels."
 
     out_path = "bmt_nightly_setups.png"
-    render_card(accepted, rejected_summary, market_theme, risk_notes, market_context, target_date, data_date, out_path)
+    render_card(selected, market_theme, risk_notes, market_context, target_date, data_date, out_path)
     print(f"\nCard saved to {out_path}")
 
-    text_digest = format_discord_digest(accepted, market_context, digest_thesis, digest_body, digest_risk, target_date)
-    posted_text = post_text_to_discord(text_digest)
-
     posted_card = post_image_to_discord(out_path, message="")
+    posted_embeds = post_embeds_to_discord(embeds)
 
-    if posted_text and posted_card:
-        print("✓ Text summary + card posted to Discord!")
+    if posted_embeds and posted_card:
+        print("✓ Card + embeds posted to Discord!")
     else:
-        if not posted_text:
-            print("✗ Text summary post FAILED")
+        if not posted_embeds:
+            print("✗ Embeds post FAILED")
         if not posted_card:
             print("✗ Card image post FAILED")
 
@@ -1333,6 +1515,10 @@ run_nightly_job = main
 
 def start_scheduler():
     scheduler = BackgroundScheduler(timezone="America/New_York")
+    # Runs at 6:00pm ET -- this is now the only nightly setups job
+    # (the old separate plain-text prod script has been replaced by
+    # this embed-format version), matching the time subscribers are
+    # already used to seeing posts land.
     scheduler.add_job(run_nightly_job, "cron", hour=18, minute=0, id="nightly_setups", replace_existing=True, max_instances=1)
     scheduler.start()
     print("Scheduler started: nightly setups job fires daily at 6:00pm ET (should_publish_tonight() internally skips weekends/holidays).")
