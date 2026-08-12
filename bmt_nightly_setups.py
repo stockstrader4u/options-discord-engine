@@ -977,6 +977,361 @@ def post_embeds_to_discord(embeds: list) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# PER-SETUP CHART RENDERING (merged into production 2026-08-12)
+# Pattern trendline uses the same swing geometry as is_clean_uptrend()/
+# is_clean_downtrend() above. Trade levels are drawn as plain unlabeled
+# lines -- the numbers live in the "TRADE PLAN" sidebar card instead.
+# Fib is anchored to trade direction and filtered to the visible
+# y-range. Volume/RSI are dedicated subplots with live value readouts.
+# CONFIRMATION checklist is computed from real data, not decorative.
+# ─────────────────────────────────────────────────────────────────────
+
+CHART_BG = "#0d1117"
+CHART_SURFACE = "#161b22"
+CHART_GRID = "#21262d"
+CHART_TEXT_PRIMARY = "#f5f5f7"
+CHART_TEXT_SECONDARY = "#9198a1"
+CHART_BORDER = "#30363d"
+CANDLE_UP = "#22d3ee"
+CANDLE_DOWN = "#f43f5e"
+EMA_FAST_COLOR = "#2dd4bf"
+EMA_SLOW_COLOR = "#fb923c"
+VOL_UP_COLOR = "#3b82f6"
+VOL_DOWN_COLOR = "#ef4444"
+CHART_GREEN = "#34d399"
+CHART_RED = "#f87171"
+CHART_GOLD = "#fbbf24"
+CHART_BLUE = "#60a5fa"
+
+FIB_LEVELS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.236, 1.382, 1.618]
+SETUP_TYPE_LABELS = {
+    ("CALL", "higher lows"): "BULLISH CONTINUATION",
+    ("CALL", "V-recovery"): "BULLISH REVERSAL",
+    ("PUT", "lower highs"): "BEARISH CONTINUATION",
+    ("PUT", "breakdown"): "BEARISH REVERSAL",
+}
+
+
+def get_extended_chart_bars(ticker: str, sessions: int = 90) -> list:
+    try:
+        import yfinance as yf
+        hist = yf.Ticker(ticker).history(period="6mo")
+        if hist.empty:
+            return []
+        hist = hist.tail(sessions)
+        return [{"date": date, "open": row["Open"], "high": row["High"], "low": row["Low"],
+                  "close": row["Close"], "volume": row.get("Volume", 0) or 0}
+                for date, row in hist.iterrows()]
+    except Exception as e:
+        print(f"  [CHART BARS WARN] {ticker}: {e}")
+        return []
+
+
+def compute_ema_series(closes: list, period: int) -> list:
+    if not closes:
+        return []
+    k = 2 / (period + 1)
+    ema = [closes[0]]
+    for price in closes[1:]:
+        ema.append(price * k + ema[-1] * (1 - k))
+    return ema
+
+
+def compute_rsi_series(closes: list, period: int = 14) -> list:
+    if len(closes) < period + 1:
+        return [50.0] * len(closes)
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    rsi = [None] * len(closes)
+    for i in range(period, len(closes)):
+        window = deltas[i - period:i]
+        gains = [d for d in window if d > 0]
+        losses = [-d for d in window if d < 0]
+        avg_gain = sum(gains) / period
+        avg_loss = sum(losses) / period
+        if avg_loss == 0:
+            rsi[i] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi[i] = 100 - (100 / (1 + rs))
+    first_valid = next((v for v in rsi if v is not None), 50.0)
+    return [v if v is not None else first_valid for v in rsi]
+
+
+def compute_chart_fib_levels(bars: list, direction: str) -> list:
+    if not bars:
+        return []
+    highs = [b["high"] for b in bars]
+    lows = [b["low"] for b in bars]
+    hi_val, lo_val = max(highs), min(lows)
+    span = hi_val - lo_val
+    if span <= 0:
+        return []
+    is_call = direction.upper() == "CALL"
+    return [(f, (lo_val + f * span) if is_call else (hi_val - f * span)) for f in FIB_LEVELS]
+
+
+def get_pattern_trendline(c: dict, chart_len: int):
+    bars = c["bars"]
+    window = bars[-10:] if len(bars) >= 10 else bars
+    offset = chart_len - len(window)
+    pattern = c.get("pattern")
+
+    if pattern == "higher lows":
+        lows = [b["low"] for b in window]
+        swing_highs, swing_lows = find_swing_points(window)
+        if len(swing_lows) >= 2:
+            pts = [(offset + i, v) for i, v in swing_lows]
+        else:
+            pts = [(offset, lows[0]), (offset + len(window) - 1, lows[-1])]
+        return pts, CHART_GREEN
+
+    if pattern == "lower highs":
+        highs = [b["high"] for b in window]
+        swing_highs, swing_lows = find_swing_points(window)
+        if len(swing_highs) >= 2:
+            pts = [(offset + i, v) for i, v in swing_highs]
+        else:
+            pts = [(offset, highs[0]), (offset + len(window) - 1, highs[-1])]
+        return pts, CHART_RED
+
+    if pattern == "V-recovery":
+        min_idx = min(range(len(window)), key=lambda i: window[i]["low"])
+        pts = [(offset + min_idx, window[min_idx]["low"]), (offset + len(window) - 1, window[-1]["close"])]
+        return pts, CHART_GREEN
+
+    if pattern == "breakdown":
+        max_idx = max(range(len(window)), key=lambda i: window[i]["high"])
+        pts = [(offset + max_idx, window[max_idx]["high"]), (offset + len(window) - 1, window[-1]["close"])]
+        return pts, CHART_RED
+
+    return [], CHART_TEXT_SECONDARY
+
+
+def compute_rvol(chart_bars: list, lookback: int = 20) -> float:
+    if len(chart_bars) < 2:
+        return 1.0
+    prior = chart_bars[-(lookback + 1):-1] or chart_bars[:-1]
+    avg = sum(b["volume"] for b in prior) / len(prior) if prior else chart_bars[-1]["volume"]
+    return (chart_bars[-1]["volume"] / avg) if avg > 0 else 1.0
+
+
+def compute_reward_risk(c: dict) -> tuple:
+    entry_mid = (c["entry_low"] + c["entry_high"]) / 2
+    is_call = c["direction"].upper() == "CALL"
+    risk = (entry_mid - c["stop"]) if is_call else (c["stop"] - entry_mid)
+    if risk <= 0:
+        return None, None
+    reward1 = (c["target1"] - entry_mid) if is_call else (entry_mid - c["target1"])
+    reward2 = (c["target2"] - entry_mid) if is_call else (entry_mid - c["target2"])
+    return round(reward1 / risk, 1), round(reward2 / risk, 1)
+
+
+def build_setup_type_label(direction: str, pattern: str) -> str:
+    label = SETUP_TYPE_LABELS.get((direction.upper(), pattern))
+    if label:
+        return label
+    return "BULLISH SETUP" if direction.upper() == "CALL" else "BEARISH SETUP"
+
+
+def render_setup_chart(c: dict, out_path: str):
+    chart_bars = c.get("chart_bars") or c["bars"]
+    n = len(chart_bars)
+    is_call = c["direction"].upper() == "CALL"
+    closes = [b["close"] for b in chart_bars]
+    xs = list(range(n))
+
+    fig = plt.figure(figsize=(15, 8.5), dpi=170, facecolor=CHART_BG)
+    outer = fig.add_gridspec(1, 2, width_ratios=[3.3, 1], wspace=0.03,
+                              left=0.045, right=0.98, top=0.85, bottom=0.07)
+    left_gs = outer[0, 0].subgridspec(3, 1, height_ratios=[3.2, 0.85, 1.0], hspace=0.10)
+    ax = fig.add_subplot(left_gs[0])
+    vol_ax = fig.add_subplot(left_gs[1], sharex=ax)
+    rsi_ax = fig.add_subplot(left_gs[2], sharex=ax)
+    side_ax = fig.add_subplot(outer[0, 1])
+    side_ax.axis("off")
+
+    for a in (ax, vol_ax, rsi_ax):
+        a.set_facecolor(CHART_BG)
+        for spine in a.spines.values():
+            spine.set_color(CHART_BORDER)
+            spine.set_linewidth(0.6)
+        a.tick_params(colors=CHART_TEXT_SECONDARY, labelsize=8, length=0)
+        a.grid(color=CHART_GRID, linewidth=0.4, alpha=0.5)
+
+    right_edge = n + 3.0
+
+    ema5 = compute_ema_series(closes, 5)
+    ema12 = compute_ema_series(closes, 12)
+    ax.plot(xs, ema5, color=EMA_FAST_COLOR, linewidth=1.3, zorder=3)
+    ax.plot(xs, ema12, color=EMA_SLOW_COLOR, linewidth=1.3, zorder=3)
+    ax.plot([0.012, 0.032], [0.965, 0.965], transform=ax.transAxes, color=EMA_FAST_COLOR, linewidth=2.5, solid_capstyle="round")
+    ax.text(0.038, 0.965, f"EMA 5   {ema5[-1]:,.2f}", transform=ax.transAxes, color=CHART_TEXT_PRIMARY,
+            fontsize=8.5, va="center", ha="left")
+    ax.plot([0.012, 0.032], [0.915, 0.915], transform=ax.transAxes, color=EMA_SLOW_COLOR, linewidth=2.5, solid_capstyle="round")
+    ax.text(0.038, 0.915, f"EMA 12  {ema12[-1]:,.2f}", transform=ax.transAxes, color=CHART_TEXT_PRIMARY,
+            fontsize=8.5, va="center", ha="left")
+
+    for i, b in enumerate(chart_bars):
+        color = CANDLE_UP if b["close"] >= b["open"] else CANDLE_DOWN
+        ax.plot([i, i], [b["low"], b["high"]], color=color, linewidth=1, zorder=4)
+        body_low, body_high = sorted([b["open"], b["close"]])
+        ax.add_patch(plt.Rectangle((i - 0.3, body_low), 0.6, max(body_high - body_low, 0.01),
+                                    facecolor=color, edgecolor=color, zorder=5))
+
+    pts, trend_color = get_pattern_trendline(c, n)
+    if len(pts) >= 2:
+        xs_t = [p[0] for p in pts]
+        ys_t = [p[1] for p in pts]
+        ax.plot(xs_t, ys_t, color=trend_color, linewidth=1.8, marker="o", markersize=4, zorder=7)
+
+    ax.axhspan(c["entry_low"], c["entry_high"], color=CHART_BLUE, alpha=0.18, zorder=1)
+    ax.axhline(c["stop"], color=CHART_RED, linestyle="--", linewidth=1.3, zorder=3)
+    ax.axhline(c["target1"], color=CHART_GREEN, linestyle="--", linewidth=1.3, zorder=3)
+    ax.axhline(c["target2"], color=CHART_GREEN, linestyle=":", linewidth=1.3, zorder=3)
+
+    all_vals = [b["low"] for b in chart_bars] + [b["high"] for b in chart_bars] + [c["stop"], c["target1"], c["target2"]]
+    pad = (max(all_vals) - min(all_vals)) * 0.06
+    y_min, y_max = min(all_vals) - pad, max(all_vals) + pad
+    ax.set_ylim(y_min, y_max)
+    ax.set_xlim(-1, right_edge)
+    ax.tick_params(labelbottom=False)
+
+    fib_levels = compute_chart_fib_levels(chart_bars, c["direction"])
+    visible_fib = [(f, price) for f, price in fib_levels if y_min <= price <= y_max]
+    for f, price in visible_fib:
+        ax.plot([0, n - 1], [price, price], color=CHART_TEXT_SECONDARY, linewidth=0.6, alpha=0.4, zorder=3, clip_on=True)
+        ax.text(n + 0.3, price, f"{f:.3f}", color=CHART_TEXT_SECONDARY, fontsize=7,
+                va="center", zorder=6, alpha=0.85, clip_on=True)
+
+    vols = [b["volume"] for b in chart_bars]
+    for i, b in enumerate(chart_bars):
+        color = VOL_UP_COLOR if b["close"] >= b["open"] else VOL_DOWN_COLOR
+        vol_ax.bar(i, b["volume"], color=color, width=0.7, alpha=0.85, zorder=3)
+    latest_vol = vols[-1] if vols else 0
+    vol_str = f"{latest_vol / 1_000_000:.2f}M" if latest_vol >= 1_000_000 else f"{latest_vol / 1_000:.0f}K"
+    vol_ax.text(0.01, 0.88, "Volume  ", transform=vol_ax.transAxes, color=CHART_TEXT_SECONDARY, fontsize=8.5, va="top")
+    vol_ax.text(0.01 + 0.058, 0.88, vol_str, transform=vol_ax.transAxes, color=VOL_UP_COLOR, fontsize=8.5,
+                fontweight="bold", va="top")
+    vol_ax.set_xlim(-1, right_edge)
+    vol_ax.tick_params(labelbottom=False)
+
+    rsi = compute_rsi_series(closes, 14)
+    rsi_ax.plot(xs, rsi, color="#c084fc", linewidth=1.1, zorder=3)
+    rsi_ax.axhspan(30, 70, color="#c084fc", alpha=0.06, zorder=1)
+    rsi_ax.axhline(70, color=CHART_TEXT_SECONDARY, linewidth=0.5, linestyle="--", alpha=0.5, zorder=2)
+    rsi_ax.axhline(30, color=CHART_TEXT_SECONDARY, linewidth=0.5, linestyle="--", alpha=0.5, zorder=2)
+    rsi_ax.text(0.01, 0.90, "RSI (14)  ", transform=rsi_ax.transAxes, color=CHART_TEXT_SECONDARY, fontsize=8.5, va="top")
+    rsi_ax.text(0.01 + 0.11, 0.90, f"{rsi[-1]:.2f}", transform=rsi_ax.transAxes, color="#c084fc",
+                fontsize=8.5, fontweight="bold", va="top")
+    rsi_ax.set_ylim(0, 100)
+    rsi_ax.set_xlim(-1, right_edge)
+
+    date_labels = [b["date"].strftime("%b %d") for b in chart_bars]
+    step = max(1, n // 8)
+    tick_idx = list(range(0, n, step))
+    rsi_ax.set_xticks(tick_idx)
+    rsi_ax.set_xticklabels([date_labels[i] for i in tick_idx], rotation=0)
+
+    card = FancyBboxPatch((0.02, 0.0), 0.96, 1.0, transform=side_ax.transAxes,
+                           boxstyle="round,pad=0.01,rounding_size=0.02",
+                           facecolor=CHART_SURFACE, edgecolor=CHART_BORDER, linewidth=1.0, clip_on=False)
+    side_ax.add_patch(card)
+    side_ax.text(0.12, 0.955, "TRADE PLAN", transform=side_ax.transAxes, color=CHART_TEXT_PRIMARY,
+                 fontsize=13, fontweight="bold", va="top")
+    side_ax.plot([0.10, 0.90], [0.915, 0.915], transform=side_ax.transAxes, color=CHART_BORDER, linewidth=0.8)
+
+    rr1, rr2 = compute_reward_risk(c)
+    rr_str = f"{rr1:.1f} / {rr2:.1f}" if rr1 is not None else "N/A"
+    rows = [
+        ("ENTRY", f"${c['entry_low']:,.2f}\u2013${c['entry_high']:,.2f}", CHART_BLUE),
+        ("STOP", f"${c['stop']:,.2f}", CHART_RED),
+        ("TARGET 1", f"${c['target1']:,.2f}", CHART_GREEN),
+        ("TARGET 2", f"${c['target2']:,.2f}", CHART_GREEN),
+        ("R:R", rr_str, CHART_TEXT_PRIMARY),
+    ]
+    row_y = 0.86
+    for label, value, color in rows:
+        side_ax.text(0.12, row_y, label, transform=side_ax.transAxes, color=color,
+                     fontsize=9.5, fontweight="bold", va="center")
+        side_ax.text(0.90, row_y, value, transform=side_ax.transAxes, color=CHART_TEXT_PRIMARY,
+                     fontsize=10.5, fontweight="bold", va="center", ha="right")
+        row_y -= 0.105
+
+    side_ax.plot([0.10, 0.90], [row_y + 0.02, row_y + 0.02], transform=side_ax.transAxes, color=CHART_BORDER, linewidth=0.8)
+    row_y -= 0.05
+    side_ax.text(0.12, row_y, "CONFIRMATION", transform=side_ax.transAxes, color=CHART_TEXT_PRIMARY,
+                 fontsize=10.5, fontweight="bold", va="top")
+    row_y -= 0.06
+
+    rvol = compute_rvol(chart_bars)
+    rsi_now = rsi[-1]
+    latest_close = closes[-1]
+    if c["entry_low"] <= latest_close <= c["entry_high"]:
+        entry_bullet = f"Price within entry zone (${latest_close:,.2f})"
+    elif latest_close > c["entry_high"]:
+        entry_bullet = f"Price above entry zone (${latest_close:,.2f}) \u2014 wait for a pullback"
+    else:
+        entry_bullet = f"Price below entry zone (${latest_close:,.2f}) \u2014 wait for confirmation"
+    bullets = [
+        entry_bullet,
+        f"RVOL {'expansion' if rvol >= 1.2 else 'below average'} ({rvol:.1f}x)",
+        f"RSI {'above' if rsi_now >= 50 else 'below'} 50 ({rsi_now:.0f})",
+    ]
+    for bullet in bullets:
+        side_ax.text(0.13, row_y, "\u2022", transform=side_ax.transAxes, color=CHART_TEXT_SECONDARY, fontsize=9, va="top")
+        side_ax.text(0.18, row_y, bullet, transform=side_ax.transAxes, color=CHART_TEXT_SECONDARY,
+                     fontsize=9, va="top", wrap=True)
+        row_y -= 0.07
+
+    arrow = "\u25b2" if is_call else "\u25bc"
+    quality_tag = build_quality_tag(c.get("pattern", ""))
+    setup_type = build_setup_type_label(c["direction"], c.get("pattern", ""))
+    dir_color = CHART_GREEN if is_call else CHART_RED
+
+    fig.text(0.045, 0.975, f"${c['ticker']}", fontsize=20, fontweight="bold", color=CHART_TEXT_PRIMARY,
+              ha="left", va="top", family="sans-serif")
+    fig.text(0.16, 0.975, f" {setup_type} ", fontsize=11, fontweight="bold", color=dir_color,
+              ha="left", va="top",
+              bbox=dict(facecolor="none", edgecolor=dir_color, alpha=0.95, pad=5, linewidth=1.3,
+                        boxstyle="round,pad=0.35"))
+    fig.text(0.40, 0.975, f" {arrow} {c['direction']} ${c['strike']:g}  \u00b7  {c['next_expiry'].upper()} ",
+              fontsize=11, fontweight="bold", color="#0d1117", ha="left", va="top",
+              bbox=dict(facecolor=dir_color, edgecolor="none", alpha=1.0, pad=5, boxstyle="round,pad=0.35"))
+
+    rvol_str = f"{rvol:.1f}x"
+    stats_line = f"Close ${c.get('current_price', closes[-1]):,.2f}   |   RVOL {rvol_str}   |   RSI {rsi_now:.0f}   |   {quality_tag}"
+    fig.text(0.045, 0.925, stats_line, fontsize=10, color=CHART_TEXT_SECONDARY, ha="left", va="top")
+
+    plt.savefig(out_path, facecolor=CHART_BG, bbox_inches="tight", pad_inches=0.25)
+    plt.close(fig)
+
+
+def post_setup_with_chart(setup_embed: dict, chart_path: str, ticker: str, risk: str) -> bool:
+    """One Discord message per setup: the fields embed immediately
+    followed, in the SAME message, by an embed whose image is the
+    attached chart PNG -- this is what makes the chart render directly
+    under its own card instead of as a separately-ordered post."""
+    color = RISK_COLOR_MAP.get(risk, COLOR_NEUTRAL)
+    filename = os.path.basename(chart_path)
+    chart_embed = {"title": f"${ticker} \u2014 Chart", "color": color,
+                    "image": {"url": f"attachment://{filename}"}}
+    payload = {"username": SENDER_USERNAME, "embeds": [setup_embed, chart_embed]}
+    try:
+        with open(chart_path, "rb") as f:
+            files = {"file": (filename, f, "image/png")}
+            data = {"payload_json": json.dumps(payload)}
+            r = requests.post(DISCORD_WEBHOOK, data=data, files=files, timeout=30)
+            print(f"  [DISCORD] ${ticker} setup+chart posted: {r.status_code}")
+            if r.status_code not in (200, 204):
+                print(f"    body: {r.text[:500]}")
+            return r.status_code in (200, 204)
+    except Exception as e:
+        print(f"  [DISCORD] ${ticker} setup+chart post FAILED: {e}")
+        return False
+
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Card image renderer -- reused from the original plain-text
 # bmt_nightly_setups.py, adapted for this embed-format version.
 # ─────────────────────────────────────────────────────────────────────
@@ -1476,38 +1831,54 @@ def main():
         top_pick_ticker = selected[0]["ticker"]
         top_pick_why = top_pick_why if top_pick_why != "Not provided" else "Top-ranked setup tonight by the model."
 
-    embeds = [
-        build_header_embed(market_backdrop, target_date),
-        build_best_choice_embed(top_pick_ticker, top_pick_why),
-    ]
+    print(f"\nRendering {len(selected)} chart(s)...")
+    for c in selected:
+        c["chart_bars"] = get_extended_chart_bars(c["ticker"])
+        chart_path = f"chart_{c['ticker']}.png"
+        render_setup_chart(c, chart_path)
+        c["_chart_path"] = chart_path
+        print(f"  {c['ticker']}: chart saved to {chart_path}")
+
+    print("\nPosting header + best-choice embeds...")
+    header_embed = build_header_embed(market_backdrop, target_date)
+    best_choice_embed = build_best_choice_embed(top_pick_ticker, top_pick_why)
+    posted_header = post_embeds_to_discord([header_embed, best_choice_embed])
+
+    print("Posting each setup, immediately followed by its own chart...")
+    posted_all_setups = True
     for i, c in enumerate(selected):
-        embeds.append(build_setup_embed(c, rank=i + 1, is_top_pick=(c["ticker"] == top_pick_ticker)))
-    embeds.append(build_contract_list_embed(selected))
+        setup_embed = build_setup_embed(c, rank=i + 1, is_top_pick=(c["ticker"] == top_pick_ticker))
+        ok = post_setup_with_chart(setup_embed, c["_chart_path"], c["ticker"], c["risk"])
+        posted_all_setups = posted_all_setups and ok
 
-    print(f"\n=== EMBEDS PREVIEW ===\n{json.dumps(embeds, indent=2)}\n")
+    print("Posting contract list...")
+    contract_embed = build_contract_list_embed(selected)
+    posted_contract = post_embeds_to_discord([contract_embed])
 
-    # Simple market_theme/risk_notes for the card image -- kept short,
-    # separate from the embeds above.
+    # Summary overview card image -- unchanged, still posted at the end.
     spy = market_context.get("SPY", {})
     qqq = market_context.get("QQQ", {})
     market_theme = (f"$SPY closed at ${spy.get('price', 'N/A')} ({spy.get('pct', 'N/A')}%) and "
                      f"$QQQ at ${qqq.get('price', 'N/A')} ({qqq.get('pct', 'N/A')}%).")
-    risk_notes = "See the write-up below for the reasoning, and this image for exact entry/stop/target levels."
+    risk_notes = "See the write-up above for the reasoning, and each chart for exact entry/stop/target levels."
 
     out_path = "bmt_nightly_setups.png"
     render_card(selected, market_theme, risk_notes, market_context, target_date, data_date, out_path)
-    print(f"\nCard saved to {out_path}")
+    print(f"\nSummary card saved to {out_path}")
 
     posted_card = post_image_to_discord(out_path, message="")
-    posted_embeds = post_embeds_to_discord(embeds)
 
-    if posted_embeds and posted_card:
-        print("✓ Card + embeds posted to Discord!")
+    if posted_header and posted_all_setups and posted_contract and posted_card:
+        print("✓ Header, all setups+charts, contract list, and summary card posted to Discord!")
     else:
-        if not posted_embeds:
-            print("✗ Embeds post FAILED")
+        if not posted_header:
+            print("✗ Header/best-choice post FAILED")
+        if not posted_all_setups:
+            print("✗ One or more setup+chart posts FAILED")
+        if not posted_contract:
+            print("✗ Contract list post FAILED")
         if not posted_card:
-            print("✗ Card image post FAILED")
+            print("✗ Summary card image post FAILED")
 
 
 run_nightly_job = main
