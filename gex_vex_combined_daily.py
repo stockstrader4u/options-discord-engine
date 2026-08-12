@@ -26,6 +26,23 @@ UNCHANGED -- they still live in gex_vex.py and are called exactly as
 before. This file only handles the ORCHESTRATION: which pipeline runs
 first, shared webhook/pacing, and the single combined cron entry point.
 
+DAY-OVER-DAY COMPARISON ADDED (2026-08-12): each run now also saves
+today's key numbers (spot, call/put wall, max +/-GEX strike, net GEX,
+gamma flip) to Postgres via gex_vex_history.py, fetches yesterday's
+snapshot for the same ticker, and appends a "Since Yesterday" field to
+each embed -- but ONLY when something moved meaningfully (a wall
+shift, a gamma-flip level shift, or -- always, regardless of
+magnitude -- a regime flip). A day where nothing meaningfully changed
+simply gets no "Since Yesterday" field at all, rather than a line
+saying "no change," so the section stays worth reading rather than
+becoming daily noise subscribers learn to skip. gex_vex.py itself is
+UNCHANGED -- the comparison field is appended to the embed dict AFTER
+gex_vex.build_gex_embed()/build_single_ticker_embed() return it, not
+by modifying those builders. If Postgres (DATABASE_URL) isn't
+reachable, the comparison layer degrades silently -- today's numbers
+still compute and post exactly as before, just without the extra
+field, since a DB hiccup must never take down the actual GEX/VEX post.
+
 Required env vars (set on Railway, not locally):
   ALPACA_API_KEY_ID
   ALPACA_API_SECRET_KEY
@@ -37,6 +54,10 @@ Required env vars (set on Railway, not locally):
                               used, so no Railway variable rename is
                               needed for the SPY/QQQ/IWM half of this
                               -- only the Mag 7 half is new.)
+  DATABASE_URL              (Postgres connection string, for the
+                              day-over-day comparison layer. Needs a
+                              Postgres plugin attached to this Railway
+                              service if not already present.)
 
 PRODUCTION HARDENING:
   - Mag 7 and SPY/QQQ/IWM are independent failure domains: if the
@@ -90,6 +111,15 @@ except Exception as e:
     log("uploaded incorrectly (e.g. duplicated content, truncated file).")
     log("Check the file directly before assuming this is a data/API issue.")
     raise
+
+try:
+    import gex_vex_history
+    HISTORY_AVAILABLE = True
+except Exception as e:
+    log(f"WARNING: failed to import gex_vex_history.py — {type(e).__name__}: {e}. "
+        f"Day-over-day 'Since Yesterday' comparisons will be unavailable this run, "
+        f"but today's GEX/VEX numbers will still compute and post normally.")
+    HISTORY_AVAILABLE = False
 
 WEBHOOK_URL = os.environ.get("GEX_DISCORD_WEBHOOK", "")
 
@@ -154,12 +184,17 @@ def get_week_label(today: date = None) -> str:
     return f"Week of {monday.strftime('%b %d')} - {friday.strftime('%b %d, %Y')}"
 
 
-def build_single_ticker_embed(r: dict, week_label: str, watch_line: str) -> dict:
+def build_single_ticker_embed(r: dict, week_label: str, watch_line: str, since_yesterday: str = "") -> dict:
     """Single-ticker equivalent of gex_vex.build_gex_embed(), scoped to
     one ticker's Regime / Key Levels / Expected Move / What To Watch
     fields for the Mag 7 posts. Identical to the version originally
     built in gex_vex_mag7_daily.py -- kept here since that standalone
-    script is being replaced by this combined one."""
+    script is being replaced by this combined one.
+
+    `since_yesterday`: optional pre-built comparison line (see
+    gex_vex_history.build_since_yesterday_line()) -- appended as its
+    own field when non-empty, omitted entirely when there's nothing
+    meaningful to report (see that module's docstring for why)."""
     if "error" in r:
         return {
             "title": f"\u26A0\uFE0F {r.get('ticker', '?')} GEX/VEX \u2014 {week_label}",
@@ -175,23 +210,6 @@ def build_single_ticker_embed(r: dict, week_label: str, watch_line: str) -> dict
     dot = "\U0001F534" if is_short else "\U0001F7E2"
 
     em = r.get("expected_move") or {}
-    # BUGFIX (2026-08-08): the Key Levels field required BOTH put_wall
-    # AND call_wall to be present ("and" condition) before showing
-    # EITHER one -- confirmed in production: AAPL had a real, valid
-    # call wall ($310, correctly shown in the rendered card image) but
-    # its put wall legitimately came back None (correctly excluded by
-    # the new minimum-significance wall-selection fix), and this "and"
-    # condition threw away the perfectly good call wall data along
-    # with the missing put wall, showing a bare "N/A" for the whole
-    # field. This happened on EVERY Mag 7 ticker in the run that
-    # exposed it, since the same threshold fix made missing walls much
-    # more common (correctly) than before. Fixed by formatting each
-    # side independently, matching the same fix already applied to
-    # gex_vex.py's build_gex_embed() for the SPY/QQQ/IWM dashboard.
-    # STRIKE-DISPLAY PRECISION FIX (2026-08-10): uses
-    # gex_vex.format_strike() instead of a bare ":,.0f" -- see module
-    # docstring for the full diagnosis (NVDA's put wall showing $212
-    # while its percentage was computed from the real $212.50).
     put_str = gex_vex.format_strike(r.get("put_wall"))
     call_str = gex_vex.format_strike(r.get("call_wall"))
     fields = [
@@ -205,6 +223,8 @@ def build_single_ticker_embed(r: dict, week_label: str, watch_line: str) -> dict
     ]
     if watch_line:
         fields.append({"name": "\U0001F440 What To Watch \u2014 Action", "value": watch_line, "inline": False})
+    if since_yesterday:
+        fields.append({"name": "\U0001F4C5 Since Yesterday", "value": since_yesterday, "inline": False})
 
     return {
         "title": f"\U0001F4CA {ticker} GEX/VEX \u2014 {week_label}",
@@ -215,7 +235,7 @@ def build_single_ticker_embed(r: dict, week_label: str, watch_line: str) -> dict
 
 
 # ── Half 1: Mag 7 individual cards ──────────────────────────────────────
-def run_mag7_section(week_label: str) -> int:
+def run_mag7_section(week_label: str, today_date: date) -> int:
     """
     Returns the number of Mag 7 tickers successfully posted (0-7).
     Isolated in its own function/try-boundary so a failure here can
@@ -249,17 +269,21 @@ def run_mag7_section(week_label: str) -> int:
     valid_results = [r for r in results if "error" not in r]
     watch_lines_by_ticker = {}
     for r in valid_results:
-        # NOTE (2026-08-10): this is a single-element list on purpose
-        # (one ticker at a time) -- generate_gex_watch_lines() and
-        # build_watch_lines_fallback() were fixed this same date to
-        # require more than one ticker before using the plural,
-        # multi-ticker consolidated-paragraph template, specifically
-        # because THIS call site was feeding it single-ticker batches
-        # and getting plural "could all... their" text back for one
-        # ticker. See gex_vex.py's module docstring for the full
-        # production incident (GOOGL/AMZN) this fixes.
         lines = gex_vex.generate_gex_watch_lines([r])
         watch_lines_by_ticker[r["ticker"]] = lines.get(r["ticker"], "")
+
+    # Day-over-day comparison: save today's snapshot + fetch yesterday's
+    # for each ticker, building a "Since Yesterday" line where something
+    # meaningful actually changed. Wrapped defensively per-ticker so a
+    # single DB hiccup on one ticker can't affect the other six.
+    since_yesterday_by_ticker = {}
+    if HISTORY_AVAILABLE:
+        for r in valid_results:
+            try:
+                since_yesterday_by_ticker[r["ticker"]] = gex_vex_history.save_and_compare(r, today_date)
+            except Exception as e:
+                log(f"{r['ticker']}: Since Yesterday comparison failed: {type(e).__name__}: {e} -- omitting for this ticker.")
+                since_yesterday_by_ticker[r["ticker"]] = ""
 
     intro = (
         f"\U0001F4CA **MAG 7 GEX SNAPSHOT \u2014 {week_label}**\n"
@@ -275,8 +299,9 @@ def run_mag7_section(week_label: str) -> int:
     for r in results:
         ticker = r.get("ticker", "?")
         watch_line = watch_lines_by_ticker.get(ticker, "")
+        since_yesterday = since_yesterday_by_ticker.get(ticker, "")
 
-        embed = build_single_ticker_embed(r, week_label, watch_line)
+        embed = build_single_ticker_embed(r, week_label, watch_line, since_yesterday)
         embed_ok = post_embed_to_discord(embed)
         time.sleep(POST_PACE_SECONDS)
 
@@ -298,7 +323,7 @@ def run_mag7_section(week_label: str) -> int:
 
 
 # ── Half 2: SPY/QQQ/IWM 3-across dashboard ──────────────────────────────
-def run_core_section(week_label: str) -> bool:
+def run_core_section(week_label: str, today_date: date) -> bool:
     """
     Returns True if the SPY/QQQ/IWM dashboard posted successfully.
     Identical logic to the original gex_vex_daily.py -- isolated in its
@@ -339,6 +364,31 @@ def run_core_section(week_label: str) -> bool:
     gex_vex.render_gex_dashboard_card(results, week_label, out_path)
 
     embed = gex_vex.build_gex_embed(results, week_label, watch_lines)
+
+    # Day-over-day comparison, same as the Mag 7 section: save + fetch
+    # per ticker, then append ONE combined "Since Yesterday" field
+    # covering all three (rather than three separate fields) to keep
+    # this embed's layout consistent with how it already groups
+    # Regime/Key Levels/Expected Move across all three tickers.
+    if HISTORY_AVAILABLE:
+        since_yesterday_lines = []
+        for r in results:
+            if "error" in r:
+                continue
+            try:
+                line = gex_vex_history.save_and_compare(r, today_date)
+            except Exception as e:
+                log(f"{r['ticker']}: Since Yesterday comparison failed: {type(e).__name__}: {e} -- omitting for this ticker.")
+                line = ""
+            if line:
+                since_yesterday_lines.append(f"**{r['ticker']}**: {line}")
+        if since_yesterday_lines:
+            embed.setdefault("fields", []).append({
+                "name": "\U0001F4C5 Since Yesterday",
+                "value": "\n".join(since_yesterday_lines),
+                "inline": False,
+            })
+
     embed_ok = post_embed_to_discord(embed)
     time.sleep(POST_PACE_SECONDS)
 
@@ -360,6 +410,10 @@ def main():
         sys.exit(1)
 
     week_label = get_week_label()
+    today_date = et_now.date()
+
+    if HISTORY_AVAILABLE:
+        gex_vex_history.ensure_table()
 
     # STRICT SEQUENCE, per direct user request: Mag 7 posts completely
     # (intro + all 7 tickers) BEFORE the SPY/QQQ/IWM section begins.
@@ -367,14 +421,14 @@ def main():
     # prevent the other from running.
     mag7_posted_count = 0
     try:
-        mag7_posted_count = run_mag7_section(week_label)
+        mag7_posted_count = run_mag7_section(week_label, today_date)
     except Exception as e:
         log(f"Mag 7 section raised an unexpected exception: {type(e).__name__}: {e} — "
             f"continuing to the SPY/QQQ/IWM section regardless.")
 
     core_posted = False
     try:
-        core_posted = run_core_section(week_label)
+        core_posted = run_core_section(week_label, today_date)
     except Exception as e:
         log(f"SPY/QQQ/IWM section raised an unexpected exception: {type(e).__name__}: {e}")
 
