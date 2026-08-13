@@ -330,6 +330,62 @@ def build_since_yesterday_line(ticker: str, today: dict, yesterday: dict) -> str
     return "Nothing meaningfully changed since yesterday \u2014 the same levels and setup still apply."
 
 
+def get_comparison_summary(r: dict, today_date: date) -> dict:
+    """
+    NEW (2026-08-13), purely additive -- does not modify save_and_compare(),
+    build_since_yesterday_line(), save_snapshot(), or get_previous_snapshot()
+    in any way, just calls them.
+
+    WHY THIS EXISTS: the unified single-card GEX/VEX dashboard needs BOTH
+    a compact, glanceable delta (a small "vs yesterday" % and a flip icon
+    drawn directly on the card) AND the full plain-English paragraph (for
+    the "Today's Focus" panel, only when something is actually notable)
+    -- without duplicating the flip-detection/threshold logic that
+    already lives in build_since_yesterday_line(). This is READ-ONLY (it
+    does not call save_snapshot() itself -- the caller is expected to
+    save the snapshot separately, same as before).
+
+    Returns:
+      {
+        "has_comparison": bool,               # False if no prior snapshot exists yet
+        "spot_change_pct": float | None,
+        "regime_flipped": bool,
+        "flip_direction": "to_long" | "to_short" | None,
+        "plain_text": str,                    # same paragraph build_since_yesterday_line() returns
+      }
+    """
+    ticker = r["ticker"]
+    yesterday = get_previous_snapshot(ticker, today_date)
+    if not yesterday:
+        return {"has_comparison": False, "spot_change_pct": None, "regime_flipped": False,
+                "flip_direction": None, "plain_text": ""}
+
+    spot_today = r.get("spot")
+    spot_yday = yesterday.get("spot")
+    spot_change_pct = None
+    if spot_today is not None and spot_yday:
+        spot_change_pct = (spot_today - spot_yday) / spot_yday * 100
+
+    regime_flipped = False
+    flip_direction = None
+    net_gex_today = r.get("net_gex")
+    net_gex_yday = yesterday.get("net_gex")
+    if net_gex_today is not None and net_gex_yday is not None:
+        was_long = net_gex_yday >= 0
+        is_long = net_gex_today >= 0
+        if was_long != is_long:
+            regime_flipped = True
+            flip_direction = "to_long" if is_long else "to_short"
+
+    return {
+        "has_comparison": True,
+        "spot_change_pct": spot_change_pct,
+        "regime_flipped": regime_flipped,
+        "flip_direction": flip_direction,
+        "plain_text": build_since_yesterday_line(ticker, r, yesterday),
+    }
+
+
 def save_and_compare(r: dict, today_date: date) -> str:
     """
     Convenience wrapper: saves today's snapshot for this ticker, fetches
