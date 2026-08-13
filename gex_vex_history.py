@@ -29,19 +29,31 @@ use) -- no manual migration step required.
 
 WHAT GETS COMPARED, AND WHY THOSE FIELDS SPECIFICALLY:
   - Regime flip (long gamma <-> short gamma): the single most
-    actionable "look forward to this" signal -- always surfaced when
-    it happens, regardless of how small the underlying magnitude
-    change was, since the REGIME itself is what changes how a ticker
-    tends to behave.
-  - Call wall / put wall level shifts: only surfaced when the move is
-    large enough to matter (see WALL_SHIFT_THRESHOLD_PCT below) -- a
-    wall that's within noise of yesterday's isn't worth a line, and
-    printing deltas every single day even when nothing changed would
-    train subscribers to ignore the section entirely.
-  - Gamma flip level shift: same threshold logic.
-  - Spot price change: always shown when a comparison exists at all,
-    since it's the one number every reader immediately understands
-    without any GEX background.
+    actionable "look forward to this" signal -- always the headline
+    when it happens, translated into plain English (more/less
+    cushion against big moves) with a concrete instruction (size
+    down, don't chase, etc.), not raw "LONG -> SHORT" labels.
+  - Call/put level shifts: surfaced when the move is large enough to
+    matter (see WALL_SHIFT_THRESHOLD_PCT below), reframed as "don't
+    anchor on yesterday's number, use today's instead" rather than a
+    bare dollar-to-dollar delta.
+  - When neither of the above applies: an explicit plain-English
+    reassurance that yesterday's setup still holds, rather than
+    silence -- a missing section reads as ambiguous ("did this break?
+    did nobody check?"), while an explicit "nothing changed, same
+    levels still apply" is itself useful, actionable information for
+    a reader deciding whether to keep watching the same numbers.
+
+REWRITTEN 2026-08-13 to match the same plain-English, action-first
+standard already enforced on gex_vex.py's "What To Watch" section
+(see that module's WATCH-LINE ACTIONABILITY FIX / PLAIN-ENGLISH FIX
+docstring notes) -- confirmed directly by the user that raw technical
+deltas ("Call wall moved down: $510 -> $500") told a layman WHAT
+changed but not what it meant or what to do about it. Every branch of
+build_since_yesterday_line() now ends in a concrete takeaway, and no
+raw jargon ("wall", "regime", "gamma flip") appears in the output --
+same banned-word posture as the rest of the GEX pipeline's subscriber-
+facing text.
 """
 
 import os
@@ -208,63 +220,114 @@ def get_previous_snapshot(ticker: str, before_date: date, lookback_days: int = 7
 
 def build_since_yesterday_line(ticker: str, today: dict, yesterday: dict) -> str:
     """
-    Returns a short "Since Yesterday" line for one ticker, or an empty
-    string if nothing meaningful changed (deliberately -- printing a
-    delta every single day even when nothing moved would train readers
-    to skip the section entirely). A regime flip is ALWAYS surfaced
-    regardless of magnitude, since the regime itself is the headline
-    fact, not a threshold-gated detail.
+    Returns a short, PLAIN-ENGLISH, action-oriented "Since Yesterday"
+    paragraph for one ticker, or an empty string if there's truly
+    nothing to report (no prior snapshot exists at all).
+
+    REWRITTEN (2026-08-13): the original version printed raw technical
+    deltas ("Call wall moved down: $510 -> $500", "Regime flipped:
+    LONG -> SHORT gamma") with an arrow and a number -- accurate, but
+    it left a layman reader with no idea what any of it means or what
+    to actually do about it, which breaks the same bar already
+    enforced on the "What To Watch" section in gex_vex.py (see that
+    module's WATCH-LINE ACTIONABILITY FIX and PLAIN-ENGLISH FIX
+    docstring notes -- no trading jargon, every line explains the
+    real-world implication and ends in a concrete instruction). This
+    rewrite applies the identical standard here: same banned-jargon
+    posture ("wall"->"level", "regime"->plain description, "gamma
+    flip"->"pivot point"), same self-correcting/less-cushion framing
+    already used elsewhere in the GEX pipeline for regime behavior,
+    and every branch ends in something the reader can actually act on.
+
+    Priority order (a ticker only gets ONE of these, not a bullet list
+    of all that apply -- a single clear paragraph beats a stacked
+    checklist for a layman reader):
+      1. Regime flip -- always the headline when it happens, since it
+         changes how the ticker tends to BEHAVE, not just where a
+         level sits.
+      2. A meaningfully shifted call/put level -- reframed as "the
+         level to watch moved, don't anchor on yesterday's number."
+      3. Nothing structural changed -- an explicit reassurance that
+         yesterday's levels still apply, so the reader isn't left
+         wondering whether the silence means something broke.
     """
     if not yesterday:
         return ""
 
-    parts = []
-
     spot_today = today.get("spot")
     spot_yday = yesterday.get("spot")
+    spot_change_pct = None
     if spot_today is not None and spot_yday:
         spot_change_pct = (spot_today - spot_yday) / spot_yday * 100
-        arrow = "\u2191" if spot_change_pct >= 0 else "\u2193"
-        parts.append(f"Spot {arrow} {abs(spot_change_pct):.1f}% (${spot_yday:,.2f} \u2192 ${spot_today:,.2f})")
 
+    def spot_clause() -> str:
+        if spot_change_pct is None:
+            return ""
+        direction = "up" if spot_change_pct >= 0 else "down"
+        magnitude = "sharply" if abs(spot_change_pct) >= 2 else ("a bit" if abs(spot_change_pct) >= 0.5 else "barely")
+        return f"{ticker} is {direction} {magnitude} ({abs(spot_change_pct):.1f}%) from yesterday's close"
+
+    # --- Priority 1: regime flip -- always the headline -----------------
     net_gex_today = today.get("net_gex")
     net_gex_yday = yesterday.get("net_gex")
     if net_gex_today is not None and net_gex_yday is not None:
         was_long = net_gex_yday >= 0
         is_long = net_gex_today >= 0
         if was_long != is_long:
-            flip_desc = "LONG \u2192 SHORT gamma" if was_long else "SHORT \u2192 LONG gamma"
-            parts.append(f"\u26A0\uFE0F Regime flipped: {flip_desc}")
+            spot_bit = spot_clause()
+            spot_prefix = f"{spot_bit}, and t" if spot_bit else "T"
+            if is_long:
+                # short -> long: MORE contained now
+                return (f"{spot_prefix}his one has calmed down since yesterday \u2014 it now has more of a "
+                        f"built-in cushion that tends to pull price back toward the middle if it swings too "
+                        f"far in either direction. That means big breakout moves are less likely to stick "
+                        f"today than they were yesterday, so it's a better setup for trading the range than "
+                        f"chasing a big move.")
+            # long -> short: LESS contained now
+            return (f"{spot_prefix}his one has less of a cushion against bigger moves than it did yesterday "
+                    f"\u2014 if it breaks past a key level today, the move could travel further and faster "
+                    f"than you'd expect from a normal day. Keep position sizes smaller than usual and don't "
+                    f"assume a dip gets bought right away.")
 
-    for label, key, pct_key in (("Call wall", "call_wall", None), ("Put wall", "put_wall", None)):
+    # --- Priority 2: a level shifted meaningfully ------------------------
+    for label_up, label_down, key in (
+        ("ceiling", "ceiling", "call_wall"),
+        ("floor", "floor", "put_wall"),
+    ):
         today_val = today.get(key)
         yday_val = yesterday.get(key)
         spot = spot_today or spot_yday
         if today_val is not None and yday_val is not None and spot:
             shift_pct = abs(today_val - yday_val) / spot * 100
             if shift_pct >= WALL_SHIFT_THRESHOLD_PCT:
-                direction = "up" if today_val > yday_val else "down"
                 import gex_vex
-                parts.append(f"{label} moved {direction}: {gex_vex.format_strike(yday_val)} \u2192 "
-                              f"{gex_vex.format_strike(today_val)}")
+                direction_word = "higher" if today_val > yday_val else "lower"
+                spot_bit = spot_clause()
+                spot_prefix = f"{spot_bit}. T" if spot_bit else "T"
+                return (f"{spot_prefix}he {label_up} level to watch moved {direction_word} today, from "
+                        f"{gex_vex.format_strike(yday_val)} yesterday to {gex_vex.format_strike(today_val)} "
+                        f"now \u2014 if you were anchored on yesterday's number, use today's instead, since "
+                        f"that's the level actually in play right now.")
         elif today_val is not None and yday_val is None:
             import gex_vex
-            parts.append(f"{label} newly established at {gex_vex.format_strike(today_val)} (had no clear level yesterday)")
+            spot_bit = spot_clause()
+            spot_prefix = f"{spot_bit}. A" if spot_bit else "A"
+            return (f"{spot_prefix} clear {label_up} level has shown up today at "
+                    f"{gex_vex.format_strike(today_val)} that wasn't there yesterday \u2014 worth keeping "
+                    f"an eye on if price approaches it.")
         elif today_val is None and yday_val is not None:
             import gex_vex
-            parts.append(f"{label} no longer clear today (was {gex_vex.format_strike(yday_val)} yesterday)")
+            spot_bit = spot_clause()
+            spot_prefix = f"{spot_bit}. T" if spot_bit else "T"
+            return (f"{spot_prefix}he {label_up} level from yesterday ({gex_vex.format_strike(yday_val)}) "
+                    f"isn't showing up as clearly today \u2014 there's less of a defined level overhead/below "
+                    f"right now, so don't rely on that old number.")
 
-    flip_today = today.get("gamma_flip")
-    flip_yday = yesterday.get("gamma_flip")
-    spot_ref = spot_today or spot_yday
-    if flip_today is not None and flip_yday is not None and spot_ref:
-        shift_pct = abs(flip_today - flip_yday) / spot_ref * 100
-        if shift_pct >= GAMMA_FLIP_SHIFT_THRESHOLD_PCT:
-            parts.append(f"Gamma flip level shifted: ${flip_yday:,.2f} \u2192 ${flip_today:,.2f}")
-
-    if not parts:
-        return ""
-    return "  \u00b7  ".join(parts)
+    # --- Priority 3: nothing structural changed --------------------------
+    spot_bit = spot_clause()
+    if spot_bit:
+        return f"{spot_bit}, but the levels to watch haven't meaningfully changed \u2014 yesterday's setup still applies."
+    return "Nothing meaningfully changed since yesterday \u2014 the same levels and setup still apply."
 
 
 def save_and_compare(r: dict, today_date: date) -> str:
