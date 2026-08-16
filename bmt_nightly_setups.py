@@ -91,6 +91,15 @@ Fix, two parts:
      before lookup, so a future run where the model ignores the
      prompt instruction degrades gracefully instead of silently
      falling back on every field again.
+
+RESULTS TRACKING (2026-08-16): every setup this script publishes is
+now also persisted to a Postgres table (nightly_setup_ideas) right
+after it's finalized, so a separate script (bmt_setup_results_tracker.py)
+can look it up on its expiry date and report whether the strike was
+ever touched between entry and expiry. See save_setup_ideas() and
+ensure_schema() below, and bmt_setup_results_tracker.py for the
+read/grade/report side. This script itself does not grade or report
+results -- it only writes the record.
 """
 
 import os
@@ -102,6 +111,7 @@ import threading
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse
 
 # Force line-buffered stdout. When output is piped rather than
 # attached to a real terminal (e.g. `railway run ... | ...`, or some
@@ -119,11 +129,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch
 from apscheduler.schedulers.background import BackgroundScheduler
+import pg8000.native as _pg8000
 
 JARVIS_API_KEY     = os.environ["JARVIS_API_KEY"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 FINNHUB_API_KEY    = os.environ["FINNHUB_API_KEY"]
 DISCORD_WEBHOOK    = os.environ["NIGHTLY_SETUPS_DISCORD_WEBHOOK"]
+# DATABASE_URL is optional at the app level (matches the pattern used
+# in bmt_trade_journal.py) so a missing var degrades to "results
+# tracking is skipped" rather than crashing the whole nightly post.
+DATABASE_URL        = os.environ.get("DATABASE_URL", "")
 JARVIS_MCP_URL      = "https://api.jarvisflow.io/.well-known/mcp"
 OPENROUTER_BASE    = "https://openrouter.ai/api/v1"
 FINNHUB_BASE       = "https://finnhub.io/api/v1"
@@ -162,6 +177,104 @@ MARKET_CONTEXT_TICKERS = ["SPY", "QQQ", "IWM"]
 CANDIDATE_UNIVERSE = [t for t in FULL_WATCHLIST if t not in EXCLUDE_FROM_CANDIDATES]
 
 EARNINGS_LOOKAHEAD_DAYS = 14
+
+
+# ─────────────────────────────────────────────────────────────────────
+# DB -- results-tracking persistence layer (2026-08-16)
+# ─────────────────────────────────────────────────────────────────────
+
+def _connect():
+    parsed = urlparse(DATABASE_URL)
+    return _pg8000.Connection(
+        host=parsed.hostname, port=parsed.port or 5432,
+        database=parsed.path.lstrip("/"),
+        user=parsed.username, password=parsed.password,
+    )
+
+
+def ensure_schema():
+    """Creates nightly_setup_ideas if it doesn't already exist. Safe to
+    call on every run -- CREATE TABLE IF NOT EXISTS is a no-op once the
+    table is there. status starts 'pending' and is only ever updated by
+    bmt_setup_results_tracker.py once the setup's expiry date arrives."""
+    if not DATABASE_URL:
+        print("  [DB WARN] DATABASE_URL not set -- results tracking will be skipped for this run.")
+        return
+    conn = _connect()
+    try:
+        conn.run("""
+            CREATE TABLE IF NOT EXISTS nightly_setup_ideas (
+                id SERIAL PRIMARY KEY,
+                ticker TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                strike NUMERIC NOT NULL,
+                entry_low NUMERIC NOT NULL,
+                entry_high NUMERIC NOT NULL,
+                stop NUMERIC NOT NULL,
+                target1 NUMERIC NOT NULL,
+                target2 NUMERIC NOT NULL,
+                expiry_label TEXT,
+                expiry_date DATE NOT NULL,
+                publish_date DATE NOT NULL,
+                role TEXT,
+                risk TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                entry_date DATE,
+                period_high NUMERIC,
+                period_low NUMERIC,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                resolved_at TIMESTAMPTZ
+            )
+        """)
+    except Exception as e:
+        print(f"  [DB WARN] ensure_schema failed: {e}")
+    finally:
+        conn.close()
+
+
+def save_setup_ideas(selected: list, target_date: datetime):
+    """Persists tonight's setups so bmt_setup_results_tracker.py can grade
+    them once their expiry date arrives. This is intentionally a
+    fire-and-forget best-effort write -- a DB hiccup here should never
+    stop tonight's Discord post, so failures are logged and swallowed,
+    not raised."""
+    if not DATABASE_URL:
+        print("  [DB WARN] DATABASE_URL not set -- setup ideas will NOT be tracked for results.")
+        return
+    conn = _connect()
+    saved = 0
+    try:
+        for c in selected:
+            expiry_iso = c.get("expiry_iso")
+            if not expiry_iso:
+                print(f"  [DB WARN] {c['ticker']}: no expiry_iso -- skipping results-tracking insert")
+                continue
+            try:
+                expiry_date = datetime.strptime(expiry_iso, "%Y-%m-%d").date()
+            except Exception:
+                print(f"  [DB WARN] {c['ticker']}: unparseable expiry_iso {expiry_iso!r} -- skipping")
+                continue
+            conn.run("""
+                INSERT INTO nightly_setup_ideas
+                    (ticker, direction, strike, entry_low, entry_high, stop, target1, target2,
+                     expiry_label, expiry_date, publish_date, role, risk)
+                VALUES
+                    (:ticker, :direction, :strike, :entry_low, :entry_high, :stop, :target1, :target2,
+                     :expiry_label, :expiry_date, :publish_date, :role, :risk)
+            """,
+                ticker=c["ticker"], direction=c["direction"], strike=c["strike"],
+                entry_low=c["entry_low"], entry_high=c["entry_high"], stop=c["stop"],
+                target1=c["target1"], target2=c["target2"],
+                expiry_label=c.get("next_expiry"), expiry_date=expiry_date,
+                publish_date=target_date.date(),
+                role=c.get("role"), risk=c.get("risk"),
+            )
+            saved += 1
+        print(f"  [DB] Saved {saved}/{len(selected)} setup idea(s) for results tracking.")
+    except Exception as e:
+        print(f"  [DB WARN] save_setup_ideas failed partway ({saved} saved before the error): {e}")
+    finally:
+        conn.close()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1611,6 +1724,8 @@ def main():
     et_now = datetime.now(ET)
     print(f"[{et_now.isoformat()}] BMT Nightly Setups")
 
+    ensure_schema()
+
     force_publish = os.environ.get("FORCE_PUBLISH") == "1"
     if force_publish:
         print("  [FORCE_PUBLISH=1 — scheduling gate BYPASSED for testing. This must NEVER happen on a real production run.]")
@@ -1830,6 +1945,9 @@ def main():
     if top_pick_ticker not in {c["ticker"] for c in selected}:
         top_pick_ticker = selected[0]["ticker"]
         top_pick_why = top_pick_why if top_pick_why != "Not provided" else "Top-ranked setup tonight by the model."
+
+    print(f"\nSaving {len(selected)} setup idea(s) to DB for results tracking...")
+    save_setup_ideas(selected, target_date)
 
     print(f"\nRendering {len(selected)} chart(s)...")
     for c in selected:
