@@ -54,14 +54,17 @@ Final design instead:
 DATA: real, live numbers from gex_vex.compute_gex_vex() for all 10
 tickers (Mag 7 + SPY/QQQ/IWM) -- the same function
 gex_vex_combined_daily.py used, unmodified. gex_vex.py is NOT touched
-by this script.
+by this script (aside from the separate 2026-08-19 gamma-flip
+band-matching fix documented in that file's own module docstring,
+which changes the VALUES compute_gex_vex() returns for gamma_flip, not
+this script's own logic).
 
-DEPLOYMENT NOTES: deploy this file alongside the unchanged gex_vex.py
-and the updated gex_vex_history.py in the same service (Custom Start
-Command "python gex_vex_unified_daily.py", Cron Schedule
-"30 14 * * 1-5"). Once confirmed running, disable or remove
-gex_vex_combined_daily.py's cron trigger so the old fragmented 8-post
-output stops firing alongside this one.
+DEPLOYMENT NOTES: deploy this file alongside gex_vex.py and the
+updated gex_vex_history.py in the same service (Custom Start Command
+"python gex_vex_unified_daily.py", Cron Schedule "30 14 * * 1-5").
+Once confirmed running, disable or remove gex_vex_combined_daily.py's
+cron trigger so the old fragmented 8-post output stops firing
+alongside this one.
 
 "TODAY'S FOCUS" SELECTION (initial heuristic, not final business
 logic -- flagged clearly since this is exactly the kind of judgment
@@ -76,6 +79,26 @@ call worth reviewing during the test period, not locking in silently):
 If fewer than 3 distinct tickers qualify, the list is padded with the
 next-highest expected-move tickers so the panel is never left with
 fewer than 3 items in a normal run.
+
+FLIP-MARKER BOUNDS GUARD (2026-08-19): confirmed in production, on
+IWM specifically and TWICE (once with a flip value of 266.97 landing
+inside a neighboring ticker's card region, once with 255.17 landing
+almost entirely off the left edge of the whole image), that this
+file's render_unified_card() drew the gamma-flip dashed line and label
+UNCONDITIONALLY -- with no check that the flip value actually fell
+within the card's own visible bar range (range_min to range_max). Both
+of gex_vex.py's own per-ticker card renderers already had this exact
+guard (`if gamma_flip is not None and range_min <= gamma_flip <=
+range_max`); this file's version of the same per-ticker card loop was
+simply missing it. The root cause -- find_gamma_flip() in gex_vex.py
+being called with a search band far wider than the wall-selection
+band, so it could return a real-but-distant crossing -- is fixed
+separately at the source (see gex_vex.py's matching 2026-08-19 module
+docstring note). This guard is added here as a second, independent
+layer regardless: even if some future data path ever hands this
+renderer an out-of-range gamma_flip again, it can now never be drawn
+outside its own card's bar, let alone bleed into a neighboring card or
+off the image entirely.
 """
 
 import os
@@ -321,7 +344,26 @@ def render_unified_card(core_results, mag7_results, focus_items, comparisons, we
         ax.plot([spot_x], [bar_y + bar_h/2], marker="o", markersize=11,
                 markerfacecolor="#ffffff", markeredgecolor=TEXT1, markeredgewidth=1.4, zorder=6)
 
-        if t.get("gamma_flip"):
+        # FLIP-MARKER BOUNDS GUARD (2026-08-19): previously drew this
+        # dashed line and "FLIP $X" label UNCONDITIONALLY, with no
+        # check that gamma_flip actually fell within THIS ticker's own
+        # bar range (rng_lo to rng_hi) -- confirmed in production
+        # (twice) that a gamma_flip value from find_gamma_flip()'s
+        # previously-too-wide search band could land far outside a
+        # ticker's own put-wall/call-wall/spot range, causing to_x() to
+        # compute an x-position well outside this card's bar -- in one
+        # case bleeding into a neighboring card, in another landing
+        # almost entirely off the left edge of the whole image. The
+        # root cause (find_gamma_flip()'s search band not matching the
+        # wall-selection band) is fixed at the source in gex_vex.py's
+        # compute_gex_vex() as of the same date, but this guard is kept
+        # here regardless, as a second, independent layer -- exactly
+        # matching the guard gex_vex.py's own two card renderers
+        # (render_single_ticker_gex_card, render_gex_dashboard_card)
+        # already had. A flip marker can now never be drawn outside its
+        # own card's visible bar, no matter what value is returned
+        # upstream.
+        if t.get("gamma_flip") is not None and rng_lo <= t["gamma_flip"] <= rng_hi:
             flip_x = to_x(t["gamma_flip"])
             ax.plot([flip_x, flip_x], [bar_y - 0.07, bar_y + bar_h + 0.07],
                     color=GOLD, linewidth=1.5, linestyle="--", zorder=5)

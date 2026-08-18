@@ -114,6 +114,34 @@ singular-voice template (which already correctly mentions BOTH the
 call wall and put wall when available) as its fallback, and the LLM
 prompt path for n=1 goes through the per-ticker "TICKER | sentence"
 branch instead of the shared-paragraph branch.
+
+GAMMA-FLIP BAND-MISMATCH BUGFIX (2026-08-19): confirmed in production,
+TWICE, on IWM specifically (gamma flip reported as 266.97 on one run
+and 255.17 on another, both far outside IWM's actual put-wall/call-wall/
+spot range at the time -- e.g. spot $302.40 with walls at 295/305, but
+a "gamma flip" of 255.17, roughly 15% below the put wall). Root cause:
+find_gamma_flip() was called from compute_gex_vex() with NO band_pct
+argument, silently defaulting to a flat +/-30% search window -- totally
+decoupled from the much tighter, expected-move-scaled band wall
+selection actually uses (often just ~3-10% for a low-volatility ticker
+like IWM, via `band_pct = max(expected_move["pct"] * 3 / 100, 0.10)`).
+IWM's thinner far-OTM open interest produces its nearest REAL
+cumulative-GEX zero-crossing well outside that tighter, economically-
+relevant window -- so find_gamma_flip() was returning a mathematically
+real crossing that the walls themselves would never even consider "in
+range." A flip level sitting 10-15% outside the card's own displayed
+put/call wall range isn't a usable data point next to them, and every
+downstream renderer (both the multi-ticker and single-ticker cards
+here, plus gex_vex_unified_daily.py's unified card) draws it as if it
+were just as trustworthy as the walls.
+
+FIX: compute_gex_vex() now passes the SAME band_pct used for wall
+selection into find_gamma_flip(), so a flip is only ever reported if
+it falls within the identical window the card's own put/call walls are
+drawn from. If nothing crosses within that tighter window, this
+returns None (the exact same "no crossing found" behavior that already
+existed and is already handled everywhere downstream), rather than a
+technically-real but visually-nonsensical distant number.
 """
 
 import math
@@ -602,7 +630,21 @@ def compute_gex_vex(ticker: str, expiries: list = None) -> dict:
         max_pos_strike = max(banded_strikes, key=lambda k: banded_strikes[k]["net_gex"])
         max_neg_strike = min(banded_strikes, key=lambda k: banded_strikes[k]["net_gex"])
 
-        gamma_flip = find_gamma_flip(per_strike, spot=spot)
+        # GAMMA-FLIP BAND BUGFIX (2026-08-19): previously called with no
+        # band_pct argument at all, which silently defaulted to a flat
+        # +/-30% search window -- completely decoupled from the tighter,
+        # expected-move-scaled band wall selection actually uses just
+        # above (often only ~3-10% for a low-volatility ticker like
+        # IWM). See the module docstring's 2026-08-19 note for the full
+        # production incident (IWM's flip reported at 266.97 and then
+        # 255.17 on two separate runs, both far outside its actual
+        # put-wall/call-wall/spot range). Now searches the IDENTICAL
+        # band as wall selection, so a flip is only ever reported if it
+        # falls within the same window the card's own put/call walls
+        # are drawn from -- otherwise returns None, same as "no
+        # crossing found" already was, rather than a technically-real
+        # but visually-nonsensical distant number.
+        gamma_flip = find_gamma_flip(per_strike, spot=spot, band_pct=band_pct)
 
         return {
             "ticker": ticker,
@@ -1761,6 +1803,14 @@ def render_single_ticker_gex_card(r: dict, week_label: str, out_path: str):
             txt(pw_x, bar_y - 0.18, f"P {format_strike(put_wall)}", fs=7.2, color=_RED, bold=True, ha="center", font=_HEADER_FONT)
             txt(cw_x, bar_y - 0.18, f"C {format_strike(call_wall)}", fs=7.2, color=_GREEN, bold=True, ha="center", font=_HEADER_FONT)
 
+    # FLIP-MARKER BOUNDS GUARD (2026-08-19): find_gamma_flip() now only
+    # ever returns a value within the SAME band wall selection uses
+    # (see compute_gex_vex()'s matching 2026-08-19 fix), so this
+    # range_min/range_max check should rarely reject a flip going
+    # forward -- but it's kept here as a second, independent guard
+    # (belt-and-suspenders, same principle as the rest of this module's
+    # defensive checks) so a flip marker can NEVER be drawn outside this
+    # card's own visible bar regardless of what upstream returns.
     if gamma_flip is not None and range_min <= gamma_flip <= range_max:
         gf_x = to_x(gamma_flip)
         ax.plot([gf_x, gf_x], [bar_y - 0.07, bar_y + bar_h + 0.07], color="#c084fc", linewidth=1.6, linestyle="--", zorder=5)
@@ -2055,6 +2105,13 @@ def render_gex_dashboard_card(results: list, week_label: str, out_path: str):
                 txt(pw_x, bar_y - 0.16, f"P {format_strike(put_wall)}", fs=6.6, color=_RED, bold=True, ha="center", font=_HEADER_FONT)
                 txt(cw_x, bar_y - 0.16, f"C {format_strike(call_wall)}", fs=6.6, color=_GREEN, bold=True, ha="center", font=_HEADER_FONT)
 
+        # FLIP-MARKER BOUNDS GUARD (2026-08-19): same second-layer
+        # defensive check as render_single_ticker_gex_card() above --
+        # find_gamma_flip() is now band-matched to wall selection at
+        # the source (see compute_gex_vex()'s 2026-08-19 fix), but this
+        # range check stays as a guarantee that a flip marker can never
+        # be drawn outside this card's own visible bar, regardless of
+        # what upstream returns.
         if gamma_flip is not None and range_min <= gamma_flip <= range_max:
             gf_x = to_x(gamma_flip)
             ax.plot([gf_x, gf_x], [bar_y - 0.06, bar_y + bar_h + 0.06], color="#c084fc", linewidth=1.4, linestyle="--", zorder=5)
