@@ -949,6 +949,9 @@ def write_setup_narratives(selected: list, market_context: dict, target_date: da
     raw = None
     message = None
     content = None
+    parsed_result = None
+    last_parse_error = None
+
     for attempt, reasoning_cap in enumerate(REASONING_MAX_TOKENS_ATTEMPTS, start=1):
         print(f"  [NARRATIVE] calling OpenRouter, attempt {attempt}/{len(REASONING_MAX_TOKENS_ATTEMPTS)} "
               f"(reasoning capped at {reasoning_cap} tokens, {TOTAL_MAX_TOKENS} total budget)...", flush=True)
@@ -996,21 +999,64 @@ def write_setup_narratives(selected: list, market_context: dict, target_date: da
             raise ValueError("write_setup_narratives: unexpected API response shape")
         message = raw["choices"][0]["message"]
         content = message.get("content")
-        if content:
-            break
-        print(f"  [NARRATIVE WARN] attempt {attempt}: empty/None content -- likely the model used its "
-              f"whole reasoning budget before writing an answer:")
-        print(f"  {json.dumps(message, indent=2)[:1000]}")
-        if attempt < len(REASONING_MAX_TOKENS_ATTEMPTS):
-            print("  [NARRATIVE] retrying with a tighter reasoning cap...", flush=True)
+        if not content:
+            print(f"  [NARRATIVE WARN] attempt {attempt}: empty/None content -- likely the model used its "
+                  f"whole reasoning budget before writing an answer:")
+            print(f"  {json.dumps(message, indent=2)[:1000]}")
+            if attempt < len(REASONING_MAX_TOKENS_ATTEMPTS):
+                print("  [NARRATIVE] retrying with a tighter reasoning cap...", flush=True)
+            continue
 
-    if not content:
+        # TRUNCATED-JSON BUGFIX (2026-08-20): confirmed in production
+        # that this exact call can return NON-EMPTY content that is
+        # still cut off mid-JSON-string (real incident: "Unterminated
+        # string starting at: line 6 column 152 (char 598)" -- only 598
+        # characters in, nowhere near a complete 5-setup JSON object).
+        # The retry loop above only ever checked for EMPTY content
+        # (`if content: break`), so truncated-but-non-empty content
+        # counted as success, exited the loop, and json.loads() below
+        # ran completely unprotected -- a parse failure propagated as
+        # an uncaught JSONDecodeError all the way up through main(),
+        # killing the entire scheduled run with ZERO Discord post that
+        # night, not even a partial one. This is the same underlying
+        # failure mode as the empty-content bug already fixed on
+        # 2026-08-11 (the model spending too much of its token budget
+        # before finishing) -- it just manifests as truncated-but-
+        # present text instead of no text at all, and needs the exact
+        # same fix: treat it as retry-worthy, not fatal.
+        #
+        # FIX: json.loads() now runs INSIDE this retry loop, wrapped in
+        # try/except. A parse failure on a non-final attempt logs a
+        # warning and retries with the next (tighter) reasoning cap,
+        # exactly like empty content already did. Only after every
+        # attempt has produced unparseable content does this raise --
+        # and when it does, the raised error now includes the actual
+        # parse error and a snippet of the bad content, not just "empty
+        # content", since content was NOT empty this time.
+        cleaned = content.strip()
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"```\s*$", "", cleaned)
+        try:
+            parsed_result = json.loads(cleaned.strip())
+            break
+        except json.JSONDecodeError as e:
+            last_parse_error = e
+            print(f"  [NARRATIVE WARN] attempt {attempt}: content was non-empty but failed to parse as "
+                  f"JSON ({e}) -- likely truncated mid-response. First 300 chars: {cleaned[:300]!r}")
+            if attempt < len(REASONING_MAX_TOKENS_ATTEMPTS):
+                print("  [NARRATIVE] retrying with a tighter reasoning cap...", flush=True)
+            continue
+
+    if parsed_result is None:
+        if last_parse_error is not None:
+            raise ValueError(
+                f"write_setup_narratives: content was non-empty on every attempt but never parsed as "
+                f"valid JSON after all retries -- last error: {last_parse_error}. "
+                f"Last content (first 500 chars): {(content or '')[:500]!r}"
+            )
         raise ValueError("write_setup_narratives: empty content in API response after all retry attempts")
 
-    content = content.strip()
-    content = re.sub(r"^```(?:json)?\s*", "", content)
-    content = re.sub(r"```\s*$", "", content)
-    return json.loads(content.strip())
+    return parsed_result
 
 
 def clean_text_field(text: str, tickers: list) -> str:
