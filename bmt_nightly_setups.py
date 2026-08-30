@@ -100,6 +100,50 @@ ever touched between entry and expiry. See save_setup_ideas() and
 ensure_schema() below, and bmt_setup_results_tracker.py for the
 read/grade/report side. This script itself does not grade or report
 results -- it only writes the record.
+
+NARRATIVE-VARIETY BUGFIX (2026-08-29): confirmed directly by the user,
+comparing real posts across two consecutive trading nights, that
+why_made_list/why_choose read as near-templated across different
+tickers sharing the same role/pattern -- e.g. two different "Best
+Overall" bullish setups on different nights both said, almost
+verbatim, "has been climbing steadily from its recent low/bottom...
+call options are cheap for how much the stock usually moves... big
+options traders have been heavily buying calls." Root cause, three
+compounding factors:
+  1. `"temperature": 0` on the write_setup_narratives() API call --
+     at temperature 0 the model always emits its single most-probable
+     continuation for a given semantic input, so two setups with the
+     same qualitative shape (bullish flow + cheap IV/RV + uptrend)
+     produce near-identical prose by construction, not by chance.
+  2. The prompt's jargon-translation instruction handed the model
+     three CONCRETE example sentences ("the options are priced cheap
+     for how much this stock actually moves", "big options traders
+     have been buying calls", "the stock has been climbing steadily")
+     framed as translations to use -- a well-documented way to get a
+     model to parrot those exact phrases back near-verbatim on every
+     call, rather than treating them as style guidance only.
+  3. build_price_narrative() already generates a genuinely specific,
+     differentiating fact per setup (the exact swing high/low price
+     and date) and it's already present in source_data -- but nothing
+     in the prompt pushed the model to actually lean on that specific
+     fact inside why_made_list, so it defaulted to the generic
+     categorical phrasing instead every time.
+
+Fix, matching each cause: (1) temperature raised from 0 to 0.7 for
+this call -- this is a plain-English rewriting/synthesis task, not
+one needing deterministic precision, so the added variety costs
+nothing; (2) the example phrases are removed from the prompt and
+replaced with a conceptual description of the translation plus an
+explicit instruction never to reuse the same wording across setups;
+(3) the prompt now explicitly tells the model to pull the specific
+price level/date already given in this setup's own "Chart setup" line
+into why_made_list, rather than only restating the categorical pattern
+label. NOTE: a separate, deeper contributor -- the role taxonomy is a
+fixed 5 slots, used exactly once each, every night, which guarantees
+the POST'S SHAPE repeats regardless of prose quality -- is flagged but
+intentionally NOT changed here, since that format was explicitly
+locked after review (see FORMAT HISTORY above) and changing it is a
+bigger decision than this prose-variety fix.
 """
 
 import os
@@ -861,8 +905,12 @@ NARRATIVE_PROMPT_TEMPLATE = """You are an expert options-trading newsletter edit
 1. **role** -- assign each of the five setups exactly one of these five roles, no duplicates: "Best Overall", "Lowest-Move Setup", "Best Balanced Setup", "Flow-Backed Momentum Setup", "Speculative / High-Risk Breakout Setup". If the data doesn't cleanly support one of these for every setup, still assign the closest truthful match -- every setup needs exactly one role and every role is used exactly once.
 2. **risk** -- exactly one of: "Low", "Moderate", "Elevated", "High", "Speculative". Base this on required move size, how far out the option is, and how much conviction the data supports -- not on the role name.
 3. **best_for** -- ONE short sentence: what kind of trader or objective this setup suits.
-4. **why_made_list** -- ONE, at most TWO, SHORT plain-English sentences. This is the single most important field -- combine chart structure + options flow + option pricing/value + catalyst (if any) into one tight, beginner-friendly explanation. NO jargon: never write "IV/RV", "implied volatility", "realized volatility", "call-weighted", "OTM/ATM", "Higher Lows Base", "conviction rank", or similar. Translate instead -- e.g. "the options are priced cheap for how much this stock actually moves" instead of an IV/RV ratio; "big options traders have been buying calls" instead of "call-weighted flow"; "the stock has been climbing steadily" instead of "Higher Lows Base". Do not restate exact dollar flow figures or percentages already implied elsewhere -- keep this readable, not data-dense.
-5. **why_choose** -- ONE short sentence: the single clearest reason to pick this over the other four tonight.
+4. **why_made_list** -- ONE, at most TWO, SHORT plain-English sentences. This is the single most important field -- combine chart structure + options flow + option pricing/value + catalyst (if any) into one tight, beginner-friendly explanation.
+   - NO jargon: never write "IV/RV", "implied volatility", "realized volatility", "call-weighted", "OTM/ATM", "Higher Lows Base", "conviction rank", or similar -- translate each into plain English instead. An IV/RV ratio becomes a plain statement about whether the options are cheap or expensive for how much the stock actually moves. Call-weighted or put-weighted flow becomes a plain statement about which side big options traders are buying. A pattern label becomes a plain description of the actual price action.
+   - CRITICAL, and the main thing to get right: DO NOT settle on one fixed phrasing for these translations and reuse it setup after setup, night after night. Two setups that are both "cheap options with bullish call flow in an uptrend" must NOT read like the same sentence with the ticker swapped in -- vary sentence structure, word choice, sentence length, and which detail you lead with, every single time.
+   - USE THE SPECIFIC FACTS ALREADY GIVEN for this setup in its "Chart setup" line above (the exact price level and date it bottomed/topped at, the exact current close and date) -- lean on those specific numbers and dates to make this setup's story concretely different from every other setup's, rather than only restating the categorical pattern label in generic terms.
+   - Do not restate exact dollar flow figures or percentages already implied elsewhere -- keep this readable, not data-dense.
+5. **why_choose** -- ONE short sentence: the single clearest reason to pick this over the other four tonight. Same variety requirement as why_made_list -- do not reuse the same sentence template ("It offers...", "It combines...", "It is the only...") across every setup; vary the construction.
 
 ## Also produce
 
@@ -973,7 +1021,23 @@ def write_setup_narratives(selected: list, market_context: dict, target_date: da
             resp = requests.post(
                 f"{OPENROUTER_BASE}/chat/completions",
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-                json={"model": "moonshotai/kimi-k2.6", "max_tokens": TOTAL_MAX_TOKENS, "temperature": 0,
+                json={"model": "moonshotai/kimi-k2.6", "max_tokens": TOTAL_MAX_TOKENS,
+                      # NARRATIVE-VARIETY BUGFIX (2026-08-29): was
+                      # "temperature": 0. At temperature 0 the model
+                      # always emits its single most-probable
+                      # continuation for a given input -- confirmed
+                      # directly by the user, comparing real posts
+                      # across different nights, that two setups
+                      # sharing the same role/pattern (e.g. two
+                      # different "Best Overall" bullish setups)
+                      # produced near-verbatim prose, night after
+                      # night. This is a plain-English rewriting/
+                      # synthesis task, not one needing deterministic
+                      # precision, so raising temperature to allow
+                      # real lexical variety costs nothing here. See
+                      # this module's own docstring for the full
+                      # three-part diagnosis and fix.
+                      "temperature": 0.7,
                       "reasoning": {"max_tokens": reasoning_cap},
                       "messages": [{"role": "user", "content": prompt}]},
                 timeout=(10, 120)
