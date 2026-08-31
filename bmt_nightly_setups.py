@@ -887,6 +887,7 @@ def build_narrative_source_data(selected: list, market_context: dict, target_dat
         lines.append(f"Ticker: ${c['ticker']}   Company: {c.get('company_name', 'Not provided')}")
         lines.append(f"Contract: {c['direction']} ${c['strike']:g} strike, expiring {c['next_expiry']} ({tp['dte']} calendar days to expiration)")
         lines.append(f"Chart setup: {build_price_narrative(c)} Pattern classification: {build_quality_tag(c.get('pattern', ''))}.")
+        lines.append(f"Technical indicators (already shown on this setup's own chart image -- these are safe to name directly): {c.get('tech_detail', 'Not available.')}")
         lines.append(f"Entry zone (underlying stock price): ${c['entry_low']}-${c['entry_high']}")
         lines.append(f"Stop / invalidation (underlying stock price): ${c['stop']}")
         lines.append(f"Target 1 (underlying stock price): ${c['target1']}")
@@ -905,12 +906,13 @@ NARRATIVE_PROMPT_TEMPLATE = """You are an expert options-trading newsletter edit
 1. **role** -- assign each of the five setups exactly one of these five roles, no duplicates: "Best Overall", "Lowest-Move Setup", "Best Balanced Setup", "Flow-Backed Momentum Setup", "Speculative / High-Risk Breakout Setup". If the data doesn't cleanly support one of these for every setup, still assign the closest truthful match -- every setup needs exactly one role and every role is used exactly once.
 2. **risk** -- exactly one of: "Low", "Moderate", "Elevated", "High", "Speculative". Base this on required move size, how far out the option is, and how much conviction the data supports -- not on the role name.
 3. **best_for** -- ONE short sentence: what kind of trader or objective this setup suits.
-4. **why_made_list** -- ONE, at most TWO, SHORT plain-English sentences. This is the single most important field -- combine chart structure + options flow + option pricing/value + catalyst (if any) into one tight, beginner-friendly explanation.
-   - NO jargon: never write "IV/RV", "implied volatility", "realized volatility", "call-weighted", "OTM/ATM", "Higher Lows Base", "conviction rank", or similar -- translate each into plain English instead. An IV/RV ratio becomes a plain statement about whether the options are cheap or expensive for how much the stock actually moves. Call-weighted or put-weighted flow becomes a plain statement about which side big options traders are buying. A pattern label becomes a plain description of the actual price action.
-   - CRITICAL, and the main thing to get right: DO NOT settle on one fixed phrasing for these translations and reuse it setup after setup, night after night. Two setups that are both "cheap options with bullish call flow in an uptrend" must NOT read like the same sentence with the ticker swapped in -- vary sentence structure, word choice, sentence length, and which detail you lead with, every single time.
-   - USE THE SPECIFIC FACTS ALREADY GIVEN for this setup in its "Chart setup" line above (the exact price level and date it bottomed/topped at, the exact current close and date) -- lean on those specific numbers and dates to make this setup's story concretely different from every other setup's, rather than only restating the categorical pattern label in generic terms.
+4. **why_made_list** -- ONE to THREE short plain-English sentences (up from the previous 1-2 cap -- there is genuinely more real detail to work with now, see below). This is the single most important field -- combine chart structure + technical indicator readings + options flow + option pricing/value + catalyst (if any) into one tight, beginner-friendly explanation.
+   - NO jargon for these terms: never write "IV/RV", "implied volatility", "realized volatility", "call-weighted", "OTM/ATM", "Higher Lows Base", "conviction rank", or similar -- translate each into plain English instead. An IV/RV ratio becomes a plain statement about whether the options are cheap or expensive for how much the stock actually moves. Call-weighted or put-weighted flow becomes a plain statement about which side big options traders are buying. A pattern label becomes a plain description of the actual price action.
+   - EXCEPTION, and this is new: RSI, relative volume ("RVOL"), moving averages ("the 5-day EMA", "the 12-day EMA"), and Fibonacci retracement levels are explicitly ALLOWED to be named directly, with their real number from the "Technical indicators" line in the source data below. These are NOT jargon to translate away -- they already appear labeled, by name, on this exact setup's own chart image right below this write-up, so citing them by name and value in the text reinforces what the reader is looking at. Pull in whichever 1-2 of these four readings are most genuinely relevant to this setup's story (e.g. an RSI reading that confirms momentum, a moving-average relationship that confirms trend direction, a Fibonacci level the stock is sitting right on) -- you do not need to force all four into every setup.
+   - CRITICAL, and the main thing to get right: DO NOT settle on one fixed phrasing for these translations and reuse it setup after setup, night after night. Two setups that are both "cheap options with bullish call flow in an uptrend" must NOT read like the same sentence with the ticker swapped in -- vary sentence structure, word choice, sentence length, and which detail you lead with, every single time. This applies equally to how you introduce the technical-indicator readings -- don't default to the same "RSI sits at X, confirming..." template on every setup.
+   - USE THE SPECIFIC FACTS ALREADY GIVEN for this setup in its "Chart setup" line above (the exact price level and date it bottomed/topped at, the exact current close and date) -- lean on those specific numbers and dates, together with the technical-indicator reading(s) you chose, to make this setup's story concretely different from every other setup's, rather than only restating the categorical pattern label in generic terms.
    - Do not restate exact dollar flow figures or percentages already implied elsewhere -- keep this readable, not data-dense.
-5. **why_choose** -- ONE short sentence: the single clearest reason to pick this over the other four tonight. Same variety requirement as why_made_list -- do not reuse the same sentence template ("It offers...", "It combines...", "It is the only...") across every setup; vary the construction.
+5. **why_choose** -- ONE short sentence: the single clearest reason to pick this over the other four tonight. This can reference a specific technical reading (RSI, RVOL, a moving-average relationship, a Fibonacci level) if that's genuinely the most distinguishing fact about this setup versus the other four -- same rules as why_made_list apply to naming these directly. Same variety requirement as why_made_list -- do not reuse the same sentence template ("It offers...", "It combines...", "It is the only...") across every setup; vary the construction.
 
 ## Also produce
 
@@ -1336,6 +1338,60 @@ def compute_rvol(chart_bars: list, lookback: int = 20) -> float:
     prior = chart_bars[-(lookback + 1):-1] or chart_bars[:-1]
     avg = sum(b["volume"] for b in prior) / len(prior) if prior else chart_bars[-1]["volume"]
     return (chart_bars[-1]["volume"] / avg) if avg > 0 else 1.0
+
+
+def build_technical_detail(c: dict) -> str:
+    """
+    NEW (2026-08-31), per direct user request for more technical
+    narrative content: computes the SAME RSI/EMA/RVOL/Fibonacci values
+    already shown on this setup's own chart card (see
+    compute_rsi_series()/compute_ema_series()/compute_rvol()/
+    compute_chart_fib_levels() above -- identical functions, identical
+    chart_bars, identical numbers) and formats them as one plain-
+    English line for write_setup_narratives()'s prompt to reference by
+    name and value in why_made_list/why_choose.
+
+    Deliberately reuses chart_bars (not the shorter `c["bars"]` used
+    elsewhere for the price narrative) so the number cited in the
+    write-up text always matches the number printed on the chart image
+    directly below it -- computing this from a different, shorter bar
+    window would risk the text and the chart quietly disagreeing on,
+    say, today's RSI reading.
+    """
+    chart_bars = c.get("chart_bars") or c["bars"]
+    if not chart_bars or len(chart_bars) < 5:
+        return "Not available."
+
+    closes = [b["close"] for b in chart_bars]
+    ema5 = compute_ema_series(closes, 5)
+    ema12 = compute_ema_series(closes, 12)
+    rsi = compute_rsi_series(closes, 14)
+    rvol = compute_rvol(chart_bars)
+    fib_levels = compute_chart_fib_levels(chart_bars, c["direction"])
+
+    ema_relation = "above" if ema5[-1] > ema12[-1] else "below"
+    rsi_now = rsi[-1]
+    if rsi_now >= 70:
+        rsi_zone = "overbought territory (70+)"
+    elif rsi_now <= 30:
+        rsi_zone = "oversold territory (30 or below)"
+    elif rsi_now >= 50:
+        rsi_zone = "above the neutral 50 midline"
+    else:
+        rsi_zone = "below the neutral 50 midline"
+
+    current_price = closes[-1]
+    fib_str = "no clear Fibonacci level nearby"
+    if fib_levels:
+        nearest_fib = min(fib_levels, key=lambda fp: abs(fp[1] - current_price))
+        fib_str = f"trading closest to the {nearest_fib[0]:.3f} Fibonacci retracement level (${nearest_fib[1]:.2f})"
+
+    return (
+        f"RSI (14-day) is {rsi_now:.0f}, {rsi_zone}. "
+        f"The 5-day EMA (${ema5[-1]:.2f}) is {ema_relation} the 12-day EMA (${ema12[-1]:.2f}). "
+        f"Relative volume is {rvol:.1f}x the 20-day average. "
+        f"Price is {fib_str}."
+    )
 
 
 def compute_reward_risk(c: dict) -> tuple:
@@ -1994,7 +2050,7 @@ def main():
         c["premium"] = premium
     selected = [c for c in selected if "strike" in c]
 
-    print("\nComputing analyst target + company name + time-pressure context for final selections...")
+    print("\nComputing analyst target + company name + time-pressure + technical detail for final selections...")
     for c in selected:
         c["analyst_target"] = get_analyst_target(c["ticker"])
         c["company_name"] = get_company_name(c["ticker"])
@@ -2002,7 +2058,19 @@ def main():
         c["quality_tag"] = build_quality_tag(c.get("pattern", ""))
         c["narrative"] = build_price_narrative(c)
         c["flow_note"] = build_flow_note_display(c["flow"])
+        # NEW (2026-08-31): chart_bars fetched HERE now, before the
+        # narrative is written -- previously this only happened later,
+        # right before chart rendering, which meant write_setup_narratives()
+        # never had access to RSI/EMA/RVOL/Fibonacci data at all. Fetching
+        # once, here, and reusing the same c["chart_bars"] for both the
+        # narrative AND the chart image (render_setup_chart() picks up
+        # c["chart_bars"] unchanged, later) guarantees the indicator value
+        # cited in the write-up text always matches what's printed on the
+        # chart -- they're now the same computation, not two separate ones.
+        c["chart_bars"] = get_extended_chart_bars(c["ticker"])
+        c["tech_detail"] = build_technical_detail(c)
         print(f"  {c['ticker']}: {c['time_pressure']['summary']} | {c['analyst_target']}")
+        print(f"    tech: {c['tech_detail']}")
 
     print(f"\nGenerating narrative content for {len(selected)} setup(s) (locked embed format)...")
     narrative_result = write_setup_narratives(selected, market_context, target_date)
@@ -2061,7 +2129,12 @@ def main():
 
     print(f"\nRendering {len(selected)} chart(s)...")
     for c in selected:
-        c["chart_bars"] = get_extended_chart_bars(c["ticker"])
+        # c["chart_bars"] was already fetched earlier (before the narrative
+        # step) -- see the note above -- so it's reused here as-is, not
+        # re-fetched. Removing the duplicate fetch also guarantees this
+        # chart's RSI/EMA/RVOL/Fib numbers are computed from the exact
+        # same bars the write-up above already cited, not a second,
+        # separately-fetched set that could theoretically differ.
         chart_path = f"chart_{c['ticker']}.png"
         render_setup_chart(c, chart_path)
         c["_chart_path"] = chart_path
