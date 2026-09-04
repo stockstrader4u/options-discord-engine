@@ -144,6 +144,45 @@ the POST'S SHAPE repeats regardless of prose quality -- is flagged but
 intentionally NOT changed here, since that format was explicitly
 locked after review (see FORMAT HISTORY above) and changing it is a
 bigger decision than this prose-variety fix.
+
+MEGA-CAP TIER FIX (2026-09-04): confirmed directly by the user that
+Mag7 names (and similarly enormous names generally) never appear in
+the nightly picks, while the same ~10-20 mid/small-cap tickers keep
+recurring. Root cause: `ranking_score`'s `flow_intensity` term divides
+a candidate's options premium by ITS OWN average daily dollar volume
+(compute_avg_dollar_volume()) -- a reasonable "how unusual is this
+flow for this stock" idea in principle, but it directly compares
+numbers across wildly different scales. A genuinely large $5-10M
+options print against AAPL's ~$10B/day volume produces a tiny ratio;
+the identical print against a $200-500M/day mid-cap produces a ratio
+10-100x larger. Sorting the whole universe by this raw ratio therefore
+mathematically locks mega-cap names out of the top 5 regardless of how
+unusual their flow actually was that day -- and structurally favors
+whichever handful of smaller, options-heavy-relative-to-float names
+happen to produce outsized ratios night after night, which is exactly
+the recurring-ticker pattern observed.
+
+Fix, per direct user decision (both changes, together):
+  1. compute_tier_percentiles() ranks each candidate's raw
+     ranking_score as a PERCENTILE WITHIN ITS OWN MARKET-CAP TIER
+     (MEGA_CAP_TIER vs. everyone else) instead of comparing raw scores
+     across the whole universe. This lets a mega-cap name surface when
+     its flow is genuinely unusual FOR a mega-cap, without discarding
+     the underlying "unusual for this stock" signal or letting
+     mega-caps dominate every night -- they still only win when their
+     own tier's relative signal is strong that day.
+  2. A reserved-floor guarantee on top of that: if no MEGA_CAP_TIER
+     name reaches the natural top TOP_N via tier-percentile ranking,
+     but at least one exists that cleared every other filter (flow,
+     same-day-ER exclusion, chart pattern, IV/RV pricing), the
+     lowest-ranked of the natural top TOP_N is swapped for the
+     best-qualifying mega-cap candidate. Per direct instruction: if NO
+     mega-cap tier candidate clears the filters at all that night, no
+     slot is forced -- the run falls back to the normal top TOP_N pool
+     exactly as before this fix.
+MEGA_CAP_TIER's exact roster is a market-cap-scale judgment call, not
+derived from any live data source -- edit the set directly below if
+the roster should change.
 """
 
 import os
@@ -219,6 +258,18 @@ EXCLUDE_FROM_CANDIDATES = {
 MARKET_CONTEXT_TICKERS = ["SPY", "QQQ", "IWM"]
 
 CANDIDATE_UNIVERSE = [t for t in FULL_WATCHLIST if t not in EXCLUDE_FROM_CANDIDATES]
+
+# MEGA-CAP TIER (2026-09-04, see module docstring's "MEGA-CAP TIER
+# FIX" section for the full root-cause writeup). Broader than the
+# classic Mag7 per direct user request -- a pure market-cap-scale
+# judgment call, not derived from any live data source. Every ticker
+# here must also be in CANDIDATE_UNIVERSE or it can never be scanned
+# in the first place; edit this set directly if the roster should
+# change.
+MEGA_CAP_TIER = {
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA",   # Mag7
+    "AVGO", "TSM", "JPM", "WMT", "ORCL", "NFLX", "LLY", "HD", "MA", "UNH",
+}
 
 EARNINGS_LOOKAHEAD_DAYS = 14
 
@@ -1886,6 +1937,35 @@ def ensure_dollar_prefixed_tickers(text: str, tickers: list) -> str:
     return text
 
 
+def compute_tier_percentiles(candidates: list) -> None:
+    """
+    MEGA-CAP TIER FIX (2026-09-04) -- see module docstring for the full
+    root-cause writeup. Mutates each candidate dict in place, adding
+    'tier_percentile': the candidate's percentile rank of its raw
+    ranking_score WITHIN ITS OWN market-cap tier (MEGA_CAP_TIER vs.
+    everyone else), instead of a flat cross-universe comparison.
+
+    Why: ranking_score's flow_intensity term (options premium / the
+    stock's own average dollar volume) is structurally incomparable
+    across wildly different volume scales -- the same $5M options print
+    against a mega-cap's ~$10B/day volume looks negligible next to the
+    identical print against a $200M/day mid-cap, even though both
+    represent genuinely unusual activity FOR THAT STOCK. Ranking each
+    tier only against its own peers preserves the "unusual for this
+    stock" signal without letting the denominator's scale alone decide
+    who can ever make the list.
+    """
+    mega = [c for c in candidates if c["ticker"] in MEGA_CAP_TIER]
+    rest = [c for c in candidates if c["ticker"] not in MEGA_CAP_TIER]
+    for group in (mega, rest):
+        n = len(group)
+        if n == 0:
+            continue
+        ranked = sorted(group, key=lambda c: c["ranking_score"])
+        for i, c in enumerate(ranked):
+            c["tier_percentile"] = (i / (n - 1) * 100) if n > 1 else 100.0
+
+
 def main():
     et_now = datetime.now(ET)
     print(f"[{et_now.isoformat()}] BMT Nightly Setups")
@@ -2002,12 +2082,25 @@ def main():
             pricing_multiplier = 0.75
         c["ranking_score"] = c["flow_intensity"] * pricing_multiplier
 
-    pattern_matched.sort(key=lambda c: (c["ranking_score"], c["flow"]["premium"]), reverse=True)
-
-    selected = []
+    # MEGA-CAP TIER FIX (2026-09-04): rank by percentile WITHIN each
+    # candidate's own market-cap tier instead of a flat cross-universe
+    # sort on raw ranking_score -- see compute_tier_percentiles() and
+    # this module's docstring for the full root-cause writeup.
+    compute_tier_percentiles(pattern_matched)
     for c in pattern_matched:
-        if len(selected) >= TOP_N:
-            break
+        tier_label = "MEGA" if c["ticker"] in MEGA_CAP_TIER else "rest"
+        print(f"  [RANK] {c['ticker']}: tier={tier_label} ranking_score={c['ranking_score']:.4f} "
+              f"tier_percentile={c['tier_percentile']:.1f}")
+
+    pattern_matched.sort(key=lambda c: (c["tier_percentile"], c["ranking_score"]), reverse=True)
+
+    # Build the full earnings-filtered, ranked "eligible" list first
+    # (not capped at TOP_N yet) so the mega-cap reserved-floor check
+    # below can look past the natural top TOP_N for a qualifying
+    # mega-cap candidate that the earnings exclusion alone knocked out
+    # of contention, without re-running the earnings lookups twice.
+    eligible = []
+    for c in pattern_matched:
         yf_er = get_upcoming_earnings_date(c["ticker"])
         finnhub_er = earnings_map.get(c["ticker"])
         er_dates = [d for d in (yf_er, finnhub_er) if d]
@@ -2021,9 +2114,36 @@ def main():
             if blocks:
                 print(f"  [ER EXCLUDE] {c['ticker']}: reports earnings {er_date}")
                 continue
-        selected.append(c)
+        eligible.append(c)
 
-    print(f"\n{len(selected)} of {len(candidates)} passed filters; taking top {len(selected)} by flow intensity.")
+    selected = eligible[:TOP_N]
+
+    # MEGA-CAP RESERVED FLOOR (2026-09-04, direct user decision): if no
+    # MEGA_CAP_TIER name reached the natural top TOP_N via tier-
+    # percentile ranking above, but at least one exists in `eligible`
+    # that cleared every other filter, swap it in for the lowest-ranked
+    # (last) of the current top TOP_N. If NO mega-cap tier candidate
+    # cleared the filters at all tonight, no slot is forced -- this
+    # falls back to the normal top TOP_N pool exactly as before this
+    # fix, per direct instruction.
+    if not any(c["ticker"] in MEGA_CAP_TIER for c in selected):
+        best_mega = next((c for c in eligible if c["ticker"] in MEGA_CAP_TIER), None)
+        if best_mega:
+            if len(selected) >= TOP_N:
+                bumped = selected.pop()
+                print(f"  [MEGA-CAP FLOOR] no mega-cap tier name reached the natural top {TOP_N} -- "
+                      f"swapping in {best_mega['ticker']} (tier percentile {best_mega['tier_percentile']:.1f}) "
+                      f"in place of {bumped['ticker']} (lowest-ranked of the natural top {TOP_N})")
+            else:
+                print(f"  [MEGA-CAP FLOOR] no mega-cap tier name reached the natural top {TOP_N} -- "
+                      f"adding {best_mega['ticker']} (tier percentile {best_mega['tier_percentile']:.1f})")
+            selected.append(best_mega)
+            selected.sort(key=lambda c: (c["tier_percentile"], c["ranking_score"]), reverse=True)
+        else:
+            print(f"  [MEGA-CAP FLOOR] no mega-cap tier candidate cleared filters tonight -- "
+                  f"falling back to the normal top {TOP_N} pool, unchanged")
+
+    print(f"\n{len(selected)} of {len(candidates)} passed filters; taking top {len(selected)} by tier-percentile rank.")
 
     if not selected:
         print("Nothing passed the deterministic chart-pattern filter tonight — no digest to post.")
