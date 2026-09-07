@@ -183,6 +183,26 @@ Fix, per direct user decision (both changes, together):
 MEGA_CAP_TIER's exact roster is a market-cap-scale judgment call, not
 derived from any live data source -- edit the set directly below if
 the roster should change.
+
+FLOW SESSION-DATE BUGFIX (2026-09-07): confirmed directly by the user
+that a scheduled run (Mon Sep 7, a market holiday, publishing ideas
+for Tue Sep 8) came back with 0/166 candidates clearing the flow
+filter -- statistically implausible on its face. Live diagnostic
+calls confirmed get_flow_for_ticker() was calling Jarvis's
+stock_ticker_unusual_options_data with NO date filter at all, which
+defaults to "as of right now" -- on a normal weekday evening that
+silently overlaps with "today's session" so it looks fine, but on a
+day with no trading session at all (weekend, market holiday) it
+returns zero flow for literally every ticker, since today genuinely
+had no trades, even though the real, relevant session's data (the
+last COMPLETED trading day) sits right there in Jarvis waiting to be
+asked for with the right date. Fixed by passing
+filter_by_transaction_date_range_from/_to, both set to the single
+most recent completed trading day (via the existing
+get_last_completed_trading_day()), per direct user instruction: a
+single session's fresh 9:30am-4pm ET data, not a rolling multi-day
+window -- Sep 4th's session feeds Sep 8th's ideas exactly the same way
+a normal Tuesday's session feeds Wednesday's.
 """
 
 import os
@@ -459,8 +479,41 @@ def call_jarvis(tool_name, arguments={}):
     return None
 
 
-def get_flow_for_ticker(ticker: str) -> dict:
-    result = call_jarvis("stock_ticker_unusual_options_data", {"filter_by_Ticker": ticker})
+def get_flow_for_ticker(ticker: str, session_date_mdy: str = None) -> dict:
+    """
+    SESSION-DATE BUGFIX (2026-09-07): previously called with no date
+    filter at all, which left Jarvis defaulting to "as of right now."
+    On a normal weekday evening that happens to overlap with "today's
+    regular session," so it looked like it worked -- but on any night
+    where TODAY had no trading session (weekend, market holiday), it
+    silently returns zero flow for every single ticker, because
+    "today" genuinely had no trades, even though the correct session
+    to screen against (the last COMPLETED trading day) does have real
+    data sitting in Jarvis. Confirmed directly: a live test with no
+    date filter returned optionsFlow:[] for NVDA/TSLA/AVGO/UPST/AMD/
+    PLTR/COIN/SMCI simultaneously on a market-holiday evening -- a
+    statistically impossible "zero flow anywhere" result that was
+    actually just an unset filter silently defaulting to a dead day.
+
+    Fix, per direct user decision: pass filter_by_transaction_date_range_from
+    and _to, BOTH set to the single most recent COMPLETED trading
+    day's date -- the exact 9:30am-4pm ET session that day's flow
+    actually happened in. On a normal night this is "yesterday" (or
+    today, once today's own session has closed); across a weekend or
+    holiday gap it correctly reaches back to the last real session
+    (e.g. Friday's flow feeds Monday-holiday-evening's run for
+    Tuesday's ideas) -- exactly matching how get_last_completed_trading_day()
+    already works for OHLC bars elsewhere in this file. This is
+    deliberately a SINGLE session, not a rolling multi-day window, per
+    direct instruction.
+    """
+    if session_date_mdy is None:
+        session_date_mdy = get_last_completed_trading_day().strftime("%m/%d/%Y")
+    result = call_jarvis("stock_ticker_unusual_options_data", {
+        "filter_by_Ticker": ticker,
+        "filter_by_transaction_date_range_from": session_date_mdy,
+        "filter_by_transaction_date_range_to": session_date_mdy,
+    })
     if not result:
         return {"bias": None, "premium": 0, "call_pct": None}
     flow = result.get("optionsFlow", []) if isinstance(result, dict) else result
@@ -1997,9 +2050,11 @@ def main():
         print(f"  {t}: ${m['price']} ({m['pct']}%)")
 
     print(f"\nScanning {len(CANDIDATE_UNIVERSE)} candidates for qualifying flow (>= ${MIN_PREMIUM:,})...")
+    session_date_mdy = get_last_completed_trading_day().strftime("%m/%d/%Y")
+    print(f"  Flow session date: {session_date_mdy} (last completed trading day)")
     qualifying = []
     for ticker in CANDIDATE_UNIVERSE:
-        flow = get_flow_for_ticker(ticker)
+        flow = get_flow_for_ticker(ticker, session_date_mdy)
         if flow["bias"] and flow["premium"] >= MIN_PREMIUM:
             print(f"  [FLOW] {ticker}: {flow['bias']} ${flow['premium']:,.0f} ({flow['call_pct']}% call)")
             qualifying.append({"ticker": ticker, "flow": flow})
