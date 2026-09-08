@@ -293,6 +293,13 @@ def build_weekly_recap(api_key: str, as_of: date | None = None) -> dict[str, Any
         "remainder": remainder,
         "failed": failed,
         "caption": format_weekly_recap_caption(start_date, end_date, total, win_rate, avg_move),
+        # HOTFIX (2026-09-07): "message" kept as an alias of "caption",
+        # purely so an old caller that hasn't been updated yet
+        # (main.py was still doing recap["message"]) degrades to a
+        # short plain-text post instead of crashing with a KeyError.
+        # Remove once main.py is confirmed updated to use "caption"
+        # and render_weekly_recap_card() directly.
+        "message": format_weekly_recap_caption(start_date, end_date, total, win_rate, avg_move),
     }
 
 
@@ -580,6 +587,29 @@ def render_weekly_recap_card(recap: dict[str, Any], out_path: str) -> None:
 # ---------------------------------------------------------------------------
 # Posting
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# HOTFIX (2026-09-07): post_weekly_recap() was removed in the visual
+# redesign in favor of post_weekly_recap_image(), but main.py's
+# top-level `from weekly_recap import build_weekly_recap,
+# post_weekly_recap` is a MODULE-LEVEL import -- its absence crashed
+# uvicorn at boot, taking down the entire service, not just the weekly
+# recap feature. Restoring this function (old plain-text behavior)
+# immediately unblocks the service from crashing on startup while
+# main.py itself gets updated to call render_weekly_recap_card() +
+# post_weekly_recap_image() instead. DELETE this function once main.py
+# is confirmed updated -- it exists only to prevent an import crash,
+# not because the plain-text format is coming back on purpose.
+# ---------------------------------------------------------------------------
+
+async def post_weekly_recap(webhook_url: str, message: str) -> bool:
+    """DEPRECATED -- old plain-text poster, kept temporarily so an
+    unmigrated caller's import doesn't crash the whole service. See
+    post_weekly_recap_image() for the current image-card version."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(webhook_url, json={"content": message})
+    return resp.status_code in (200, 204)
+
 
 async def post_weekly_recap_image(webhook_url: str, image_path: str, caption: str) -> bool:
     """
