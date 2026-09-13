@@ -55,9 +55,9 @@ DATA: real, live numbers from gex_vex.compute_gex_vex() for all 10
 tickers (Mag 7 + SPY/QQQ/IWM) -- the same function
 gex_vex_combined_daily.py used, unmodified. gex_vex.py is NOT touched
 by this script (aside from the separate 2026-08-19 gamma-flip
-band-matching fix documented in that file's own module docstring,
-which changes the VALUES compute_gex_vex() returns for gamma_flip, not
-this script's own logic).
+band-matching fix and the 2026-09-13 near-term-expiry redesign,
+documented in that file's own module docstring, which change the
+VALUES compute_gex_vex() returns, not this script's own logic).
 
 DEPLOYMENT NOTES: deploy this file alongside gex_vex.py and the
 updated gex_vex_history.py in the same service (Custom Start Command
@@ -99,6 +99,25 @@ layer regardless: even if some future data path ever hands this
 renderer an out-of-range gamma_flip again, it can now never be drawn
 outside its own card's bar, let alone bleed into a neighboring card or
 off the image entirely.
+
+MARKET-HOLIDAY GATE (2026-09-13): confirmed in production that this
+script has NO check anywhere for whether TODAY is actually a trading
+day before running -- the cron schedule itself (30 14 * * 1-5, weekday-
+only) has no concept of market holidays, so a run on e.g. Labor Day
+would fire normally and post a full dashboard built from whatever stale
+data Alpaca happens to return for a day the market never opened. This
+is the same category of bug already found and fixed twice elsewhere in
+this same BMT stack this week (bmt_nightly_setups.py's flow-session-
+date defaulting to a dead day, bmt_weekly_insights.py's week-boundary
+title/day-labeling). Fixed by importing and checking
+market_hours.market_closed_reason() -- the SAME shared holiday-
+detection utility already used correctly elsewhere in this repo (e.g.
+weekly_recap.py's resolve_recap_window() already rolls back to the last
+real trading day using this exact module, which is why that script
+never had this bug) -- at the very top of main(), before any data is
+fetched. A closed-market day now logs the reason and returns
+immediately, posting nothing, rather than publishing a dashboard for a
+day that never traded.
 """
 
 import os
@@ -116,6 +135,7 @@ import numpy as np
 
 import gex_vex
 import gex_vex_history
+from market_hours import market_closed_reason
 
 DISCORD_WEBHOOK = os.environ["GEX_DISCORD_WEBHOOK"]
 ET = ZoneInfo("America/New_York")
@@ -141,6 +161,26 @@ def fmt(v):
     if v is None:
         return "N/A"
     return f"{v:,.0f}" if v == int(v) else f"{v:,.2f}"
+
+
+def _fmt_expiry_label(expiries: list) -> str:
+    """
+    EXPIRY LABEL (2026-09-13): formats a ticker's actual expiry date
+    for on-card display -- see the near-term-expiry redesign in
+    gex_vex.py's module docstring for why this suddenly matters more
+    than it used to (the window now rolls 2-3 days out from whenever
+    the job runs, instead of a fixed "this week" target, so a reader
+    genuinely needs to know which date they're looking at). Falls back
+    to the raw ISO string if parsing fails for any reason, rather than
+    hiding the value entirely.
+    """
+    if not expiries:
+        return "N/A"
+    try:
+        d = datetime.strptime(expiries[0], "%Y-%m-%d").date()
+        return d.strftime("%b %d")
+    except Exception:
+        return expiries[0]
 
 
 def esc(text):
@@ -324,6 +364,21 @@ def render_unified_card(core_results, mag7_results, focus_items, comparisons, we
         if comp.get("regime_flipped"):
             ax.text(badge_x - 0.10, cy + 0.50, "\u26A0", fontsize=13, color=GOLD, va="center", ha="right", zorder=4)
 
+        # EXPIRY LABEL (2026-09-13): nothing on this card previously
+        # showed which expiry date the walls/gamma-flip/net-GEX numbers
+        # actually came from -- confirmed as a real gap while mocking
+        # up the near-term-expiry redesign (see gex_vex.py's module
+        # docstring): the layout never changed, but the underlying
+        # expiry now rolls with a 2-3 day window instead of a fixed
+        # "this week" target, so it's more important than before for a
+        # reader to see exactly which date they're looking at. Placed
+        # in the blank space below the regime badge, which doesn't
+        # require shifting any of the other carefully-measured offsets
+        # below it.
+        exp_label = _fmt_expiry_label(t.get("expiries"))
+        ax.text(cx + card_w - 0.28, cy + 0.78, f"EXP {exp_label}", fontsize=7.6,
+                color=TEXT3, va="top", ha="right", zorder=3)
+
         bar_y = cy + bar_y_off
         bar_x0 = px
         bar_w = card_w - 0.60
@@ -490,8 +545,12 @@ def render_unified_card(core_results, mag7_results, focus_items, comparisons, we
     ax.text(x0 + 0.32, cy + 0.32, "MAG 7 POSITIONING", fontsize=14, fontweight="bold", color=TEXT1, va="top", zorder=3)
 
     th_y = cy + 0.88
-    cols = [x0 + 0.30, x0 + 1.55, x0 + 2.75, x0 + 4.10, x0 + 5.25, x0 + 6.40, x0 + 7.65, x0 + 8.75]
-    headers = ["TICKER", "SPOT", "REGIME", "PUT WALL", "CALL WALL", "GAMMA FLIP", "EXP MOVE", "NET GEX"]
+    # EXPIRY COLUMN ADDED (2026-09-13): same rationale as the core
+    # cards' new expiry label -- see that comment above. Column
+    # positions tightened slightly from the original 8-column layout
+    # to fit the new 9th column within the same left_w.
+    cols = [x0 + 0.30, x0 + 1.30, x0 + 2.15, x0 + 2.95, x0 + 4.15, x0 + 5.30, x0 + 6.45, x0 + 7.60, x0 + 8.70]
+    headers = ["TICKER", "EXPIRY", "SPOT", "REGIME", "PUT WALL", "CALL WALL", "GAMMA FLIP", "EXP MOVE", "NET GEX"]
     for x, h in zip(cols, headers):
         ax.text(x, th_y, h, fontsize=7.3, fontweight="bold", color=TEXT3, va="top", zorder=3)
     th_y += 0.26
@@ -506,17 +565,18 @@ def render_unified_card(core_results, mag7_results, focus_items, comparisons, we
         rc = GREEN if is_long else RED
         em = t.get("expected_move") or {}
         ax.text(cols[0], ry, f"${t['ticker']}", fontsize=10.5, fontweight="bold", color=TEXT1, va="top", zorder=3)
-        ax.text(cols[1], ry, f"{t['spot']:,.2f}", fontsize=9.3, color=TEXT2, va="top", zorder=3)
-        pill(ax, cols[2], ry - 0.01, 1.10, 0.34, rc, "LONG" if is_long else "SHORT", fontsize=7.3)
+        ax.text(cols[1], ry, _fmt_expiry_label(t.get("expiries")), fontsize=8.6, color=TEXT3, va="top", zorder=3)
+        ax.text(cols[2], ry, f"{t['spot']:,.2f}", fontsize=9.3, color=TEXT2, va="top", zorder=3)
+        pill(ax, cols[3], ry - 0.01, 1.05, 0.34, rc, "LONG" if is_long else "SHORT", fontsize=7.0)
         comp = comparisons.get(t["ticker"], {})
         if comp.get("regime_flipped"):
-            ax.text(cols[2] - 0.16, ry + 0.16, "\u26A0", fontsize=10, color=GOLD, va="center", ha="right", zorder=4)
-        ax.text(cols[3], ry, fmt(t.get("put_wall")), fontsize=9.3, color=RED, va="top", zorder=3)
-        ax.text(cols[4], ry, fmt(t.get("call_wall")), fontsize=9.3, color=GREEN, va="top", zorder=3)
-        ax.text(cols[5], ry, fmt(t.get("gamma_flip")), fontsize=9.3, color=GOLD, va="top", zorder=3)
-        ax.text(cols[6], ry, f"\u00b1{em.get('pct', 0)}%" if em else "N/A", fontsize=9.3, color=TEXT1, va="top", zorder=3)
+            ax.text(cols[3] - 0.16, ry + 0.16, "\u26A0", fontsize=10, color=GOLD, va="center", ha="right", zorder=4)
+        ax.text(cols[4], ry, fmt(t.get("put_wall")), fontsize=9.3, color=RED, va="top", zorder=3)
+        ax.text(cols[5], ry, fmt(t.get("call_wall")), fontsize=9.3, color=GREEN, va="top", zorder=3)
+        ax.text(cols[6], ry, fmt(t.get("gamma_flip")), fontsize=9.3, color=GOLD, va="top", zorder=3)
+        ax.text(cols[7], ry, f"\u00b1{em.get('pct', 0)}%" if em else "N/A", fontsize=9.3, color=TEXT1, va="top", zorder=3)
         gex_str = f"+${t['net_gex']/1e9:.2f}B" if t["net_gex"] >= 0 else f"-${abs(t['net_gex'])/1e9:.2f}B"
-        ax.text(cols[7], ry, gex_str, fontsize=9.3, fontweight="bold", color=rc, va="top", zorder=3)
+        ax.text(cols[8], ry, gex_str, fontsize=9.3, fontweight="bold", color=rc, va="top", zorder=3)
         ry += row_h
 
     ax.text(right_x + 0.32, cy + 0.32, "TODAY'S FOCUS", fontsize=14, fontweight="bold", color=TEXT1, va="top", zorder=3)
@@ -634,6 +694,15 @@ def main():
     print("=== DAILY GEX/VEX UNIFIED DASHBOARD -- production run ===\n")
     et_now = datetime.now(ET)
     today_date = et_now.date()
+
+    # MARKET-HOLIDAY GATE (2026-09-13) -- see module docstring for the
+    # full incident this fixes. Must run BEFORE any data is fetched or
+    # any Discord post happens.
+    closed_reason = market_closed_reason()
+    if closed_reason:
+        print(f"  Market closed today ({closed_reason}) -- skipping this run entirely, nothing to post.")
+        return
+
     week_label = get_week_label()
 
     print("Fetching real data for all 10 tickers...")
@@ -644,7 +713,8 @@ def main():
         if "error" in r:
             print(f"  {r.get('ticker', '?')}: ERROR -- {r['error']}")
         else:
-            print(f"  {r['ticker']}: OK -- spot=${r['spot']:.2f} net_gex={r['net_gex']/1e9:+.2f}B")
+            print(f"  {r['ticker']}: OK -- spot=${r['spot']:.2f} net_gex={r['net_gex']/1e9:+.2f}B "
+                  f"expiry={r['expiries'][0]}")
 
     errored_mag7 = [r.get("ticker", "?") for r in mag7_results if "error" in r]
     if errored_mag7:

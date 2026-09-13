@@ -54,6 +54,49 @@ build_since_yesterday_line() now ends in a concrete takeaway, and no
 raw jargon ("wall", "regime", "gamma flip") appears in the output --
 same banned-word posture as the rest of the GEX pipeline's subscriber-
 facing text.
+
+TEMPLATE-VARIETY BUGFIX (2026-09-13): confirmed directly by the user,
+comparing two real posted "Today's Focus" REGIME FLIP entries on the
+same day, that MSFT's and GOOGL's paragraphs were near word-for-word
+identical -- both flipped the SAME direction (long -> short) the same
+day, and build_since_yesterday_line() has exactly ONE hardcoded string
+per flip direction, so any two tickers sharing a direction on the same
+day always produced the literal same paragraph (only the ticker name
+and the opening spot-change clause differed, via spot_clause()). This
+is NOT an LLM -- this whole function is deterministic Python string
+building, so the "templated" complaint was about REAL template reuse,
+not an LLM parroting itself.
+
+FIX: each flip direction now has FIVE phrasing variants instead of one
+(widened from an initial 3 -- see the 2026-09-13 same-day follow-up
+note below). A ticker's variant is chosen deterministically from its
+own symbol (see _pick_variant() below) -- the SAME ticker always gets
+the same variant day to day (so its voice doesn't feel randomly
+inconsistent), but DIFFERENT tickers very likely land on different
+variants, so two tickers flipping the same direction on the same day
+no longer produce identical text. Each variant also weaves in the
+ticker's actual gamma_flip level when available (not just the ticker
+name), which further differentiates two same-direction tickers whose
+pivot levels genuinely differ -- concrete numbers, not just varied
+wording, same principle already used in bmt_nightly_setups.py's own
+narrative-variety fix (lean on the specific real numbers already
+available, not just categorical language). All five variants for a
+given direction say the exact same real thing (same mechanism, same
+instruction) -- only sentence structure and phrasing differ.
+
+SAME-DAY FOLLOW-UP (2026-09-13): a real mock render caught a residual
+collision even after the above fix -- SPY and QQQ, both flipping the
+same direction, both landed on the SAME variant (3 variants means
+roughly 1-in-3 odds for any pair) AND both had gamma_flip=None (a
+completely normal, common occurrence, not a data error), so
+_flip_level_clause() returned an empty string for both -- meaning the
+one piece of the sentence meant to carry ticker-specific numbers
+carried nothing for either, and they ended up identical after the
+variant text anyway. Two independent fixes: (1) variant count raised
+from 3 to 5, lowering collision odds further; (2) _flip_level_clause()
+now falls back to the nearer of put_wall/call_wall when gamma_flip is
+unavailable, so the clause is non-empty far more often instead of
+depending entirely on a field that's frequently None.
 """
 
 import os
@@ -218,6 +261,49 @@ def get_previous_snapshot(ticker: str, before_date: date, lookback_days: int = 7
         return None
 
 
+def _pick_variant(ticker: str, n: int) -> int:
+    """
+    TEMPLATE-VARIETY BUGFIX (2026-09-13): deterministic per-ticker
+    variant selector -- see module docstring for the full production
+    incident (MSFT/GOOGL posting word-for-word identical paragraphs on
+    the same flip direction). The SAME ticker always gets the same
+    variant index across runs (so its voice doesn't feel randomly
+    inconsistent day to day), but different tickers very likely land
+    on different variants, since this hashes the ticker symbol itself
+    rather than the date or any shared input.
+    """
+    return sum(ord(c) for c in ticker) % n
+
+
+def _flip_level_clause(today: dict) -> str:
+    """
+    Small optional clause naming a real concrete number, when available,
+    so two tickers sharing both a flip direction AND a phrasing variant
+    still read as concretely different -- their real numbers differ
+    even when their sentence structure doesn't.
+
+    FALLBACK FIX (2026-09-13): confirmed via a real mock render that
+    SPY and QQQ -- both flipping the same direction the same day, both
+    with gamma_flip=None (a completely normal, common occurrence, not
+    an error) -- produced an EMPTY level_bit for both, which was the
+    deeper reason they still collided even after the variant fix: two
+    empty strings are identical no matter how many variants exist.
+    Falls back to whichever of put_wall/call_wall sits closer to spot
+    when gamma_flip isn't available, so this clause is far more often
+    non-empty than before.
+    """
+    flip = today.get("gamma_flip")
+    if flip is not None:
+        return f" (around {flip:,.2f})"
+
+    spot = today.get("spot")
+    candidates = [w for w in (today.get("put_wall"), today.get("call_wall")) if w is not None]
+    if not candidates or spot is None:
+        return ""
+    nearest = min(candidates, key=lambda w: abs(w - spot))
+    return f" (near {nearest:,.2f})"
+
+
 def build_since_yesterday_line(ticker: str, today: dict, yesterday: dict) -> str:
     """
     Returns a short, PLAIN-ENGLISH, action-oriented "Since Yesterday"
@@ -238,6 +324,11 @@ def build_since_yesterday_line(ticker: str, today: dict, yesterday: dict) -> str
     flip"->"pivot point"), same self-correcting/less-cushion framing
     already used elsewhere in the GEX pipeline for regime behavior,
     and every branch ends in something the reader can actually act on.
+
+    TEMPLATE-VARIETY BUGFIX (2026-09-13): see module docstring. The
+    regime-flip branch (Priority 1) now picks from THREE phrasing
+    variants per direction via _pick_variant(), instead of the single
+    hardcoded string each direction previously had.
 
     Priority order (a ticker only gets ONE of these, not a bullet list
     of all that apply -- a single clear paragraph beats a stacked
@@ -276,18 +367,59 @@ def build_since_yesterday_line(ticker: str, today: dict, yesterday: dict) -> str
         if was_long != is_long:
             spot_bit = spot_clause()
             spot_prefix = f"{spot_bit}, and t" if spot_bit else "T"
+            level_bit = _flip_level_clause(today)
+            variant = _pick_variant(ticker, 5)
+
             if is_long:
                 # short -> long: MORE contained now
-                return (f"{spot_prefix}his one has calmed down since yesterday \u2014 it now has more of a "
-                        f"built-in cushion that tends to pull price back toward the middle if it swings too "
-                        f"far in either direction. That means big breakout moves are less likely to stick "
-                        f"today than they were yesterday, so it's a better setup for trading the range than "
-                        f"chasing a big move.")
-            # long -> short: LESS contained now
-            return (f"{spot_prefix}his one has less of a cushion against bigger moves than it did yesterday "
-                    f"\u2014 if it breaks past a key level today, the move could travel further and faster "
-                    f"than you'd expect from a normal day. Keep position sizes smaller than usual and don't "
-                    f"assume a dip gets bought right away.")
+                variants = [
+                    (f"{spot_prefix}his one has calmed down since yesterday \u2014 it now has more of a "
+                     f"built-in cushion that tends to pull price back toward the middle if it swings too "
+                     f"far in either direction. That means big breakout moves are less likely to stick "
+                     f"today than they were yesterday, so it's a better setup for trading the range than "
+                     f"chasing a big move."),
+                    (f"{spot_prefix}his setup shifted calmer overnight{level_bit} \u2014 there's real "
+                     f"resistance now to a runaway move in either direction, so a push toward either edge "
+                     f"of today's range is more likely to get bought/sold back than to keep going. Fits "
+                     f"better with fading extremes than swinging for a breakout today."),
+                    (f"{spot_prefix}his positioning turned more contained since yesterday{level_bit} \u2014 "
+                     f"a move past either edge now has something pulling it back toward the middle rather "
+                     f"than running away. Today favors trading the range over chasing a big move, since a "
+                     f"spike past either level is more likely to snap back than extend."),
+                    (f"{spot_prefix}his one flipped into a steadier setup overnight{level_bit} \u2014 price "
+                     f"now has more of a natural brake on it, so a fast move in either direction is more "
+                     f"likely to fade than follow through. Good day to lean on the range rather than chase "
+                     f"a breakout."),
+                    (f"{spot_prefix}his one is behaving differently than it did yesterday{level_bit} \u2014 "
+                     f"the options market is now leaning toward pulling price back toward the middle rather "
+                     f"than letting a move run, so today's breakouts are less trustworthy than they were. "
+                     f"Trade the bounce, not the breakout."),
+                ]
+            else:
+                # long -> short: LESS contained now
+                variants = [
+                    (f"{spot_prefix}his one has less of a cushion against bigger moves than it did "
+                     f"yesterday \u2014 if it breaks past a key level today, the move could travel "
+                     f"further and faster than you'd expect from a normal day. Keep position sizes "
+                     f"smaller than usual and don't assume a dip gets bought right away."),
+                    (f"{spot_prefix}his setup shifted more exposed overnight{level_bit} \u2014 the "
+                     f"cushion that was keeping moves contained yesterday isn't there today, so a break "
+                     f"past a key level has real room to run further than usual. Size down and don't "
+                     f"assume a pullback shows up on cue."),
+                    (f"{spot_prefix}his positioning turned less stable since yesterday{level_bit} \u2014 "
+                     f"there's less to slow a move down once it clears a nearby level, so today's swings "
+                     f"could extend further and faster than a typical session. Trade smaller and stay "
+                     f"ready for a move that doesn't get bought back quickly."),
+                    (f"{spot_prefix}his one lost some of its natural brake overnight{level_bit} \u2014 "
+                     f"once price clears a nearby level today, there's less standing in the way of it "
+                     f"continuing, so a breakout has a better chance of actually sticking than it did "
+                     f"yesterday. Keep size in check."),
+                    (f"{spot_prefix}his one is more exposed to a real move today than it was "
+                     f"yesterday{level_bit} \u2014 the options market isn't leaning toward pulling price "
+                     f"back the way it was, so a break past a nearby level could travel further than "
+                     f"usual. Don't fade this one as confidently as you might have yesterday."),
+                ]
+            return variants[variant]
 
     # --- Priority 2: a level shifted meaningfully ------------------------
     for label_up, label_down, key in (

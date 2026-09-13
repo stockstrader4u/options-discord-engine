@@ -13,13 +13,46 @@ get_iv_vs_realized_vol). The one thing yfinance does NOT return is Greeks
 Black-Scholes closed-form formulas, using the IV/spot/strike/time-to-
 expiry yfinance already gives us.
 
-DEFAULT EXPIRY RULE (get_week_ending_expiry): computed for the LAST
-TRADING DAY of the current calendar week — Mon Jul 27 through Fri Jul 31
-of the same week all resolve to the Jul 31 expiry. Verified against the
-ticker's real listed expiries rather than assuming Friday is always a
-trading day, so a holiday-shortened week automatically falls back to
-Thursday. Pass an explicit `expiries=[...]` list to override this (used
-by the multi-expiry diagnostic mode in test_gex_vex_live.py).
+NEAR-TERM EXPIRY REDESIGN (2026-09-13): confirmed by direct user
+decision that this entire pipeline's actual audience is day traders and
+2-3 DTE swing traders -- meaning the expiry this dashboard uses for
+EVERY ticker needs to consistently reflect "the next couple of trading
+sessions," not whatever happens to expire by the end of the current
+calendar week. The old default, get_week_ending_expiry(), picked
+whatever expired by THIS WEEK'S Friday -- which meant the actual DTE
+being shown silently floated from 5 days (a Monday run) down to 1 day
+(a Friday run) purely depending on what day the job happened to run,
+with nothing on the card telling a reader the window had shifted. A
+dashboard meant to show "the levels that matter right now for a 2-3 day
+trade" was instead showing a genuinely different lookout window every
+single day of the week.
+
+FIX: get_near_term_expiry() (new, see below) replaces
+get_week_ending_expiry() as compute_gex_vex()'s default for EVERY
+ticker (SPY/QQQ/IWM and all seven Mag7 names alike, per direct user
+decision -- this isn't scoped to just the three indices). It searches
+for the nearest ACTUALLY LISTED expiry within a 2-3 calendar-day window
+from today, so "today's near-term view" means roughly the same thing
+regardless of which day of the week the job runs. get_week_ending_expiry()
+itself is left in place, unused internally, only in case some external
+caller still depends on it directly -- it is no longer called by
+anything in this file.
+
+This same decision is also why gex_vex_html_render.py's weekly+monthly-
+OpEx blend for SPY/QQQ/IWM was removed entirely (see that file's own
+docstring) -- monthly OI reflects medium-term institutional
+positioning, not what's pinning or releasing price in the next 2-3
+sessions, so blending it into the near-term view actively worked
+against this dashboard's actual audience.
+
+DEFAULT EXPIRY RULE, OLD (get_week_ending_expiry, superseded as of
+2026-09-13 -- see above): computed for the LAST TRADING DAY OF THE
+CURRENT CALENDAR WEEK — Mon Jul 27 through Fri Jul 31 of the same week
+all resolve to the Jul 31 expiry. Verified against the ticker's real
+listed expiries rather than assuming Friday is always a trading day, so
+a holiday-shortened week automatically falls back to Thursday. Pass an
+explicit `expiries=[...]` list to override this (used by the
+multi-expiry diagnostic mode in test_gex_vex_live.py).
 
 METHODOLOGY NOTES (read before trusting the numbers):
 - Convention used: the standard "public GEX approximation" that every
@@ -137,11 +170,22 @@ were just as trustworthy as the walls.
 
 FIX: compute_gex_vex() now passes the SAME band_pct used for wall
 selection into find_gamma_flip(), so a flip is only ever reported if
-it falls within the identical window the card's own put/call walls are
-drawn from. If nothing crosses within that tighter window, this
+it falls within the identical window the card's own put/call walls
+are drawn from. If nothing crosses within that tighter window, this
 returns None (the exact same "no crossing found" behavior that already
 existed and is already handled everywhere downstream), rather than a
 technically-real but visually-nonsensical distant number.
+
+NOTE (2026-09-13): band_pct's formula --
+`max(expected_move["pct"] * 3 / 100, 0.10)` -- is worth watching now
+that the default expiry is near-term (2-3 DTE) rather than a full week
+out. SPY/QQQ/IWM's expected move over 2-3 days is typically well under
+3.3%, meaning `3 x expected_move` rarely exceeds the 10% floor -- in
+practice the band is close to a flat 10% for these three tickers most
+days, regardless of the expected-move scaling term. Not changed here
+without real evidence either way; flagged for future comparison against
+an unrestricted (no-band) flip search if gamma flip continues to show
+as N/A unexpectedly often.
 """
 
 import math
@@ -360,6 +404,13 @@ def pick_nearest_expiry(expirations: list) -> str:
 
 
 def get_week_ending_expiry(ticker: str, today: date = None) -> str:
+    """
+    SUPERSEDED (2026-09-13): this was compute_gex_vex()'s default expiry
+    selection until the near-term-expiry redesign (see module docstring)
+    replaced it with get_near_term_expiry() for every ticker. Left in
+    place, unused internally, only in case some external caller still
+    depends on it directly -- nothing in this file calls it anymore.
+    """
     if today is None:
         today = date.today()
     monday = today - timedelta(days=today.weekday())
@@ -385,6 +436,82 @@ def get_week_ending_expiry(ticker: str, today: date = None) -> str:
     return None
 
 
+def get_near_term_expiry(ticker: str, today: date = None,
+                          min_days: int = 2, max_days: int = 3) -> str:
+    """
+    NEAR-TERM EXPIRY REDESIGN (2026-09-13) -- see module docstring for
+    the full rationale. Replaces get_week_ending_expiry() as
+    compute_gex_vex()'s default for EVERY ticker (all 10 -- SPY/QQQ/IWM
+    and the Mag7 alike, per direct user decision).
+
+    Definition, per direct user decision: the nearest ACTUALLY LISTED
+    expiry within [today + min_days, today + max_days] calendar days
+    (default 2-3 days) -- not "whatever expires by this Friday," so the
+    window means roughly the same thing whether this runs on a Monday
+    or a Thursday.
+
+    Search order:
+      1. Walk forward day-by-day from today+min_days through
+         today+max_days, return the first date that's actually listed
+         for this ticker.
+      2. If nothing in that exact window is listed (e.g. a holiday-
+         shortened week, or a name whose weeklies don't align with
+         every calendar day), expand outward one day at a time in both
+         directions (never going earlier than today) up to a week out,
+         and take whichever actually-listed date is found first --
+         same defensive probing pattern already used elsewhere in this
+         file for holiday fallback.
+      3. Returns None (compute_gex_vex() already handles this as "no
+         options chain available") if nothing is found at all.
+    """
+    if today is None:
+        today = date.today()
+
+    target_low = today + timedelta(days=min_days)
+    target_high = today + timedelta(days=max_days)
+
+    candidate = target_low
+    while candidate <= target_high:
+        candidate_str = candidate.strftime("%Y-%m-%d")
+        try:
+            resp = requests.get(
+                f"{ALPACA_TRADING_BASE}/v2/options/contracts",
+                headers=_alpaca_headers(),
+                params={"underlying_symbols": ticker, "expiration_date": candidate_str, "limit": 1},
+                timeout=15,
+            )
+            if resp.status_code == 200 and resp.json().get("option_contracts"):
+                return candidate_str
+        except Exception as e:
+            print(f"[GEX WARN] {ticker} near-term expiry probe {candidate_str}: {e}")
+        candidate += timedelta(days=1)
+
+    # Nothing listed in the exact target window -- expand outward day by
+    # day (both earlier, never before today, and later) up to a week in
+    # each direction.
+    for offset in range(1, 8):
+        for probe in (target_low - timedelta(days=offset), target_high + timedelta(days=offset)):
+            if probe < today:
+                continue
+            probe_str = probe.strftime("%Y-%m-%d")
+            try:
+                resp = requests.get(
+                    f"{ALPACA_TRADING_BASE}/v2/options/contracts",
+                    headers=_alpaca_headers(),
+                    params={"underlying_symbols": ticker, "expiration_date": probe_str, "limit": 1},
+                    timeout=15,
+                )
+                if resp.status_code == 200 and resp.json().get("option_contracts"):
+                    print(f"  [EXPIRY] {ticker}: nothing listed within {min_days}-{max_days}d window, "
+                          f"using {probe_str} instead (offset {offset}d from target window)")
+                    return probe_str
+            except Exception as e:
+                print(f"[GEX WARN] {ticker} near-term expiry fallback probe {probe_str}: {e}")
+
+    print(f"[GEX WARN] {ticker}: no listed expiry found within the near-term window or its fallback range")
+    return None
+
+
 def compute_gex_vex(ticker: str, expiries: list = None) -> dict:
     try:
         spot = get_spot_price(ticker)
@@ -393,10 +520,14 @@ def compute_gex_vex(ticker: str, expiries: list = None) -> dict:
 
         target_expiries = expiries
         if not target_expiries:
-            week_exp = get_week_ending_expiry(ticker)
-            if not week_exp:
+            # NEAR-TERM EXPIRY REDESIGN (2026-09-13): was
+            # get_week_ending_expiry() -- see that function's and this
+            # module's docstrings for why. Applies to every ticker
+            # equally now, not just SPY/QQQ/IWM.
+            near_term_exp = get_near_term_expiry(ticker)
+            if not near_term_exp:
                 return {"error": f"{ticker}: no options chain available", "ticker": ticker}
-            target_expiries = [week_exp]
+            target_expiries = [near_term_exp]
 
         per_strike = {}
         total_oi_seen = 0.0
