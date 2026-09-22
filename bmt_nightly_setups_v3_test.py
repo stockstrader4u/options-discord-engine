@@ -450,16 +450,46 @@ def get_flow_rows_for_ticker(ticker: str, session_date_mdy: str = None) -> list:
 
 
 def get_daily_ohlc(ticker: str, sessions: int = 15) -> list:
+    """
+    NaN-ROW BUGFIX (confirmed 2026-09-22 from a real v3 test post): a
+    posted setup showed "$nan" for stop/target/R:R and "closing at $nan"
+    in the price narrative, across every setup in the batch -- not one
+    ticker's fluke. Root cause: yfinance's .history() can return a row
+    with NaN open/high/low/close (seen on thinly-traded sessions, and
+    around split/dividend adjustment boundaries in the 2mo window) --
+    and NaN poisons every downstream float computation it touches via
+    ordinary arithmetic (NaN + x = NaN), silently, with no exception
+    raised anywhere. compute_daily_atr() summed b["high"]-b["low"]
+    across all bars with no NaN guard, so one bad bar in the 15-session
+    window was enough to NaN the whole ATR, and every stop/target/R:R
+    derived from it downstream. Fixed by dropping any row with a NaN
+    open/high/low/close right here, at the source, so nothing
+    downstream in the pipeline ever sees a bad bar. A ticker that ends
+    up with too few clean sessions after this filtering is handled by
+    the existing "if not bars" checks already present at every call
+    site (e.g. main()'s "[WARN] {ticker}: no current price -- dropping"
+    and similar upstream skip-on-empty guards).
+    """
     try:
         import yfinance as yf
+        import math
         stock = yf.Ticker(ticker)
         hist = stock.history(period="2mo")
         if hist.empty:
             return []
         hist = hist.tail(sessions)
-        return [{"date": date, "open": row["Open"], "high": row["High"], "low": row["Low"],
-                  "close": row["Close"], "volume": row.get("Volume", 0) or 0}
-                for date, row in hist.iterrows()]
+        bars = []
+        dropped = 0
+        for date, row in hist.iterrows():
+            o, h, l, c = row["Open"], row["High"], row["Low"], row["Close"]
+            if any(v is None or (isinstance(v, float) and math.isnan(v)) for v in (o, h, l, c)):
+                dropped += 1
+                continue
+            bars.append({"date": date, "open": o, "high": h, "low": l,
+                         "close": c, "volume": row.get("Volume", 0) or 0})
+        if dropped:
+            print(f"  [OHLC WARN] {ticker}: dropped {dropped} bar(s) with NaN OHLC values")
+        return bars
     except Exception as e:
         print(f"  [OHLC WARN] {ticker}: {e}")
         return []
@@ -1474,15 +1504,30 @@ def build_technical_detail(c: dict) -> str:
 
 
 def get_extended_chart_bars(ticker: str, sessions: int = 90) -> list:
+    """Same NaN-row bugfix as get_daily_ohlc() above -- see that
+    function's docstring for the full root-cause writeup. This is the
+    90-session window used for charts, RVOL, RSI, EMA, and Fibonacci
+    levels, so a NaN row here is exactly what produced the "EMA 5 nan"
+    legend text and "$nan" R:R seen in the real posted test output."""
     try:
         import yfinance as yf
+        import math
         hist = yf.Ticker(ticker).history(period="6mo")
         if hist.empty:
             return []
         hist = hist.tail(sessions)
-        return [{"date": date, "open": row["Open"], "high": row["High"], "low": row["Low"],
-                  "close": row["Close"], "volume": row.get("Volume", 0) or 0}
-                for date, row in hist.iterrows()]
+        bars = []
+        dropped = 0
+        for date, row in hist.iterrows():
+            o, h, l, c = row["Open"], row["High"], row["Low"], row["Close"]
+            if any(v is None or (isinstance(v, float) and math.isnan(v)) for v in (o, h, l, c)):
+                dropped += 1
+                continue
+            bars.append({"date": date, "open": o, "high": h, "low": l,
+                         "close": c, "volume": row.get("Volume", 0) or 0})
+        if dropped:
+            print(f"  [CHART BARS WARN] {ticker}: dropped {dropped} bar(s) with NaN OHLC values")
+        return bars
     except Exception as e:
         print(f"  [CHART BARS WARN] {ticker}: {e}")
         return []
