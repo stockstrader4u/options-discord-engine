@@ -98,7 +98,7 @@ except Exception:
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyBboxPatch
+from matplotlib.patches import FancyBboxPatch, Circle
 from apscheduler.schedulers.background import BackgroundScheduler
 import pg8000.native as _pg8000
 
@@ -1881,24 +1881,28 @@ def post_embeds_to_discord(embeds: list) -> bool:
 # change the chart renderer" instruction.
 # ─────────────────────────────────────────────────────────────────────
 
-CHART_BG = "#0d1117"
-CHART_SURFACE = "#161b22"
-CHART_GRID = "#21262d"
-CHART_TEXT_PRIMARY = "#f5f5f7"
-CHART_TEXT_SECONDARY = "#9198a1"
-CHART_BORDER = "#30363d"
-CANDLE_UP = "#22d3ee"
-CANDLE_DOWN = "#f43f5e"
-EMA_FAST_COLOR = "#2dd4bf"
-EMA_SLOW_COLOR = "#fb923c"
-VOL_UP_COLOR = "#3b82f6"
-VOL_DOWN_COLOR = "#ef4444"
-CHART_GREEN = "#34d399"
-CHART_RED = "#f87171"
-CHART_GOLD = "#fbbf24"
-CHART_BLUE = "#60a5fa"
+# ── Chart palette (redesigned, v3-only): warm charcoal, muted sage/coral —
+# a deliberate departure from generic blue-black/neon-fintech dark mode.
+# See prototype_chart.py (design scratch file, not part of the pipeline)
+# for the side-by-side before/after this was developed against.
+CHART_BG = "#16151A"
+CHART_SURFACE = "#1E1D24"
+CHART_SURFACE_ALT = "#252430"
+CHART_GRID = "#2A2932"
+CHART_TEXT_PRIMARY = "#EDEBE8"
+CHART_TEXT_SECONDARY = "#9B96A3"
+CHART_TEXT_TERTIARY = "#635E6C"
+CHART_BORDER = "#332F3B"
+CANDLE_UP = "#5FBF8F"
+CANDLE_DOWN = "#E0685C"
+EMA_FAST_COLOR = "#5FBF8F"
+EMA_SLOW_COLOR = "#D4A657"
+CHART_GREEN = "#5FBF8F"
+CHART_RED = "#E0685C"
+CHART_GOLD = "#D4A657"
+CHART_BLUE = "#7C93B0"
+CHART_RSI_COLOR = "#A88FC7"
 
-FIB_LEVELS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.236, 1.382, 1.618]
 SETUP_TYPE_LABELS = {
     ("CALL", "higher lows"): "BULLISH CONTINUATION",
     ("CALL", "V-recovery"): "BULLISH REVERSAL",
@@ -1907,41 +1911,11 @@ SETUP_TYPE_LABELS = {
 }
 
 
-def get_pattern_trendline(c: dict, chart_len: int):
-    bars = c["bars"]
-    window = bars[-10:] if len(bars) >= 10 else bars
-    offset = chart_len - len(window)
-    pattern = c.get("pattern")
-
-    if pattern == "higher lows":
-        lows = [b["low"] for b in window]
-        swing_highs, swing_lows = find_swing_points(window)
-        if len(swing_lows) >= 2:
-            pts = [(offset + i, v) for i, v in swing_lows]
-        else:
-            pts = [(offset, lows[0]), (offset + len(window) - 1, lows[-1])]
-        return pts, CHART_GREEN
-
-    if pattern == "lower highs":
-        highs = [b["high"] for b in window]
-        swing_highs, swing_lows = find_swing_points(window)
-        if len(swing_highs) >= 2:
-            pts = [(offset + i, v) for i, v in swing_highs]
-        else:
-            pts = [(offset, highs[0]), (offset + len(window) - 1, highs[-1])]
-        return pts, CHART_RED
-
-    if pattern == "V-recovery":
-        min_idx = min(range(len(window)), key=lambda i: window[i]["low"])
-        pts = [(offset + min_idx, window[min_idx]["low"]), (offset + len(window) - 1, window[-1]["close"])]
-        return pts, CHART_GREEN
-
-    if pattern == "breakdown":
-        max_idx = max(range(len(window)), key=lambda i: window[i]["high"])
-        pts = [(offset + max_idx, window[max_idx]["high"]), (offset + len(window) - 1, window[-1]["close"])]
-        return pts, CHART_RED
-
-    return [], CHART_TEXT_SECONDARY
+def build_setup_type_label(direction: str, pattern: str) -> str:
+    label = SETUP_TYPE_LABELS.get((direction.upper(), pattern))
+    if label:
+        return label
+    return "BULLISH SETUP" if direction.upper() == "CALL" else "BEARISH SETUP"
 
 
 def compute_reward_risk(c: dict) -> tuple:
@@ -1955,24 +1929,32 @@ def compute_reward_risk(c: dict) -> tuple:
     return round(reward1 / risk, 1), round(reward2 / risk, 1)
 
 
-def build_setup_type_label(direction: str, pattern: str) -> str:
-    label = SETUP_TYPE_LABELS.get((direction.upper(), pattern))
-    if label:
-        return label
-    return "BULLISH SETUP" if direction.upper() == "CALL" else "BEARISH SETUP"
-
-
 def render_setup_chart(c: dict, out_path: str):
+    """
+    REDESIGNED (v3, lock lifted per direct instruction after review of
+    real posted test output showed the old chart's visual execution --
+    invisible trendline, cluttered legend, flat unstyled sidebar -- was
+    genuinely mediocre, separately from the NaN-data bug that also hit
+    the same test post). Same information content as before (candles,
+    EMA 5/12, entry zone, stop/targets, volume, RSI, trade-plan sidebar,
+    confirmation checklist) -- redesigned for actual visual hierarchy:
+    a warm-charcoal palette instead of blue-black, muted sage/coral
+    instead of neon, a heavier glow-backed trendline that actually reads
+    as structure, right-edge tag labels on stop/target lines instead of
+    a cluttered top-left legend, and a sidebar with real hierarchy (the
+    entry zone gets a boxed treatment as the primary decision, then
+    stop/targets/R:R, then a confirmation checklist with status dots).
+    """
     chart_bars = c.get("chart_bars") or c["bars"]
     n = len(chart_bars)
     is_call = c["direction"].upper() == "CALL"
     closes = [b["close"] for b in chart_bars]
     xs = list(range(n))
 
-    fig = plt.figure(figsize=(15, 8.5), dpi=170, facecolor=CHART_BG)
-    outer = fig.add_gridspec(1, 2, width_ratios=[3.3, 1], wspace=0.03,
-                              left=0.045, right=0.98, top=0.85, bottom=0.07)
-    left_gs = outer[0, 0].subgridspec(3, 1, height_ratios=[3.2, 0.85, 1.0], hspace=0.10)
+    fig = plt.figure(figsize=(15.5, 8.6), dpi=170, facecolor=CHART_BG)
+    outer = fig.add_gridspec(1, 2, width_ratios=[3.15, 1.05], wspace=0.035,
+                              left=0.045, right=0.98, top=0.85, bottom=0.065)
+    left_gs = outer[0, 0].subgridspec(3, 1, height_ratios=[3.3, 0.75, 0.95], hspace=0.09)
     ax = fig.add_subplot(left_gs[0])
     vol_ax = fig.add_subplot(left_gs[1], sharex=ax)
     rsi_ax = fig.add_subplot(left_gs[2], sharex=ax)
@@ -1984,152 +1966,198 @@ def render_setup_chart(c: dict, out_path: str):
         for spine in a.spines.values():
             spine.set_color(CHART_BORDER)
             spine.set_linewidth(0.6)
-        a.tick_params(colors=CHART_TEXT_SECONDARY, labelsize=8, length=0)
-        a.grid(color=CHART_GRID, linewidth=0.4, alpha=0.5)
+        a.tick_params(colors=CHART_TEXT_TERTIARY, labelsize=8, length=0)
+        a.grid(color=CHART_GRID, linewidth=0.4, alpha=0.45)
 
-    right_edge = n + 3.0
+    right_edge = n + 6.5
 
     ema5 = compute_ema_series(closes, 5)
     ema12 = compute_ema_series(closes, 12)
-    ax.plot(xs, ema5, color=EMA_FAST_COLOR, linewidth=1.3, zorder=3)
-    ax.plot(xs, ema12, color=EMA_SLOW_COLOR, linewidth=1.3, zorder=3)
-    ax.plot([0.012, 0.032], [0.965, 0.965], transform=ax.transAxes, color=EMA_FAST_COLOR, linewidth=2.5, solid_capstyle="round")
-    ax.text(0.038, 0.965, f"EMA 5   {ema5[-1]:,.2f}", transform=ax.transAxes, color=CHART_TEXT_PRIMARY,
-            fontsize=8.5, va="center", ha="left")
-    ax.plot([0.012, 0.032], [0.915, 0.915], transform=ax.transAxes, color=EMA_SLOW_COLOR, linewidth=2.5, solid_capstyle="round")
-    ax.text(0.038, 0.915, f"EMA 12  {ema12[-1]:,.2f}", transform=ax.transAxes, color=CHART_TEXT_PRIMARY,
-            fontsize=8.5, va="center", ha="left")
+    ax.plot(xs, ema5, color=EMA_FAST_COLOR, linewidth=1.1, alpha=0.9, zorder=3)
+    ax.plot(xs, ema12, color=EMA_SLOW_COLOR, linewidth=1.1, alpha=0.9, zorder=3)
 
     for i, b in enumerate(chart_bars):
         color = CANDLE_UP if b["close"] >= b["open"] else CANDLE_DOWN
-        ax.plot([i, i], [b["low"], b["high"]], color=color, linewidth=1, zorder=4)
+        ax.plot([i, i], [b["low"], b["high"]], color=color, linewidth=1.0, zorder=4, alpha=0.95)
         body_low, body_high = sorted([b["open"], b["close"]])
-        ax.add_patch(plt.Rectangle((i - 0.3, body_low), 0.6, max(body_high - body_low, 0.01),
-                                    facecolor=color, edgecolor=color, zorder=5))
+        ax.add_patch(plt.Rectangle((i - 0.32, body_low), 0.64, max(body_high - body_low, 0.01),
+                                    facecolor=color, edgecolor=color, zorder=5, alpha=0.95))
 
-    pts, trend_color = get_pattern_trendline(c, n)
-    if len(pts) >= 2:
-        xs_t = [p[0] for p in pts]
-        ys_t = [p[1] for p in pts]
-        ax.plot(xs_t, ys_t, color=trend_color, linewidth=1.8, marker="o", markersize=4, zorder=7)
+    # Trendline: wider window (22 bars, not 10) so real swing structure has
+    # room to show up; glow-backed heavier line so it reads as the
+    # pattern's STRUCTURE rather than a decorative squiggle. Falls back to
+    # a simple first-to-last anchor on the relevant extreme if fewer than
+    # 2 real swing points exist in the window, so there's always a line.
+    window = chart_bars[-22:] if len(chart_bars) >= 22 else chart_bars
+    offset = n - len(window)
+    swing_highs, swing_lows = find_swing_points(window)
+    if is_call:
+        if len(swing_lows) >= 2:
+            pts = sorted([(offset + i, v) for i, v in swing_lows], key=lambda p: p[0])
+        else:
+            lows = [b["low"] for b in window]
+            min_idx = min(range(len(lows)), key=lambda i: lows[i])
+            pts = [(offset + min_idx, lows[min_idx]), (offset + len(window) - 1, window[-1]["low"])]
+        trend_color = CHART_GREEN
+    else:
+        if len(swing_highs) >= 2:
+            pts = sorted([(offset + i, v) for i, v in swing_highs], key=lambda p: p[0])
+        else:
+            highs = [b["high"] for b in window]
+            max_idx = max(range(len(highs)), key=lambda i: highs[i])
+            pts = [(offset + max_idx, highs[max_idx]), (offset + len(window) - 1, window[-1]["high"])]
+        trend_color = CHART_RED
+    xs_t = [p[0] for p in pts]
+    ys_t = [p[1] for p in pts]
+    ax.plot(xs_t, ys_t, color=trend_color, linewidth=6.0, alpha=0.18, zorder=2, solid_capstyle="round")
+    ax.plot(xs_t, ys_t, color=trend_color, linewidth=2.2, zorder=9, marker="o", markersize=6.5,
+            markerfacecolor=trend_color, markeredgecolor=CHART_BG, markeredgewidth=1.2, solid_capstyle="round")
 
-    ax.axhspan(c["entry_low"], c["entry_high"], color=CHART_BLUE, alpha=0.18, zorder=1)
-    ax.axhline(c["stop"], color=CHART_RED, linestyle="--", linewidth=1.3, zorder=3)
-    ax.axhline(c["target1"], color=CHART_GREEN, linestyle="--", linewidth=1.3, zorder=3)
-    ax.axhline(c["target2"], color=CHART_GREEN, linestyle=":", linewidth=1.3, zorder=3)
+    ax.axhspan(c["entry_low"], c["entry_high"], color=CHART_BLUE, alpha=0.14, zorder=1)
+    ax.axhline(c["stop"], color=CHART_RED, linewidth=1.1, alpha=0.75, zorder=3)
+    ax.axhline(c["target1"], color=CHART_GREEN, linewidth=1.1, alpha=0.75, zorder=3)
+    ax.axhline(c["target2"], color=CHART_GOLD, linewidth=1.1, alpha=0.6, zorder=3, linestyle=(0, (4, 3)))
 
     all_vals = [b["low"] for b in chart_bars] + [b["high"] for b in chart_bars] + [c["stop"], c["target1"], c["target2"]]
-    pad = (max(all_vals) - min(all_vals)) * 0.06
+    pad = (max(all_vals) - min(all_vals)) * 0.07
     y_min, y_max = min(all_vals) - pad, max(all_vals) + pad
     ax.set_ylim(y_min, y_max)
     ax.set_xlim(-1, right_edge)
     ax.tick_params(labelbottom=False)
 
-    fib_levels = compute_chart_fib_levels(chart_bars, c["direction"])
-    visible_fib = [(f, price) for f, price in fib_levels if y_min <= price <= y_max]
-    for f, price in visible_fib:
-        ax.plot([0, n - 1], [price, price], color=CHART_TEXT_SECONDARY, linewidth=0.6, alpha=0.4, zorder=3, clip_on=True)
-        ax.text(n + 0.3, price, f"{f:.3f}", color=CHART_TEXT_SECONDARY, fontsize=7,
-                va="center", zorder=6, alpha=0.85, clip_on=True)
+    def edge_tag(y, text, color, bg=CHART_SURFACE):
+        if y_min <= y <= y_max:
+            ax.text(n + 0.6, y, text, color=color, fontsize=7.6, fontweight="bold",
+                     va="center", ha="left", zorder=8, fontfamily="DejaVu Sans Mono", clip_on=False,
+                     bbox=dict(boxstyle="round,pad=0.32", facecolor=bg, edgecolor=color,
+                                linewidth=0.8, alpha=0.95))
+    edge_tag(c["stop"], f"STOP {c['stop']:.2f}", CHART_RED)
+    edge_tag(c["target1"], f"T1 {c['target1']:.2f}", CHART_GREEN)
+    edge_tag(c["target2"], f"T2 {c['target2']:.2f}", CHART_GOLD)
 
-    vols = [b["volume"] for b in chart_bars]
+    ax.text(0.012, 0.965, "EMA5", transform=ax.transAxes, color=EMA_FAST_COLOR, fontsize=7.6,
+            va="center", ha="left", fontfamily="DejaVu Sans", fontweight="bold")
+    ax.text(0.075, 0.965, f"{ema5[-1]:.2f}", transform=ax.transAxes, color=CHART_TEXT_SECONDARY,
+            fontsize=7.6, va="center", ha="left", fontfamily="DejaVu Sans Mono")
+    ax.text(0.012, 0.918, "EMA12", transform=ax.transAxes, color=EMA_SLOW_COLOR, fontsize=7.6,
+            va="center", ha="left", fontfamily="DejaVu Sans", fontweight="bold")
+    ax.text(0.078, 0.918, f"{ema12[-1]:.2f}", transform=ax.transAxes, color=CHART_TEXT_SECONDARY,
+            fontsize=7.6, va="center", ha="left", fontfamily="DejaVu Sans Mono")
+
     for i, b in enumerate(chart_bars):
-        color = VOL_UP_COLOR if b["close"] >= b["open"] else VOL_DOWN_COLOR
-        vol_ax.bar(i, b["volume"], color=color, width=0.7, alpha=0.85, zorder=3)
-    latest_vol = vols[-1] if vols else 0
-    vol_str = f"{latest_vol / 1_000_000:.2f}M" if latest_vol >= 1_000_000 else f"{latest_vol / 1_000:.0f}K"
-    vol_ax.text(0.01, 0.88, "Volume  ", transform=vol_ax.transAxes, color=CHART_TEXT_SECONDARY, fontsize=8.5, va="top")
-    vol_ax.text(0.01 + 0.058, 0.88, vol_str, transform=vol_ax.transAxes, color=VOL_UP_COLOR, fontsize=8.5,
-                fontweight="bold", va="top")
+        color = CANDLE_UP if b["close"] >= b["open"] else CANDLE_DOWN
+        vol_ax.bar(i, b["volume"], color=color, width=0.7, alpha=0.55, zorder=3)
+    latest_vol = chart_bars[-1]["volume"] if chart_bars else 0
+    vol_str = f"{latest_vol/1_000_000:.2f}M" if latest_vol >= 1_000_000 else f"{latest_vol/1_000:.0f}K"
+    vol_ax.text(0.01, 0.85, "VOL", transform=vol_ax.transAxes, color=CHART_TEXT_TERTIARY, fontsize=7.6,
+                va="top", fontfamily="DejaVu Sans", fontweight="bold")
+    vol_ax.text(0.058, 0.85, vol_str, transform=vol_ax.transAxes, color=CHART_TEXT_SECONDARY, fontsize=7.6,
+                va="top", fontfamily="DejaVu Sans Mono")
     vol_ax.set_xlim(-1, right_edge)
     vol_ax.tick_params(labelbottom=False)
 
     rsi = compute_rsi_series(closes, 14)
-    rsi_ax.plot(xs, rsi, color="#c084fc", linewidth=1.1, zorder=3)
-    rsi_ax.axhspan(30, 70, color="#c084fc", alpha=0.06, zorder=1)
-    rsi_ax.axhline(70, color=CHART_TEXT_SECONDARY, linewidth=0.5, linestyle="--", alpha=0.5, zorder=2)
-    rsi_ax.axhline(30, color=CHART_TEXT_SECONDARY, linewidth=0.5, linestyle="--", alpha=0.5, zorder=2)
-    rsi_ax.text(0.01, 0.90, "RSI (14)  ", transform=rsi_ax.transAxes, color=CHART_TEXT_SECONDARY, fontsize=8.5, va="top")
-    rsi_ax.text(0.01 + 0.11, 0.90, f"{rsi[-1]:.2f}", transform=rsi_ax.transAxes, color="#c084fc",
-                fontsize=8.5, fontweight="bold", va="top")
+    rsi_ax.plot(xs, rsi, color=CHART_RSI_COLOR, linewidth=1.2, zorder=3)
+    rsi_ax.axhspan(30, 70, color=CHART_RSI_COLOR, alpha=0.05, zorder=1)
+    rsi_ax.axhline(70, color=CHART_TEXT_TERTIARY, linewidth=0.5, linestyle=(0, (3, 3)), alpha=0.5, zorder=2)
+    rsi_ax.axhline(30, color=CHART_TEXT_TERTIARY, linewidth=0.5, linestyle=(0, (3, 3)), alpha=0.5, zorder=2)
+    rsi_ax.text(0.01, 0.88, "RSI 14", transform=rsi_ax.transAxes, color=CHART_TEXT_TERTIARY, fontsize=7.6,
+                va="top", fontfamily="DejaVu Sans", fontweight="bold")
+    rsi_ax.text(0.08, 0.88, f"{rsi[-1]:.0f}", transform=rsi_ax.transAxes, color=CHART_RSI_COLOR, fontsize=7.6,
+                va="top", fontfamily="DejaVu Sans Mono", fontweight="bold")
     rsi_ax.set_ylim(0, 100)
     rsi_ax.set_xlim(-1, right_edge)
 
     date_labels = [b["date"].strftime("%b %d") for b in chart_bars]
-    step = max(1, n // 8)
+    step = max(1, n // 7)
     tick_idx = list(range(0, n, step))
     rsi_ax.set_xticks(tick_idx)
-    rsi_ax.set_xticklabels([date_labels[i] for i in tick_idx], rotation=0)
+    rsi_ax.set_xticklabels([date_labels[i] for i in tick_idx], rotation=0, fontsize=7.4)
 
     card = FancyBboxPatch((0.02, 0.0), 0.96, 1.0, transform=side_ax.transAxes,
-                           boxstyle="round,pad=0.01,rounding_size=0.02",
+                           boxstyle="round,pad=0.01,rounding_size=0.025",
                            facecolor=CHART_SURFACE, edgecolor=CHART_BORDER, linewidth=1.0, clip_on=False)
     side_ax.add_patch(card)
-    side_ax.text(0.12, 0.955, "TRADE PLAN", transform=side_ax.transAxes, color=CHART_TEXT_PRIMARY,
-                 fontsize=13, fontweight="bold", va="top")
-    side_ax.plot([0.10, 0.90], [0.915, 0.915], transform=side_ax.transAxes, color=CHART_BORDER, linewidth=0.8)
+
+    side_ax.text(0.11, 0.958, "TRADE PLAN", transform=side_ax.transAxes, color=CHART_TEXT_PRIMARY,
+                 fontsize=12.5, fontweight="bold", va="top", fontfamily="DejaVu Sans")
+    side_ax.plot([0.09, 0.91], [0.918, 0.918], transform=side_ax.transAxes, color=CHART_BORDER, linewidth=0.8)
+
+    side_ax.add_patch(FancyBboxPatch((0.09, 0.845), 0.82, 0.062, transform=side_ax.transAxes,
+                       boxstyle="round,pad=0,rounding_size=0.012", facecolor=CHART_SURFACE_ALT,
+                       edgecolor=CHART_BLUE, linewidth=1.1, clip_on=False))
+    side_ax.text(0.13, 0.888, "ENTRY ZONE", transform=side_ax.transAxes, color=CHART_BLUE,
+                 fontsize=8.2, fontweight="bold", va="top", fontfamily="DejaVu Sans")
+    side_ax.text(0.13, 0.862, f"{c['entry_low']:.2f} \u2013 {c['entry_high']:.2f}", transform=side_ax.transAxes,
+                 color=CHART_TEXT_PRIMARY, fontsize=12.5, fontweight="bold", va="top", fontfamily="DejaVu Sans Mono")
 
     rr1, rr2 = compute_reward_risk(c)
     rr_str = f"{rr1:.1f} / {rr2:.1f}" if rr1 is not None else "N/A"
     rows = [
-        ("ENTRY", f"${c['entry_low']:,.2f}\u2013${c['entry_high']:,.2f}", CHART_BLUE),
-        ("STOP", f"${c['stop']:,.2f}", CHART_RED),
-        ("TARGET 1", f"${c['target1']:,.2f}", CHART_GREEN),
-        ("TARGET 2", f"${c['target2']:,.2f}", CHART_GREEN),
+        ("STOP", f"{c['stop']:.2f}", CHART_RED),
+        ("TARGET 1", f"{c['target1']:.2f}", CHART_GREEN),
+        ("TARGET 2", f"{c['target2']:.2f}", CHART_GOLD),
         ("R:R", rr_str, CHART_TEXT_PRIMARY),
     ]
-    row_y = 0.86
+    row_y = 0.795
     for label, value, color in rows:
-        side_ax.text(0.12, row_y, label, transform=side_ax.transAxes, color=color,
-                     fontsize=9.5, fontweight="bold", va="center")
-        side_ax.text(0.90, row_y, value, transform=side_ax.transAxes, color=CHART_TEXT_PRIMARY,
-                     fontsize=10.5, fontweight="bold", va="center", ha="right")
-        row_y -= 0.105
+        side_ax.text(0.13, row_y, label, transform=side_ax.transAxes, color=CHART_TEXT_SECONDARY,
+                     fontsize=8.4, fontweight="bold", va="center", fontfamily="DejaVu Sans")
+        side_ax.text(0.89, row_y, value, transform=side_ax.transAxes, color=color,
+                     fontsize=11, fontweight="bold", va="center", ha="right", fontfamily="DejaVu Sans Mono")
+        row_y -= 0.062
 
-    side_ax.plot([0.10, 0.90], [row_y + 0.02, row_y + 0.02], transform=side_ax.transAxes, color=CHART_BORDER, linewidth=0.8)
-    row_y -= 0.05
-    side_ax.text(0.12, row_y, "CONFIRMATION", transform=side_ax.transAxes, color=CHART_TEXT_PRIMARY,
-                 fontsize=10.5, fontweight="bold", va="top")
-    row_y -= 0.06
+    side_ax.plot([0.09, 0.91], [row_y + 0.018, row_y + 0.018], transform=side_ax.transAxes,
+                 color=CHART_BORDER, linewidth=0.8)
+    row_y -= 0.048
+    side_ax.text(0.11, row_y, "CONFIRMATION", transform=side_ax.transAxes, color=CHART_TEXT_PRIMARY,
+                 fontsize=9.5, fontweight="bold", va="top", fontfamily="DejaVu Sans")
+    row_y -= 0.058
 
     rvol = compute_rvol(chart_bars)
     rsi_now = rsi[-1]
     latest_close = closes[-1]
-    if c["entry_low"] <= latest_close <= c["entry_high"]:
-        entry_bullet = f"Price within entry zone (${latest_close:,.2f})"
-    elif latest_close > c["entry_high"]:
-        entry_bullet = f"Price above entry zone (${latest_close:,.2f}) \u2014 wait for a pullback"
+    zone_low, zone_high = min(c["entry_low"], c["entry_high"]), max(c["entry_low"], c["entry_high"])
+    if zone_low <= latest_close <= zone_high:
+        entry_status = ("IN ZONE", CHART_GREEN)
+    elif is_call:
+        entry_status = ("ABOVE ZONE", CHART_GOLD) if latest_close > zone_high else ("BELOW ZONE", CHART_TEXT_TERTIARY)
     else:
-        entry_bullet = f"Price below entry zone (${latest_close:,.2f}) \u2014 wait for confirmation"
-    bullets = [
-        entry_bullet,
-        f"RVOL {'expansion' if rvol >= 1.2 else 'below average'} ({rvol:.1f}x)",
-        f"RSI {'above' if rsi_now >= 50 else 'below'} 50 ({rsi_now:.0f})",
+        entry_status = ("ABOVE ZONE", CHART_TEXT_TERTIARY) if latest_close > zone_high else ("BELOW ZONE", CHART_GOLD)
+
+    checks = [
+        ("Price vs entry", entry_status[0], entry_status[1]),
+        ("Relative volume", f"{rvol:.1f}x avg", CHART_GREEN if rvol >= 1.2 else CHART_TEXT_TERTIARY),
+        ("RSI momentum", f"{rsi_now:.0f} / 100", CHART_GREEN if rsi_now >= 50 else CHART_RED),
     ]
-    for bullet in bullets:
-        side_ax.text(0.13, row_y, "\u2022", transform=side_ax.transAxes, color=CHART_TEXT_SECONDARY, fontsize=9, va="top")
-        side_ax.text(0.18, row_y, bullet, transform=side_ax.transAxes, color=CHART_TEXT_SECONDARY,
-                     fontsize=9, va="top", wrap=True)
-        row_y -= 0.07
+    for label, value, color in checks:
+        side_ax.add_patch(Circle((0.135, row_y - 0.012), 0.011, transform=side_ax.transAxes,
+                                   facecolor=color, edgecolor="none", zorder=6, clip_on=False))
+        side_ax.text(0.175, row_y, label, transform=side_ax.transAxes, color=CHART_TEXT_SECONDARY,
+                     fontsize=8.0, va="top", fontfamily="DejaVu Sans")
+        side_ax.text(0.89, row_y, value, transform=side_ax.transAxes, color=color,
+                     fontsize=8.4, fontweight="bold", va="top", ha="right", fontfamily="DejaVu Sans Mono")
+        row_y -= 0.062
 
     arrow = "\u25b2" if is_call else "\u25bc"
     quality_tag = build_quality_tag(c.get("pattern", ""))
     setup_type = build_setup_type_label(c["direction"], c.get("pattern", ""))
     dir_color = CHART_GREEN if is_call else CHART_RED
 
-    fig.text(0.045, 0.975, f"${c['ticker']}", fontsize=20, fontweight="bold", color=CHART_TEXT_PRIMARY,
-              ha="left", va="top", family="sans-serif")
-    fig.text(0.16, 0.975, f" {setup_type} ", fontsize=11, fontweight="bold", color=dir_color,
-              ha="left", va="top",
-              bbox=dict(facecolor="none", edgecolor=dir_color, alpha=0.95, pad=5, linewidth=1.3,
-                        boxstyle="round,pad=0.35"))
-    fig.text(0.40, 0.975, f" {arrow} {c['direction']} ${c['strike']:g}  \u00b7  {c['next_expiry'].upper()} ",
-              fontsize=11, fontweight="bold", color="#0d1117", ha="left", va="top",
-              bbox=dict(facecolor=dir_color, edgecolor="none", alpha=1.0, pad=5, boxstyle="round,pad=0.35"))
+    fig.text(0.045, 0.975, f"{c['ticker']}", fontsize=21, fontweight="bold", color=CHART_TEXT_PRIMARY,
+              ha="left", va="top", fontfamily="DejaVu Sans")
+    fig.text(0.16, 0.978, f"{setup_type}", fontsize=10.5, fontweight="bold", color=dir_color,
+              ha="left", va="top", fontfamily="DejaVu Sans",
+              bbox=dict(facecolor=CHART_SURFACE, edgecolor=dir_color, alpha=1.0, pad=4.5, linewidth=1.1,
+                        boxstyle="round,pad=0.3"))
+    fig.text(0.40, 0.978, f" {arrow} {c['direction']} ${c['strike']:g}  \u00b7  {c['next_expiry'].upper()} ",
+              fontsize=10.5, fontweight="bold", color=CHART_BG, ha="left", va="top", fontfamily="DejaVu Sans",
+              bbox=dict(facecolor=dir_color, edgecolor="none", alpha=1.0, pad=4.5, boxstyle="round,pad=0.3"))
 
     rvol_str = f"{rvol:.1f}x"
-    stats_line = f"Close ${c.get('current_price', closes[-1]):,.2f}   |   RVOL {rvol_str}   |   RSI {rsi_now:.0f}   |   {quality_tag}"
-    fig.text(0.045, 0.925, stats_line, fontsize=10, color=CHART_TEXT_SECONDARY, ha="left", va="top")
+    stats_line = f"Close ${c.get('current_price', closes[-1]):,.2f}    RVOL {rvol_str}    RSI {rsi_now:.0f}    {quality_tag}"
+    fig.text(0.045, 0.925, stats_line, fontsize=9.5, color=CHART_TEXT_SECONDARY, ha="left", va="top",
+              fontfamily="DejaVu Sans")
 
     plt.savefig(out_path, facecolor=CHART_BG, bbox_inches="tight", pad_inches=0.25)
     plt.close(fig)
