@@ -47,14 +47,114 @@ FONT_DIR = "/usr/share/fonts/truetype/dejavu/"
 FONT_REGULAR_PATH = FONT_DIR + "DejaVuSans.ttf"
 FONT_BOLD_PATH = FONT_DIR + "DejaVuSans-Bold.ttf"
 
+# FONT-PATH BUGFIX (confirmed on Railway, 2026-09-23): a real deploy
+# crashed with "OSError: cannot open resource" trying to load
+# /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf -- that hardcoded path
+# is specific to the Debian/Ubuntu desktop font layout used during
+# development and testing. A live `find / -iname "*.ttf"` on the actual
+# Railway container confirmed there is NO system font directory at all --
+# the only DejaVu TTFs anywhere on the machine are matplotlib's own
+# bundled copies, at a venv-relative path like
+# /app/.venv/lib/python3.13/site-packages/matplotlib/mpl-data/fonts/ttf/.
+# This crashed the ENTIRE nightly run at the very last step (after every
+# setup had already posted successfully to Discord) -- the whole pipeline
+# is worthless if the one thing it can't do is finish rendering the
+# summary card.
+#
+# Fixed by resolving the font path via matplotlib.get_data_path() --
+# matplotlib is ALREADY a hard dependency of this file (used for the
+# per-setup chart renderer), so its bundled fonts are guaranteed present
+# wherever this script runs at all, regardless of venv path, Python
+# version, or which base OS image Railway happens to be using this
+# week. This is far more reliable than guessing OS-level system-font
+# paths, which was the root cause here. A short list of old system-path
+# guesses is kept as a fallback in case matplotlib's own data path ever
+# changes shape, and a last-resort fallback to Pillow's bundled default
+# bitmap font means this renderer can never again crash the whole run
+# over a missing font file -- worst case it renders with plainer
+# typography instead of not rendering at all.
+def _matplotlib_font_paths():
+    """Returns {False: <regular ttf path>, True: <bold ttf path>} from
+    matplotlib's own bundled DejaVu Sans fonts, or {False: None, True: None}
+    if matplotlib isn't importable for some reason (shouldn't happen, since
+    this file already hard-imports it above, but defensive regardless)."""
+    try:
+        import matplotlib
+        import os
+        base = os.path.join(matplotlib.get_data_path(), "fonts", "ttf")
+        regular = os.path.join(base, "DejaVuSans.ttf")
+        bold = os.path.join(base, "DejaVuSans-Bold.ttf")
+        return {
+            False: regular if os.path.exists(regular) else None,
+            True: bold if os.path.exists(bold) else None,
+        }
+    except Exception:
+        return {False: None, True: None}
+
+
+_CANDIDATE_FONT_PATHS = {
+    False: [  # regular weight
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/DejaVuSans.ttf",
+        "/usr/local/share/fonts/DejaVuSans.ttf",
+        "/app/.fonts/DejaVuSans.ttf",
+    ],
+    True: [  # bold weight
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/DejaVuSans-Bold.ttf",
+        "/usr/local/share/fonts/DejaVuSans-Bold.ttf",
+        "/app/.fonts/DejaVuSans-Bold.ttf",
+    ],
+}
+_resolved_font_path = {False: None, True: None}  # cached per-weight, resolved lazily
+
+
+def _resolve_font_path(bold: bool):
+    """Finds a real, loadable DejaVu Sans TTF on this machine. Tries
+    matplotlib's bundled copy FIRST (reliable, guaranteed present since
+    matplotlib is a hard dependency of this codebase already), then falls
+    back to the old system-path guesses, then gives up (caller falls back
+    to Pillow's built-in default font in that case). Caches the first
+    path that actually opens."""
+    if _resolved_font_path[bold] is not None:
+        return _resolved_font_path[bold]
+    import os
+
+    mpl_path = _matplotlib_font_paths()[bold]
+    candidates = ([mpl_path] if mpl_path else []) + _CANDIDATE_FONT_PATHS[bold]
+
+    for path in candidates:
+        if path and os.path.exists(path):
+            try:
+                ImageFont.truetype(path, 10)  # cheap load test
+                _resolved_font_path[bold] = path
+                return path
+            except Exception:
+                continue
+    return None
+
 _font_cache = {}
+
+
+_warned_fallback = {False: False, True: False}
 
 
 def font(size: int, bold: bool = False):
     key = (size, bold)
     if key not in _font_cache:
-        path = FONT_BOLD_PATH if bold else FONT_REGULAR_PATH
-        _font_cache[key] = ImageFont.truetype(path, size)
+        path = _resolve_font_path(bold)
+        if path:
+            _font_cache[key] = ImageFont.truetype(path, size)
+        else:
+            if not _warned_fallback[bold]:
+                print(f"  [FONT WARN] No DejaVu Sans TTF found on this machine "
+                      f"(tried: {_CANDIDATE_FONT_PATHS[bold]}) -- falling back to "
+                      f"Pillow's built-in default font. Card will render, but "
+                      f"typography will not match the design spec.")
+                _warned_fallback[bold] = True
+            _font_cache[key] = ImageFont.load_default()
     return _font_cache[key]
 
 
