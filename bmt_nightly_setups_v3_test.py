@@ -681,6 +681,40 @@ def check_chart_pattern(flow_bias: str, bars: list) -> dict:
 
 
 def get_quote_change(ticker: str) -> dict:
+    """
+    PRICE-ACCURACY BUGFIX (confirmed 2026-09-23 from a real v3 test post):
+    a posted card showed SHOP's close as $137.92, but the actual close that
+    session (per a live/delayed quote source checked at the same time) was
+    materially different (~$147-150 range) -- roughly a 7% discrepancy,
+    far beyond rounding or a few minutes' drift. This directly poisons
+    every downstream number on the card (entry, stop, targets, OTM%,
+    R-multiples), since they're all computed from this one price.
+
+    Root cause: the original implementation took the LAST bar from Yahoo's
+    `/v8/finance/chart/` endpoint with `interval=1d, range=10d` and trusted
+    it as "the close," with no cross-check. That endpoint's most recent
+    daily bar, when queried after-hours, does not reliably represent the
+    final settled close -- Yahoo's own backend can return a still-updating
+    or differently-sourced intraday snapshot for the current session's bar
+    depending on exactly when the request lands relative to their close
+    reconciliation, and this script had no way to detect that mismatch.
+
+    Fix: cross-validate against yfinance's `.info` dict (`regularMarketPrice`
+    / `previousClose`), a SEPARATE Yahoo data path already trusted
+    elsewhere in this file (get_iv_vs_realized_vol_with_ratio,
+    get_analyst_target, get_option_premium's underlying chain calls all go
+    through yfinance's Ticker object rather than this raw chart endpoint).
+    If the two sources disagree by more than a small tolerance, yfinance's
+    `.info` price wins (it's the same source this file already trusts for
+    every other price-dependent calculation), and the discrepancy is
+    logged loudly so a persistent mismatch pattern would be visible in
+    logs rather than silently accepted. If yfinance's `.info` call itself
+    fails, this falls back to the original chart-endpoint value rather
+    than returning nothing -- a possibly-stale price beats no price for a
+    method every caller already treats as fallible via `if not
+    current_price`.
+    """
+    chart_price, chart_pct, chart_open, chart_high, chart_low = None, None, None, None, None
     try:
         r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
                           params={"interval": "1d", "range": "10d"}, headers=HEADERS, timeout=10)
@@ -688,19 +722,49 @@ def get_quote_change(ticker: str) -> dict:
         quote = result["indicators"]["quote"][0]
         closes, opens, highs, lows = quote["close"], quote["open"], quote["high"], quote["low"]
         valid_idxs = [i for i in range(len(closes)) if closes[i] is not None]
-        if len(valid_idxs) < 2:
-            return {"price": None, "pct": None, "open": None, "high": None, "low": None}
-        last_idx, prev_idx = valid_idxs[-1], valid_idxs[-2]
-        price = closes[last_idx]
-        prev_close = closes[prev_idx]
-        pct = round((price - prev_close) / prev_close * 100, 2) if prev_close else None
-        return {"price": round(price, 2), "pct": pct,
-                "open": round(opens[last_idx], 2) if opens[last_idx] else None,
-                "high": round(highs[last_idx], 2) if highs[last_idx] else None,
-                "low": round(lows[last_idx], 2) if lows[last_idx] else None}
+        if len(valid_idxs) >= 2:
+            last_idx, prev_idx = valid_idxs[-1], valid_idxs[-2]
+            chart_price = closes[last_idx]
+            prev_close = closes[prev_idx]
+            chart_pct = round((chart_price - prev_close) / prev_close * 100, 2) if prev_close else None
+            chart_open = round(opens[last_idx], 2) if opens[last_idx] else None
+            chart_high = round(highs[last_idx], 2) if highs[last_idx] else None
+            chart_low = round(lows[last_idx], 2) if lows[last_idx] else None
     except Exception as e:
-        print(f"  [QUOTE WARN] {ticker}: {e}")
-        return {"price": None, "pct": None, "open": None, "high": None, "low": None}
+        print(f"  [QUOTE WARN] {ticker}: chart endpoint failed: {e}")
+
+    yf_price, yf_prev_close = None, None
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info
+        yf_price = info.get("regularMarketPrice") or info.get("currentPrice")
+        yf_prev_close = info.get("regularMarketPreviousClose") or info.get("previousClose")
+    except Exception as e:
+        print(f"  [QUOTE WARN] {ticker}: yfinance .info cross-check failed: {e}")
+
+    if yf_price is None:
+        if chart_price is None:
+            return {"price": None, "pct": None, "open": None, "high": None, "low": None}
+        print(f"  [QUOTE WARN] {ticker}: yfinance cross-check unavailable -- using chart-endpoint "
+              f"price ${chart_price:.2f} unverified")
+        return {"price": round(chart_price, 2), "pct": chart_pct, "open": chart_open,
+                "high": chart_high, "low": chart_low}
+
+    if chart_price is not None:
+        discrepancy_pct = abs(yf_price - chart_price) / chart_price * 100 if chart_price else 0
+        if discrepancy_pct > 1.0:
+            print(f"  [QUOTE MISMATCH] {ticker}: chart endpoint gave ${chart_price:.2f}, "
+                  f"yfinance .info gave ${yf_price:.2f} ({discrepancy_pct:.1f}% apart) -- "
+                  f"using yfinance .info as the trusted source")
+
+    yf_pct = round((yf_price - yf_prev_close) / yf_prev_close * 100, 2) if yf_prev_close else chart_pct
+    return {
+        "price": round(yf_price, 2),
+        "pct": yf_pct,
+        "open": chart_open,
+        "high": chart_high,
+        "low": chart_low,
+    }
 
 
 def get_tone_phrase(m: dict) -> str:
