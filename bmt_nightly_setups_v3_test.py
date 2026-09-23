@@ -20,8 +20,16 @@ LOCKED INVARIANTS (per direct instruction — do not change vs. production):
   - Discord embed layout (build_header_embed / build_best_choice_embed /
     build_setup_embed / build_contract_list_embed) — same shape, only the
     Role/Best-for fields are replaced with Edge/Watch-out per item 8(d).
-  - Chart renderer (render_setup_chart) — byte-identical to production.
-  - Summary card renderer (render_card) — byte-identical to production.
+  - Chart renderer (render_setup_chart) — was byte-identical to production;
+    REDESIGNED for v3 only after real posted output review (see that
+    function's own docstring) — this lock was explicitly lifted.
+  - Summary card renderer — was matplotlib render_card(), byte-identical to
+    production; REPLACED for v3 only with bmt_watchlist_card_v3's
+    Pillow-based render_watchlist_card() per direct instruction (see the
+    watchlist-card section near the bottom of main()). The old
+    render_card() and its helpers (fit_value_fontsize/wrap_lines/
+    escape_dollars_for_matplotlib) remain in this file, unused, rather than
+    deleted -- harmless dead code kept for reference/rollback.
   - Win/loss grading definition in the tracker (touch-the-strike,
     entry→expiry window, never_triggered excluded from reports) — unchanged.
 
@@ -101,6 +109,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, Circle
 from apscheduler.schedulers.background import BackgroundScheduler
 import pg8000.native as _pg8000
+
+from bmt_watchlist_card_v3 import render_watchlist_card, build_setup_dict_from_v3
 
 JARVIS_API_KEY     = os.environ["JARVIS_API_KEY"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
@@ -2722,14 +2732,46 @@ def main():
     contract_embed = build_contract_list_embed(selected)
     posted_contract = post_embeds_to_discord([contract_embed])
 
+    # NEW WATCHLIST CARD (v3 only): replaces the old matplotlib render_card()
+    # with bmt_watchlist_card_v3.render_watchlist_card(), a Pillow-based
+    # renderer built to the landscape spec (3705x1656, dark terminal theme,
+    # risk/reward diverging bar, R-multiples, optional edge-strip fields).
+    # Production's bmt_nightly_setups.py is untouched and keeps its own
+    # matplotlib render_card() -- this swap is v3-only per direct instruction.
     spy = market_context.get("SPY", {})
     qqq = market_context.get("QQQ", {})
-    market_theme = (f"$SPY closed at ${spy.get('price', 'N/A')} ({spy.get('pct', 'N/A')}%) and "
-                     f"$QQQ at ${qqq.get('price', 'N/A')} ({qqq.get('pct', 'N/A')}%).")
-    risk_notes = "See the write-up above for the reasoning, and each chart for exact entry/stop/target levels. (V3 TEST TRACK)"
+    iwm = market_context.get("IWM", {})
+    market_for_card = {
+        "spy": {"price": spy.get("price"), "pct": spy.get("pct") or 0, "note": get_tone_phrase(spy)},
+        "qqq": {"price": qqq.get("price"), "pct": qqq.get("pct") or 0, "note": get_tone_phrase(qqq)},
+        "iwm": {"price": iwm.get("price"), "pct": iwm.get("pct") or 0, "note": get_tone_phrase(iwm)},
+    }
+    note_line = (f"$SPY closed at ${spy.get('price', 'N/A')} ({spy.get('pct', 'N/A')}%) and "
+                 f"$QQQ at ${qqq.get('price', 'N/A')} ({qqq.get('pct', 'N/A')}%).")
+
+    n_calls = sum(1 for c in selected if c["direction"].upper() == "CALL")
+    n_puts = len(selected) - n_calls
+    if n_puts == 0:
+        dir_summary = "All calls"
+    elif n_calls == 0:
+        dir_summary = "All puts"
+    else:
+        dir_summary = f"{n_calls} calls, {n_puts} puts"
+    expiries = set(c.get("next_expiry", "") for c in selected)
+    expiry_summary = f"All {list(expiries)[0]} expiry" if len(expiries) == 1 else "Mixed expiries"
+    close_date_str = data_date.strftime("%-m/%-d") if os.name != "nt" else data_date.strftime("%#m/%#d")
+    subtitle_line = f"{len(selected)} setups \u00b7 {dir_summary} \u00b7 {expiry_summary} \u00b7 Based on {close_date_str} close"
+    footer_line = (f"Setups derived from {close_date_str} close \u00b7 Re-validate at next session's open "
+                   f"\u00b7 Not financial advice \u00b7 V3 TEST TRACK")
+
+    card_setups = [build_setup_dict_from_v3(c) for c in selected]
 
     out_path = "bmt_nightly_setups_v3.png"
-    render_card(selected, market_theme, risk_notes, market_context, target_date, data_date, out_path)
+    render_watchlist_card(
+        card_setups, market_for_card, note_line,
+        title_date=target_date.strftime("%A, %B %d"),
+        subtitle=subtitle_line, footer=footer_line, out_path=out_path,
+    )
     print(f"\nSummary card saved to {out_path}")
 
     posted_card = post_image_to_discord(out_path, message="")
