@@ -28,6 +28,7 @@ Both run automatically inside render_watchlist_card() before saving; a
 failed assertion raises, so a bad render can never silently go out.
 """
 
+import math
 from PIL import Image, ImageDraw, ImageFont
 
 # ── Canvas & palette (per spec, verbatim) ──────────────────────────────
@@ -375,6 +376,32 @@ def render_header(draw, market: dict, note: str, title_date: str, subtitle: str)
 # ── Risk/reward diverging bar panel ─────────────────────────────────────
 
 def render_risk_reward_panel(draw, x0, y0, w, h, setup, derived, boxes):
+    """
+    LAYOUT BUGFIX (confirmed 2026-09-23 from real posted output, then
+    revised after a first fix attempt was judged still visually weak):
+    the diverging bar's red (STOP) segment was scaled against
+    max(risk_pct, reward_pct) -- since T2's percentage is almost always
+    3-4x STOP's, the red segment only filled a small fraction of its own
+    half of the track, leaving a long stretch of visibly empty track. A
+    first fix attempt (a thin outlined "lane" spanning the full
+    half-width) didn't meaningfully help -- at this bar's thickness the
+    outline was too subtle to register, and the underlying issue wasn't
+    really about a missing visual anchor, it was that a genuinely
+    3-4x-different pair of values will always make a pure linear-scale
+    bar look lopsided and sparse on one side, no matter how the empty
+    remainder is decorated.
+
+    Fix: apply a square-root compression to both values before scaling
+    (sqrt is a common, well-understood technique for exactly this --
+    compressing a wide dynamic range so the SMALLER value still gets a
+    visually meaningful share of the track, while still preserving true
+    ordering and directional signal: risk always looks smaller than
+    reward when it IS smaller, just not by an exaggerated linear ratio).
+    The exact numbers remain fully accurate in the text below the bar
+    (STOP -X.X%, T2 Y.YR (+Z.Z%)) -- only the BAR'S length mapping is
+    compressed, purely a visual-legibility choice, never the underlying
+    data.
+    """
     label_font = font(26, bold=False)
     draw_text(draw, (x0, y0), "RISK / REWARD vs ENTRY", label_font, TEXT_DIM,
               track_boxes=boxes, label="rr_title")
@@ -387,23 +414,33 @@ def render_risk_reward_panel(draw, x0, y0, w, h, setup, derived, boxes):
 
     risk_pct = abs(derived["risk_pct"])
     reward_pct = abs(derived["t2_pct"])
-    scale = max(risk_pct, reward_pct, 0.01)
+    # Square-root compression: both values pass through sqrt() before
+    # scaling, so a 4x difference in the raw percentages becomes only a
+    # 2x difference in bar length -- enough to still show which side is
+    # bigger, without letting the smaller side collapse to a sliver.
+    risk_compressed = math.sqrt(risk_pct)
+    reward_compressed = math.sqrt(reward_pct)
+    scale = max(risk_compressed, reward_compressed, 0.01)
     half_w = (w / 2) * 0.92  # leave a little margin so bars don't touch the edges
 
-    # Track background
+    # Track background (full width).
     rounded_rect(draw, (bar_x0, bar_y, bar_x1, bar_y + bar_h), radius=bar_h // 2, fill=CARD_FILL, outline=BORDER, width=2)
 
-    red_len = (risk_pct / scale) * half_w
-    green_len = (reward_pct / scale) * half_w
+    red_len = (risk_compressed / scale) * half_w
+    green_len = (reward_compressed / scale) * half_w
+
     rounded_rect(draw, (bar_mid_x - red_len, bar_y, bar_mid_x, bar_y + bar_h), radius=bar_h // 2, fill=RED)
     rounded_rect(draw, (bar_mid_x, bar_y, bar_mid_x + green_len, bar_y + bar_h), radius=bar_h // 2, fill=GREEN)
 
-    # Center tick (dark, at entry) and T1 tick (white). T1's distance from
-    # center uses the same abs()-scaled convention as the bar itself, so
-    # the tick lands inside the green segment regardless of call/put sign.
+    # Center tick (dark, at entry) and T1 tick (white). T1's position
+    # uses the SAME sqrt-compressed scale as the bar segments, so the
+    # tick lands at the correct visual position relative to the
+    # (compressed) green segment, not at a position implying a different
+    # scale than what's actually drawn.
     tick_w = 4
     draw.rectangle((bar_mid_x - tick_w / 2, bar_y - 6, bar_mid_x + tick_w / 2, bar_y + bar_h + 6), fill=(20, 22, 26))
-    t1_frac = abs(derived["t1_pct"]) / scale
+    t1_compressed = math.sqrt(abs(derived["t1_pct"]))
+    t1_frac = t1_compressed / scale
     t1_x = bar_mid_x + t1_frac * half_w
     draw.rectangle((t1_x - tick_w / 2, bar_y - 10, t1_x + tick_w / 2, bar_y + bar_h + 10), fill=TEXT_WHITE)
 
@@ -426,6 +463,7 @@ def render_risk_reward_panel(draw, x0, y0, w, h, setup, derived, boxes):
 
 
 # ── 2x2 stat grid ────────────────────────────────────────────────────────
+
 
 def render_stat_grid(draw, x0, y0, w, setup, derived, boxes):
     label_font = font(24, bold=False)
