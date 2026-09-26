@@ -14,7 +14,7 @@ from models import FlowAlert
 from scoring import auto_score_alert
 from flow_filters import filter_flow_items, is_high_conviction
 from market_hours import is_market_open, market_closed_reason
-from weekly_recap import build_weekly_recap, post_weekly_recap
+from weekly_recap import build_weekly_recap, render_weekly_recap_card, post_weekly_recap_image
 from flow_heatmap import heatmap_job
 from enrichment import enrich_alert, enrichment_summary, compute_levels
 from classifier import classify_alert
@@ -416,7 +416,17 @@ async def weekly_recap_job():
         return
 
     try:
-        posted = await post_weekly_recap(DISCORD_WEBHOOK_URL, recap["message"])
+        import os, tempfile
+        fd, card_path = tempfile.mkstemp(suffix=".png", prefix="weekly_recap_")
+        os.close(fd)
+        try:
+            render_weekly_recap_card(recap, card_path)
+            posted = await post_weekly_recap_image(DISCORD_WEBHOOK_URL, card_path, recap["caption"])
+        finally:
+            try:
+                os.remove(card_path)
+            except OSError:
+                pass
     except Exception as e:
         logger.exception("weekly_recap_post_failed error=%s", str(e))
         return
