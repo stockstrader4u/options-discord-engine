@@ -203,6 +203,25 @@ get_last_completed_trading_day()), per direct user instruction: a
 single session's fresh 9:30am-4pm ET data, not a rolling multi-day
 window -- Sep 4th's session feeds Sep 8th's ideas exactly the same way
 a normal Tuesday's session feeds Wednesday's.
+
+RUN-ONCE / RAILWAY CRON MODE (2026-09-26): added purely to cut Railway
+memory cost. The always-on APScheduler process below held RAM 24/7 to
+fire one ~minutes-long job per day. With RUN_MODE=once this file
+instead runs the job a single time and exits, so Railway only bills
+for the minutes it actually runs. NOTHING about the job itself
+changed -- main() is byte-for-byte the same function.
+  * Default (no RUN_MODE set): identical to before -- start_scheduler().
+  * RUN_MODE=once: intended for a Railway Cron Schedule. Railway cron
+    is UTC-only and has no DST awareness, so the service is scheduled
+    at BOTH 22:00 and 23:00 UTC ("0 22,23 * * *") and this script only
+    proceeds when the current America/New_York hour is 18 -- exactly
+    one of the two firings passes that gate all year, the other exits
+    in about a second. Posts therefore keep landing at 6pm ET through
+    every DST change with no manual edits twice a year.
+  * FORCE_PUBLISH=1 still wins over everything (manual test runs).
+  * An exception inside the job is logged and swallowed (exit code 0)
+    so Railway's restart-on-failure policy can never re-run the job
+    and double-post to subscribers midway through a partial failure.
 """
 
 import os
@@ -211,6 +230,7 @@ import json
 import re
 import time
 import threading
+import traceback
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -2380,8 +2400,39 @@ def start_scheduler():
         time.sleep(3600)
 
 
+# The America/New_York hour (0-23) the nightly job is allowed to start in
+# when running under Railway cron (RUN_MODE=once). 18 == 6pm ET.
+CRON_TARGET_HOUR_ET = 18
+
+
+def cron_should_fire(et_now: datetime) -> bool:
+    """Gate for Railway cron mode. Railway fires this service at both
+    22:00 and 23:00 UTC every day; only the firing that lands in the
+    6pm ET hour is allowed through. Comparing the ET *hour* (not the
+    exact minute) tolerates Railway's few-minutes cron start jitter."""
+    return et_now.hour == CRON_TARGET_HOUR_ET
+
+
+def run_once_from_cron():
+    et_now = datetime.now(ET)
+    if not cron_should_fire(et_now):
+        print(f"[{et_now.isoformat()}] RUN_MODE=once: ET hour is {et_now.hour}, "
+              f"not {CRON_TARGET_HOUR_ET} -- this is the off-DST cron firing, exiting without posting.")
+        return
+    try:
+        run_nightly_job()
+    except Exception:
+        # Deliberately swallowed (process still exits 0): a non-zero exit
+        # could trigger Railway's restart policy and re-run the whole job,
+        # re-posting already-published setups to subscribers.
+        print("\u2717 RUN_MODE=once: nightly job raised an exception (traceback below); NOT retrying.")
+        traceback.print_exc()
+
+
 if __name__ == "__main__":
     if os.environ.get("FORCE_PUBLISH") == "1":
         run_nightly_job()
+    elif os.environ.get("RUN_MODE", "").strip().lower() == "once":
+        run_once_from_cron()
     else:
         start_scheduler()
