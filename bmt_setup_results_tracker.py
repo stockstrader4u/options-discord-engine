@@ -82,12 +82,32 @@ JOURNAL_MODE pattern):
 Run locally:
   $env:RESULTS_MODE = "run"
   C:\\Python314\\python.exe bmt_setup_results_tracker.py
+
+RUN-ONCE / RAILWAY CRON MODE (2026-09-26): added purely to cut Railway
+memory cost. The always-on APScheduler process held RAM 24/7 to fire one
+short job per weekday. With RUN_MODE=once this file instead runs the
+check a single time and exits, so Railway only bills for the minutes it
+actually runs. Grading, posting and DB logic are untouched.
+  * Default (no RUN_MODE set): identical to before -- start_scheduler().
+  * RESULTS_MODE=run (local testing): unchanged, runs immediately with no
+    time gate.
+  * RUN_MODE=once: intended for a Railway Cron Schedule. Railway cron is
+    UTC-only with no DST awareness, so schedule it at BOTH 20:15 and
+    21:15 UTC on weekdays ("15 20,21 * * 1-5") and this script only
+    proceeds when the America/New_York hour is 16 (4pm -- the 4:15pm ET
+    slot). Exactly one firing passes all year; the other exits in about
+    a second. The gate is essential, not cosmetic: in winter the 20:15
+    UTC firing lands at 3:15pm ET, BEFORE the close, and would grade
+    setups on an unfinished day and mark them resolved.
+  * An exception inside the job is logged and swallowed (exit code 0) so
+    Railway's restart policy can never re-run a half-finished job.
 """
 
 import os
 import sys
 import time
 import threading
+import traceback
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -490,10 +510,41 @@ def start_scheduler():
         time.sleep(3600)
 
 
+# The America/New_York hour (0-23) the check may start in when running
+# under Railway cron (RUN_MODE=once). 16 == 4pm ET, i.e. the 4:15pm slot.
+CRON_TARGET_HOUR_ET = 16
+
+
+def cron_should_fire(et_now: datetime) -> bool:
+    """Gate for Railway cron mode. Railway fires this service at both
+    20:15 and 21:15 UTC on weekdays; only the firing that lands in the
+    4pm ET hour is allowed through. Comparing the ET *hour* (not the exact
+    minute) tolerates Railway's few-minutes cron start jitter."""
+    return et_now.hour == CRON_TARGET_HOUR_ET
+
+
+def run_once_from_cron():
+    et_now = datetime.now(ET)
+    if not cron_should_fire(et_now):
+        log(f"[{et_now.isoformat()}] RUN_MODE=once: ET hour is {et_now.hour}, "
+            f"not {CRON_TARGET_HOUR_ET} -- this is the off-DST cron firing, exiting without grading.")
+        return
+    try:
+        run_results_job()
+    except Exception:
+        # Deliberately swallowed (process still exits 0) so a restart
+        # policy can't re-run the job after a partial failure.
+        log("\u2717 RUN_MODE=once: results job raised an exception (traceback below); NOT retrying.")
+        traceback.print_exc()
+
+
 if __name__ == "__main__":
     mode = os.environ.get("RESULTS_MODE", "scheduler").lower()
-    log(f"BMT Setup Results Tracker starting (mode={mode})...")
+    run_once = os.environ.get("RUN_MODE", "").strip().lower() == "once"
+    log(f"BMT Setup Results Tracker starting (mode={mode}, run_once={run_once})...")
     if mode == "run":
         run_results_job()
+    elif run_once:
+        run_once_from_cron()
     else:
         start_scheduler()
