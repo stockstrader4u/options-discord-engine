@@ -1,6 +1,23 @@
 r"""
 gex_vex_unified_daily.py -- PRODUCTION single-card GEX/VEX dashboard.
 
+RESTYLE v2 (2026-09-28) -- the render + Today's Focus logic described in
+the sections below were REPLACED by a verdict-first, 2560px-wide layout
+(pure presentation change; data pipeline, history logic, webhook, cron,
+market-holiday gate and output filename are unchanged):
+  header -> VERDICT band (deterministic headline + plain-English body) ->
+  SPY/QQQ/IWM cards -> Mag 7 positioning bars -> Today's Focus (1-3
+  deterministic picks: regime flips first, then widest expected move) ->
+  one-line footer. The "Key Terms" strip is gone from the image; the
+  glossary lives in a pinned channel message. Sections below that talk
+  about the old matplotlib card, the KEY LEVELS / BREAKOUT WATCH focus
+  tags, the 2-item flip cap and the flip-marker bounds guard are
+  historical: the shared tick_bar() now widens its range to include the
+  flip (and spot), so a marker can never leave its own bar. Everything
+  from "theme" down to build_day() is the renderer; it is fed one `day`
+  dict (see DATA CONTRACT in build_day) and every number drawn traces to it.
+
+
 PROMOTED TO PRODUCTION (2026-08-13): this script was developed and
 tested as gex_vex_unified_test.py, posted to a separate test webhook
 and iterated on over several rounds directly against a reference
@@ -121,17 +138,12 @@ day that never traded.
 """
 
 import os
-import textwrap
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
 import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.patches import FancyBboxPatch, Circle
-from matplotlib.colors import LinearSegmentedColormap
-import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 import gex_vex
 import gex_vex_history
@@ -143,525 +155,492 @@ ET = ZoneInfo("America/New_York")
 MAG7_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"]
 CORE_TICKERS = ["SPY", "QQQ", "IWM"]
 
-BG      = "#080b12"
-SURFACE = "#0f1420"
-CARD_BG = "#131928"
-BORDER  = "#232d42"
-TEXT1   = "#f5f7fa"
-TEXT2   = "#9aa4b8"
-TEXT3   = "#6b7488"
-GREEN   = "#2dd4a8"
-RED     = "#f26a7d"
-GOLD    = "#f5b942"
-BLUE    = "#5b9df5"
-PURPLE  = "#b088f5"
+
+# ---------------------------------------------------------------- theme
+BG, CARD, BORDER = "#0A0D14", "#141925", "#262F42"
+TEXT, MUTED = "#E8ECF1", "#8B93A3"
+RED, GREEN, AMBER, BLUE, BARMID = "#FF5D6C", "#2FD08C", "#F5B942", "#6EA0E6", "#3A4258"
+WHITE = "#FFFFFF"
+
+W = 2560
+MARGIN = 60
+MIN_FONT = 24
+MAX_BYTES = 8 * 1024 * 1024
+LABEL_GAP = 16
+
+_FONT_DIR = os.path.join(matplotlib.get_data_path(), "fonts", "ttf")
+_font_cache = {}
 
 
-def fmt(v):
-    if v is None:
-        return "N/A"
-    return f"{v:,.0f}" if v == int(v) else f"{v:,.2f}"
+def font(size, bold=False):
+    key = (size, bold)
+    if key not in _font_cache:
+        name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+        _font_cache[key] = ImageFont.truetype(os.path.join(_FONT_DIR, name), size)
+    return _font_cache[key]
 
 
-def _fmt_expiry_label(expiries: list) -> str:
-    """
-    EXPIRY LABEL (2026-09-13): formats a ticker's actual expiry date
-    for on-card display -- see the near-term-expiry redesign in
-    gex_vex.py's module docstring for why this suddenly matters more
-    than it used to (the window now rolls 2-3 days out from whenever
-    the job runs, instead of a fixed "this week" target, so a reader
-    genuinely needs to know which date they're looking at). Falls back
-    to the raw ISO string if parsing fails for any reason, rather than
-    hiding the value entirely.
-    """
-    if not expiries:
-        return "N/A"
-    try:
-        d = datetime.strptime(expiries[0], "%Y-%m-%d").date()
-        return d.strftime("%b %d")
-    except Exception:
-        return expiries[0]
+def rgb(hex_):
+    hex_ = hex_.lstrip("#")
+    return tuple(int(hex_[i:i + 2], 16) for i in (0, 2, 4))
 
 
-def esc(text):
-    return text.replace("$", r"\$") if text else text
+def blend(fg, bg, a):
+    f, b = rgb(fg), rgb(bg)
+    return tuple(int(f[i] * a + b[i] * (1 - a)) for i in range(3))
 
 
-def measure_text_width(fig, ax, text, fontsize, fontweight="bold"):
-    probe = ax.text(0, 0, esc(text), fontsize=fontsize, fontweight=fontweight, alpha=0)
-    fig.canvas.draw()
-    renderer = fig.canvas.get_renderer()
-    bbox = probe.get_window_extent(renderer=renderer)
-    inv = ax.transData.inverted()
-    (x0, _), (x1, _) = inv.transform((bbox.x0, bbox.y0)), inv.transform((bbox.x1, bbox.y1))
-    probe.remove()
-    return abs(x1 - x0)
+def tw(draw, text, f):
+    return draw.textlength(text, font=f)
 
 
-def measure_text_height(fig, ax, text, fontsize, fontweight="normal"):
-    probe = ax.text(0, 0, esc(text), fontsize=fontsize, fontweight=fontweight, va="top", alpha=0)
-    fig.canvas.draw()
-    renderer = fig.canvas.get_renderer()
-    bbox = probe.get_window_extent(renderer=renderer)
-    inv = ax.transData.inverted()
-    (_, y0), (_, y1) = inv.transform((bbox.x0, bbox.y0)), inv.transform((bbox.x1, bbox.y1))
-    probe.remove()
-    return abs(y1 - y0)
+def fmt_px(v):
+    """Price-like number: integers bare, otherwise 2 decimals."""
+    return f"{v:,.0f}" if float(v) == int(v) else f"{v:,.2f}"
 
 
-def pill(ax, x, y, w, h, color, text, fontsize=8, fill_alpha=0.18, zorder=3):
-    ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.015,rounding_size=0.05",
-                                facecolor=color, alpha=fill_alpha, edgecolor="none", zorder=zorder))
-    ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.015,rounding_size=0.05",
-                                facecolor="none", edgecolor=color, linewidth=1.2, zorder=zorder+1))
-    ax.text(x + w/2, y + h/2, esc(text), fontsize=fontsize, fontweight="bold", color=color,
-            va="center", ha="center", zorder=zorder+2)
+def money(v):
+    return f"${v:,.2f}"
 
 
-def pill_right_aligned(ax, fig, right_edge_x, y, h, color, text, fontsize=8, fill_alpha=0.2, h_pad=0.28, zorder=3):
-    text_w = measure_text_width(fig, ax, text, fontsize)
-    w = text_w + h_pad
-    pill(ax, right_edge_x - w, y, w, h, color, text, fontsize=fontsize, fill_alpha=fill_alpha, zorder=zorder)
+# ------------------------------------------------------- derived helpers
+def is_short(net_gex):
+    return net_gex < 0
+
+
+def regime_of(net_gex):
+    return "SHORT" if is_short(net_gex) else "LONG"
+
+
+def day_change_pct(ix):
+    if ix.get("prev_close") in (None, 0):
+        return None
+    return (ix["spot"] / ix["prev_close"] - 1) * 100
+
+
+def exp_move_dollar(x):
+    return x["spot"] * x["exp_move_pct"] / 100
+
+
+def join_names(names):
+    return " and ".join(names) if len(names) <= 2 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+# ---------------------------------------------------------- verdict engine
+def verdict(day):
+    ixs = day["indexes"]
+    short = [i for i in ixs if is_short(i["net_gex"])]
+    long_ = [i for i in ixs if not is_short(i["net_gex"])]
+    spy = next((i for i in ixs if i["ticker"] == "SPY"), None)
+
+    if len(short) == len(ixs):
+        headline, accent = "FRAGILE DAY — BREAKS CAN RUN", RED
+    elif len(long_) == len(ixs):
+        headline, accent = "STICKY DAY — MOVES LIKELY TO FADE", GREEN
+    elif spy is not None and is_short(spy["net_gex"]) and long_:
+        headline, accent = "MIXED DAY — FRAGILE UNDERNEATH", AMBER
+    elif spy is not None and not is_short(spy["net_gex"]) and short:
+        headline, accent = "MIXED DAY — SPY ANCHORED", AMBER
+    else:
+        headline, accent = "MIXED DAY", AMBER
+
+    sentences = []
+    if short:
+        names = join_names([i["ticker"] for i in short])
+        sentences.append(f"{names} {'is' if len(short) == 1 else 'are'} short gamma: "
+                         f"once a level breaks, the move can run further than usual.")
+    if long_:
+        def near(i):
+            return fmt_px(i["gamma_flip"] if i["gamma_flip"] is not None else i["put_wall"])
+
+        def flipped(i):
+            return regime_of(i["net_gex"]) != i["regime_prev"]
+
+        groups = []
+        for verb, sel in (("flipped into", [i for i in long_ if flipped(i)]),
+                          ("sits in", [i for i in long_ if not flipped(i)])):
+            if sel:
+                groups.append((verb, sel))
+        parts = []
+        for verb, sel in groups:
+            names = join_names([i["ticker"] for i in sel])
+            where = (f"near {near(sel[0])}" if len(sel) == 1
+                     else "near " + join_names([f"{near(i)} ({i['ticker']})" for i in sel]))
+            parts.append(f"{names} {verb} long gamma {where}")
+        sentences.append(" and ".join(parts) + " — stickier, so fast moves are more likely "
+                         "to fade than follow through.")
+    sentences.append("Trade smaller than usual and respect the walls.")
+    return headline, accent, " ".join(s for s in sentences if s)
+
+
+# ------------------------------------------------------------ focus picker
+def pick_focus(day):
+    """Returns up to 3 dicts: tag, tag_color, ticker, blurb (priority order)."""
+    picks = []
+    for ix in day["indexes"]:
+        now = regime_of(ix["net_gex"])
+        if now == ix["regime_prev"]:
+            continue
+        chg = day_change_pct(ix)
+        t = ix["ticker"]
+        if now == "SHORT":
+            color = RED
+            move = ""
+            if chg is not None:
+                move = f"{t} {'down' if chg < 0 else 'up'} {'barely ' if abs(chg) < 0.3 else ''}{abs(chg):.1f}%, but"
+            lead = move if move else f"{t}:"
+            blurb = (f"{lead} this setup got less stable — near {fmt_px(ix['put_wall'])} "
+                     f"there's less to slow a move down. Swings could run further than a normal "
+                     f"session: trade smaller, and don't expect dips to get bought back fast.")
+        else:
+            color = AMBER
+            move = ""
+            if chg is not None:
+                move = f"{t} {'down' if chg < 0 else 'up'} {abs(chg):.1f}% yet"
+            lead = move if move else f"{t}"
+            near = (f"near the {fmt_px(ix['gamma_flip'])} flip" if ix["gamma_flip"] is not None
+                    else f"near {fmt_px(ix['put_wall'])}")
+            blurb = (f"{lead} flipped into a steadier setup {near} — price has a natural "
+                     f"brake now. Fast moves in either direction are more likely to fade than "
+                     f"follow through: lean on the range, don't chase breakouts.")
+        picks.append(dict(tag="REGIME FLIP", tag_color=color, ticker=t, blurb=blurb))
+
+    if day["mag7"]:
+        top = max(day["mag7"], key=lambda m: m["exp_move_pct"])
+        blurb = (f"Widest expected move of the group at ±{top['exp_move_pct']:.2f}% "
+                 f"(±{money(exp_move_dollar(top))}). Bigger swings cut both ways here "
+                 f"— size accordingly.")
+        picks.append(dict(tag="HIGH RISK", tag_color=AMBER, ticker=top["ticker"], blurb=blurb))
+    return picks[:3]
+
+
+# --------------------------------------------------------------- primitives
+def rrect(draw, box, radius, fill=None, outline=None, width=2):
+    draw.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=width)
+
+
+def pill(draw, x, y, h, text, color, size, bg, min_w=0):
+    """Outlined pill, left-anchored at x, top at y. Returns width."""
+    f = font(size, True)
+    w = max(min_w, tw(draw, text, f) + 44)
+    rrect(draw, (x, y, x + w, y + h), h // 2, fill=blend(color, bg, 0.14), outline=rgb(color), width=3)
+    draw.text((x + w / 2, y + h / 2 + 1), text, font=f, fill=rgb(color), anchor="mm")
     return w
 
 
-def pick_todays_focus(core_results, mag7_results, comparisons):
-    """
-    Initial heuristic -- see module docstring. Returns up to 3
-    (ticker_result, color, tag, description) tuples.
-
-    `comparisons`: dict of ticker -> gex_vex_history.get_comparison_summary()
-    result. A REGIME FLIP today is now the #1 priority signal (ahead of
-    the three heuristics below) -- this is what REPLACES the separate
-    "Since Yesterday" text message: instead of a wall of prose covering
-    every ticker's delta, only tickers where something actually
-    regime-changed get a slot in this panel, using the same real
-    plain-English paragraph gex_vex_history already writes.
-    """
-    all_valid = [r for r in (core_results + mag7_results) if "error" not in r]
-    picked_tickers = set()
-    focus = []
-
-    # 0. REGIME FLIP TODAY -- highest priority, replaces the separate
-    # Since Yesterday text post entirely. Only tickers with an actual
-    # flip get a slot here; a quiet day with no flips means this rule
-    # contributes nothing, and the panel falls through to the normal
-    # heuristics below.
-    flipped = [r for r in all_valid if comparisons.get(r["ticker"], {}).get("regime_flipped")]
-    for r in flipped[:2]:  # cap at 2 so there's still room for at least one heuristic pick
-        comp = comparisons[r["ticker"]]
-        color = GOLD if comp["flip_direction"] == "to_long" else RED
-        focus.append((r, color, "REGIME FLIP", comp["plain_text"]))
-        picked_tickers.add(r["ticker"])
-
-    # 1. Highest expected move -> HIGH RISK
-    with_em = [r for r in all_valid if r.get("expected_move") and r["ticker"] not in picked_tickers]
-    if with_em and len(focus) < 3:
-        top_em = max(with_em, key=lambda r: r["expected_move"]["pct"])
-        em = top_em["expected_move"]
-        desc = (f"Widest expected move of the group (\u00b1{em['pct']}%, \u00b1${em['dollar']:.2f} by Friday). "
-                f"Bigger swings cut both ways here -- size accordingly.")
-        focus.append((top_em, GOLD, "HIGH RISK", desc))
-        picked_tickers.add(top_em["ticker"])
-
-    # 2. Closest to its own gamma flip -> KEY LEVELS
-    near_flip = [r for r in all_valid if r.get("gamma_flip") and r["ticker"] not in picked_tickers]
-    if near_flip and len(focus) < 3:
-        closest = min(near_flip, key=lambda r: abs(r["spot"] - r["gamma_flip"]) / r["spot"])
-        desc = (f"Sitting right at its {fmt(closest['gamma_flip'])} pivot level -- which way it breaks "
-                f"from here matters more than usual today.")
-        focus.append((closest, PURPLE, "KEY LEVELS", desc))
-        picked_tickers.add(closest["ticker"])
-
-    # 3. First short-gamma name (the regime outlier) -> BREAKOUT WATCH
-    short_names = [r for r in all_valid if r["net_gex"] < 0 and r["ticker"] not in picked_tickers]
-    if short_names and len(focus) < 3:
-        s = short_names[0]
-        desc = ("Short gamma while most of the group is long -- less cushion against a big move here. "
-                "Keep position sizes tighter than the rest of the list.")
-        focus.append((s, RED, "BREAKOUT WATCH", desc))
-        picked_tickers.add(s["ticker"])
-
-    # Pad with next-highest expected-move tickers if fewer than 3 qualified
-    if len(focus) < 3:
-        remaining = sorted([r for r in with_em if r["ticker"] not in picked_tickers],
-                            key=lambda r: r["expected_move"]["pct"], reverse=True)
-        for r in remaining:
-            if len(focus) >= 3:
-                break
-            em = r["expected_move"]
-            desc = f"Expected move \u00b1{em['pct']}% this week -- worth a look alongside the rest of the group."
-            focus.append((r, BLUE, "WATCH", desc))
-            picked_tickers.add(r["ticker"])
-
-    return focus[:3]
-
-
-def render_unified_card(core_results, mag7_results, focus_items, comparisons, week_label, out_path):
-    FIG_W = 15.5
-    fig = plt.figure(figsize=(FIG_W, 20), dpi=170, facecolor=BG)
-    ax = fig.add_axes([0, 0, 1, 1])
-    ax.set_xlim(0, FIG_W); ax.set_ylim(0, 20)
-    ax.axis("off"); ax.invert_yaxis()
-
-    ax.text(FIG_W/2, 0.45, "DAILY GEX / VEX DASHBOARD", fontsize=25, fontweight="bold",
-            color=TEXT1, va="top", ha="center")
-    ax.text(FIG_W/2, 0.98, f"{week_label}  \u00b7  BlueMoonTrades", fontsize=11.5,
-            color=BLUE, va="top", ha="center")
-
-    cy = 1.65
-    card_w = 4.95
-    card_gap = 0.25
-    x0 = 0.35
-    gradient_cmap = LinearSegmentedColormap.from_list("rg", [RED, "#3a3f4e", GREEN])
-
-    STAT_FONTSIZE = 10.5
-    LABEL_FONTSIZE = 8.2
-    row_gap = 0.60
-    stat_value_h = measure_text_height(fig, ax, "-0.91B", STAT_FONTSIZE, fontweight="bold")
-    bottom_pad = 0.30
-
-    py_off = 0.32
-    spot_label_off = py_off + 0.48
-    spot_val_off = py_off + 0.72
-    bar_y_off = py_off + 1.55
-    bar_h = 0.24
-    legend_y_off = bar_y_off + bar_h + 0.56
-    sy_off = legend_y_off + 0.42
-    last_left_row_label_off = sy_off + 2 * row_gap
-    last_left_row_val_off = last_left_row_label_off + 0.24
-    card_h = (last_left_row_val_off + stat_value_h) + bottom_pad
-
-    valid_core = [r for r in core_results if "error" not in r]
-    for i, t in enumerate(valid_core):
-        cx = x0 + i * (card_w + card_gap)
-        ax.add_patch(FancyBboxPatch((cx, cy), card_w, card_h,
-                                    boxstyle="round,pad=0.02,rounding_size=0.10",
-                                    facecolor=CARD_BG, edgecolor=BORDER, linewidth=1.0, zorder=2))
-
-        px = cx + 0.30
-        ax.text(px, cy + py_off, f"${t['ticker']}", fontsize=22, fontweight="bold", color=TEXT1, va="top", zorder=3)
-        ax.text(px, cy + spot_label_off, "SPOT PRICE", fontsize=7.5, color=TEXT3, va="top", zorder=3)
-        ax.text(px, cy + spot_val_off, f"{t['spot']:,.2f}", fontsize=14, fontweight="bold", color=GREEN, va="top", zorder=3)
-
-        # Compact "vs yesterday" delta -- glanceable data, no prose.
-        # This is what replaced the separate Since Yesterday text post.
-        comp = comparisons.get(t["ticker"], {})
-        if comp.get("has_comparison") and comp.get("spot_change_pct") is not None:
-            pct = comp["spot_change_pct"]
-            arrow = "\u25b2" if pct >= 0 else "\u25bc"
-            delta_color = GREEN if pct >= 0 else RED
-            spot_val_w = measure_text_width(fig, ax, f"{t['spot']:,.2f}", 14)
-            ax.text(px + spot_val_w + 0.18, cy + spot_val_off + 0.06, f"{arrow} {abs(pct):.1f}% vs yesterday",
-                    fontsize=8.0, color=delta_color, va="top", zorder=3)
-
-        is_long = t["net_gex"] >= 0
-        badge_color = GREEN if is_long else RED
-        badge_txt = "LONG GAMMA" if is_long else "SHORT GAMMA"
-        bw = 1.75
-        badge_x = cx + card_w - bw - 0.28
-        pill(ax, badge_x, cy + 0.30, bw, 0.40, badge_color, badge_txt, fontsize=8.5)
-        if comp.get("regime_flipped"):
-            ax.text(badge_x - 0.10, cy + 0.50, "\u26A0", fontsize=13, color=GOLD, va="center", ha="right", zorder=4)
-
-        # EXPIRY LABEL (2026-09-13): nothing on this card previously
-        # showed which expiry date the walls/gamma-flip/net-GEX numbers
-        # actually came from -- confirmed as a real gap while mocking
-        # up the near-term-expiry redesign (see gex_vex.py's module
-        # docstring): the layout never changed, but the underlying
-        # expiry now rolls with a 2-3 day window instead of a fixed
-        # "this week" target, so it's more important than before for a
-        # reader to see exactly which date they're looking at. Placed
-        # in the blank space below the regime badge, which doesn't
-        # require shifting any of the other carefully-measured offsets
-        # below it.
-        exp_label = _fmt_expiry_label(t.get("expiries"))
-        ax.text(cx + card_w - 0.28, cy + 0.78, f"EXP {exp_label}", fontsize=7.6,
-                color=TEXT3, va="top", ha="right", zorder=3)
-
-        bar_y = cy + bar_y_off
-        bar_x0 = px
-        bar_w = card_w - 0.60
-        put_wall = t.get("put_wall") or t["spot"] * 0.99
-        call_wall = t.get("call_wall") or t["spot"] * 1.01
-        grad = np.linspace(0, 1, 256).reshape(1, -1)
-        ax.imshow(grad, extent=[bar_x0, bar_x0 + bar_w, bar_y, bar_y + bar_h],
-                  cmap=gradient_cmap, aspect="auto", zorder=3, alpha=0.9)
-        ax.add_patch(FancyBboxPatch((bar_x0, bar_y), bar_w, bar_h,
-                                    boxstyle="round,pad=0,rounding_size=0.12",
-                                    facecolor="none", edgecolor=BORDER, linewidth=0.9, zorder=4))
-
-        rng_lo, rng_hi = put_wall * 0.995, call_wall * 1.005
-        def to_x(v, lo=rng_lo, hi=rng_hi, x0_=bar_x0, w=bar_w):
-            return x0_ + (v - lo) / (hi - lo) * w
-
-        spot_x = to_x(t["spot"])
-        ax.plot([spot_x], [bar_y + bar_h/2], marker="o", markersize=11,
-                markerfacecolor="#ffffff", markeredgecolor=TEXT1, markeredgewidth=1.4, zorder=6)
-
-        # FLIP-MARKER BOUNDS GUARD (2026-08-19): previously drew this
-        # dashed line and "FLIP $X" label UNCONDITIONALLY, with no
-        # check that gamma_flip actually fell within THIS ticker's own
-        # bar range (rng_lo to rng_hi) -- confirmed in production
-        # (twice) that a gamma_flip value from find_gamma_flip()'s
-        # previously-too-wide search band could land far outside a
-        # ticker's own put-wall/call-wall/spot range, causing to_x() to
-        # compute an x-position well outside this card's bar -- in one
-        # case bleeding into a neighboring card, in another landing
-        # almost entirely off the left edge of the whole image. The
-        # root cause (find_gamma_flip()'s search band not matching the
-        # wall-selection band) is fixed at the source in gex_vex.py's
-        # compute_gex_vex() as of the same date, but this guard is kept
-        # here regardless, as a second, independent layer -- exactly
-        # matching the guard gex_vex.py's own two card renderers
-        # (render_single_ticker_gex_card, render_gex_dashboard_card)
-        # already had. A flip marker can now never be drawn outside its
-        # own card's visible bar, no matter what value is returned
-        # upstream.
-        if t.get("gamma_flip") is not None and rng_lo <= t["gamma_flip"] <= rng_hi:
-            flip_x = to_x(t["gamma_flip"])
-            ax.plot([flip_x, flip_x], [bar_y - 0.07, bar_y + bar_h + 0.07],
-                    color=GOLD, linewidth=1.5, linestyle="--", zorder=5)
-            ax.text(flip_x, bar_y - 0.12, f"FLIP {fmt(t['gamma_flip'])}", fontsize=7.0, color=GOLD,
-                    va="bottom", ha="center", fontweight="bold", zorder=6)
-
-        ax.text(bar_x0, bar_y - 0.32, "PUT WALL", fontsize=7.3, color=RED, va="bottom", fontweight="bold", zorder=6)
-        ax.text(bar_x0 + bar_w, bar_y - 0.32, "CALL WALL", fontsize=7.3, color=GREEN, va="bottom",
-                ha="right", fontweight="bold", zorder=6)
-
-        quarter_lo = rng_lo + (rng_hi - rng_lo) * 0.25
-        quarter_hi = rng_lo + (rng_hi - rng_lo) * 0.75
-        scale_points = [
-            (0.00, fmt(put_wall), RED, True), (0.25, fmt(quarter_lo), TEXT3, False),
-            (0.50, fmt(t["spot"]), TEXT1, True), (0.75, fmt(quarter_hi), TEXT3, False),
-            (1.00, fmt(call_wall), GREEN, True),
-        ]
-        for frac, label, color, bold in scale_points:
-            tx = bar_x0 + frac * bar_w
-            ha = "left" if frac == 0 else ("right" if frac == 1 else "center")
-            ax.text(tx, bar_y + bar_h + 0.24, label, fontsize=9.0 if bold else 7.8, color=color,
-                    va="top", ha=ha, fontweight="bold" if bold else "normal", zorder=6)
-
-        legend_y = cy + legend_y_off
-        ax.plot([bar_x0], [legend_y + 0.045], marker="o", markersize=6,
-                markerfacecolor="#ffffff", markeredgecolor=TEXT1, markeredgewidth=0.8, zorder=6)
-        ax.text(bar_x0 + 0.16, legend_y, "CURRENT PRICE", fontsize=6.6, color=TEXT3, va="top", zorder=6)
-        ax.plot([bar_x0 + 1.55, bar_x0 + 1.80], [legend_y + 0.045, legend_y + 0.045],
-                color=GOLD, linewidth=1.3, linestyle="--", zorder=6)
-        ax.text(bar_x0 + 1.90, legend_y, "GAMMA FLIP", fontsize=6.6, color=TEXT3, va="top", zorder=6)
-
-        sy = cy + sy_off
-        em = t.get("expected_move") or {}
-        left_col = [("Gamma Flip", fmt(t.get("gamma_flip")), TEXT1),
-                    ("Net GEX", f"+${t['net_gex']/1e9:.2f}B" if t["net_gex"] >= 0 else f"-${abs(t['net_gex'])/1e9:.2f}B", badge_color),
-                    ("Net VEX", f"{t['net_vex']/1e9:+.2f}B", RED if t["net_vex"] < 0 else GREEN)]
-        right_col = [("Expected Move (1D)", f"\u00b1{em.get('pct', 0)}%" if em else "N/A", GOLD),
-                     ("Implied Range (1D)", f"{em.get('min', 0):.2f}\u2013{em.get('max', 0):.2f}" if em else "N/A", TEXT1),
-                     ("Put Wall / Call Wall", f"{fmt(put_wall)}  /  {fmt(call_wall)}", TEXT2)]
-
-        col2_x = px + (card_w - 0.60) / 2 + 0.20
-        _y = sy
-        for label, val, color in left_col:
-            ax.text(px, _y, label, fontsize=LABEL_FONTSIZE, color=TEXT2, va="top", zorder=3)
-            ax.text(px, _y + 0.24, esc(val), fontsize=STAT_FONTSIZE, fontweight="bold", color=color, va="top", zorder=3)
-            _y += row_gap
-        _y = sy
-        for label, val, color in right_col:
-            ax.text(col2_x, _y, label, fontsize=LABEL_FONTSIZE, color=TEXT2, va="top", zorder=3)
-            ax.text(col2_x, _y + 0.24, esc(val), fontsize=9.5, fontweight="bold", color=color, va="top", zorder=3)
-            _y += row_gap
-
-    cy += card_h + 0.35
-
-    left_w = 9.6
-    right_x = x0 + left_w + 0.3
-    right_w = FIG_W - right_x - 0.35
-
-    valid_mag7 = [r for r in mag7_results if "error" not in r]
-    table_row_sample_h = measure_text_height(fig, ax, "$AAPL", 10.5, fontweight="bold")
-    regime_pill_h = 0.34
-    row_h = max(table_row_sample_h, regime_pill_h) + 0.30
-    table_header_h = measure_text_height(fig, ax, "TICKER", 7.3, fontweight="bold") + 0.55
-    mag7_content_h = table_header_h + row_h * max(len(valid_mag7), 1)
-
-    # --- Pre-compute Today's Focus real content height BEFORE fixing --
-    # the shared section height. BUGFIX (2026-08-13): the shared height
-    # for both bottom panels was previously derived ONLY from the Mag 7
-    # table's row count -- on a run where some Mag 7 tickers errored
-    # out (fewer valid rows -> shorter table), the shared height shrank
-    # below what Today's Focus actually needs for its fixed 3 items,
-    # and the last item's content rendered PAST the card's own bottom
-    # border (confirmed in a real screenshot: $AMZN's badge circle and
-    # description text hung below the panel's rounded border entirely).
-    # Computing both panels' real needed height first, then using
-    # whichever is LARGER as the shared section_h, guarantees neither
-    # panel is ever truncated below its own content regardless of how
-    # many Mag 7 tickers happen to error out on a given run.
-    desc_fontsize = 9.5
-    ticker_fontsize = 15
-    tag_fontsize = 8.0
-    badge_r = 0.34
-    title_row_h = 0.46
-    tag_desc_gap = 0.22
-    stacked_extra_h = 0.42 + tag_desc_gap
-    bottom_margin = 0.20
-
-    sample = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ "
-    avg_char_w = measure_text_width(fig, ax, sample, desc_fontsize, fontweight="normal") / len(sample)
-    desc_x_offset = 0.65 + badge_r + 0.38
-    avail_w = right_w - desc_x_offset - 0.35
-    chars_per_line = max(20, int(avail_w / avg_char_w))
-
-    min_gap = 0.30
-    item_heights, wrapped_texts, stack_tag = [], [], []
-    for t, color, tag, text in focus_items:
-        ticker = t["ticker"]
-        tx_est = right_x + 0.65 + badge_r + 0.38
-        name_w = measure_text_width(fig, ax, f"${ticker}", ticker_fontsize)
-        tag_pill_w = measure_text_width(fig, ax, tag, tag_fontsize) + 0.28
-        tag_right_edge = right_x + right_w - 0.32
-        fits_same_row = (tx_est + name_w + min_gap) <= (tag_right_edge - tag_pill_w)
-        stack_tag.append(not fits_same_row)
-
-        wrapped = "\n".join(textwrap.wrap(text, width=chars_per_line))
-        wrapped_texts.append(wrapped)
-        desc_h = measure_text_height(fig, ax, wrapped, desc_fontsize)
-        extra = tag_desc_gap if fits_same_row else stacked_extra_h
-        item_heights.append(title_row_h + extra + desc_h + bottom_margin)
-
-    focus_natural_total = sum(item_heights) if item_heights else 0
-    focus_content_h = 0.88 + focus_natural_total  # header + items, no leftover yet
-
-    pad = 0.45
-    section_h = max(mag7_content_h, focus_content_h) + pad
-
-    ax.add_patch(FancyBboxPatch((x0, cy), left_w, section_h,
-                                boxstyle="round,pad=0.02,rounding_size=0.07",
-                                facecolor=CARD_BG, edgecolor=BORDER, linewidth=1.0, zorder=2))
-    ax.add_patch(FancyBboxPatch((right_x, cy), right_w, section_h,
-                                boxstyle="round,pad=0.02,rounding_size=0.07",
-                                facecolor=CARD_BG, edgecolor=BORDER, linewidth=1.0, zorder=2))
-
-    ax.text(x0 + 0.32, cy + 0.32, "MAG 7 POSITIONING", fontsize=14, fontweight="bold", color=TEXT1, va="top", zorder=3)
-
-    th_y = cy + 0.88
-    # EXPIRY COLUMN ADDED (2026-09-13): same rationale as the core
-    # cards' new expiry label -- see that comment above. Column
-    # positions tightened slightly from the original 8-column layout
-    # to fit the new 9th column within the same left_w.
-    cols = [x0 + 0.30, x0 + 1.30, x0 + 2.15, x0 + 2.95, x0 + 4.15, x0 + 5.30, x0 + 6.45, x0 + 7.60, x0 + 8.70]
-    headers = ["TICKER", "EXPIRY", "SPOT", "REGIME", "PUT WALL", "CALL WALL", "GAMMA FLIP", "EXP MOVE", "NET GEX"]
-    for x, h in zip(cols, headers):
-        ax.text(x, th_y, h, fontsize=7.3, fontweight="bold", color=TEXT3, va="top", zorder=3)
-    th_y += 0.26
-    ax.plot([x0 + 0.22, x0 + left_w - 0.22], [th_y, th_y], color=BORDER, linewidth=0.7, zorder=3)
-
-    ry = th_y + 0.16
-    for i, t in enumerate(valid_mag7):
-        if i % 2 == 0:
-            ax.add_patch(plt.Rectangle((x0 + 0.15, ry - 0.06), left_w - 0.30, row_h - 0.05,
-                                        facecolor=SURFACE, edgecolor="none", zorder=1))
-        is_long = t["net_gex"] >= 0
-        rc = GREEN if is_long else RED
-        em = t.get("expected_move") or {}
-        ax.text(cols[0], ry, f"${t['ticker']}", fontsize=10.5, fontweight="bold", color=TEXT1, va="top", zorder=3)
-        ax.text(cols[1], ry, _fmt_expiry_label(t.get("expiries")), fontsize=8.6, color=TEXT3, va="top", zorder=3)
-        ax.text(cols[2], ry, f"{t['spot']:,.2f}", fontsize=9.3, color=TEXT2, va="top", zorder=3)
-        pill(ax, cols[3], ry - 0.01, 1.05, 0.34, rc, "LONG" if is_long else "SHORT", fontsize=7.0)
-        comp = comparisons.get(t["ticker"], {})
-        if comp.get("regime_flipped"):
-            ax.text(cols[3] - 0.16, ry + 0.16, "\u26A0", fontsize=10, color=GOLD, va="center", ha="right", zorder=4)
-        ax.text(cols[4], ry, fmt(t.get("put_wall")), fontsize=9.3, color=RED, va="top", zorder=3)
-        ax.text(cols[5], ry, fmt(t.get("call_wall")), fontsize=9.3, color=GREEN, va="top", zorder=3)
-        ax.text(cols[6], ry, fmt(t.get("gamma_flip")), fontsize=9.3, color=GOLD, va="top", zorder=3)
-        ax.text(cols[7], ry, f"\u00b1{em.get('pct', 0)}%" if em else "N/A", fontsize=9.3, color=TEXT1, va="top", zorder=3)
-        gex_str = f"+${t['net_gex']/1e9:.2f}B" if t["net_gex"] >= 0 else f"-${abs(t['net_gex'])/1e9:.2f}B"
-        ax.text(cols[8], ry, gex_str, fontsize=9.3, fontweight="bold", color=rc, va="top", zorder=3)
-        ry += row_h
-
-    ax.text(right_x + 0.32, cy + 0.32, "TODAY'S FOCUS", fontsize=14, fontweight="bold", color=TEXT1, va="top", zorder=3)
-
-    usable_h = section_h - 1.0
-    leftover = max(0, usable_h - focus_natural_total)
-    extra_gap = leftover / (len(focus_items) + 1) if focus_items else 0
-
-    fy = cy + 0.88 + extra_gap
-    for idx, (t, color, tag, text) in enumerate(focus_items):
-        ticker = t["ticker"]
-        row_top = fy
-        item_h = item_heights[idx]
-
-        ax.add_patch(plt.Rectangle((right_x + 0.18, row_top + 0.05), 0.05, item_h - 0.10,
-                                    facecolor=color, linewidth=0, zorder=3))
-
-        bx = right_x + 0.65
-        by = row_top + 0.50
-        ax.add_patch(Circle((bx, by), badge_r, facecolor=color, alpha=0.85, edgecolor=color, linewidth=1.2, zorder=4))
-        ax.text(bx, by, ticker[0], fontsize=16, fontweight="bold", color=BG, va="center", ha="center", zorder=5)
-
-        tx = bx + badge_r + 0.38
-        ax.text(tx, row_top + 0.20, f"${ticker}", fontsize=ticker_fontsize, fontweight="bold", color=TEXT1, va="top", zorder=4)
-
-        tag_right_edge = right_x + right_w - 0.32
-        if stack_tag[idx]:
-            tag_w = measure_text_width(fig, ax, tag, tag_fontsize) + 0.28
-            pill(ax, tx, row_top + 0.60, tag_w, 0.36, color, tag, fontsize=tag_fontsize, fill_alpha=0.2)
-            desc_y = row_top + 0.60 + stacked_extra_h
+def wrap(draw, text, f, max_w):
+    lines, cur = [], ""
+    for word in text.split():
+        trial = f"{cur} {word}".strip()
+        if tw(draw, trial, f) <= max_w or not cur:
+            cur = trial
         else:
-            pill_right_aligned(ax, fig, tag_right_edge, row_top + 0.22, 0.42, color, tag, fontsize=tag_fontsize, fill_alpha=0.2)
-            desc_y = row_top + 0.46 + tag_desc_gap
+            lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    return lines
 
-        ax.text(tx, desc_y, esc(wrapped_texts[idx]), fontsize=desc_fontsize, color=TEXT2, va="top", zorder=4)
 
-        fy = row_top + item_h + extra_gap
-        if idx < len(focus_items) - 1:
-            divider_y = row_top + item_h + extra_gap / 2
-            ax.plot([right_x + 0.32, right_x + right_w - 0.32], [divider_y, divider_y],
-                    color=BORDER, linewidth=0.6, zorder=3)
+def gradient_bar(img, x, y, w, h):
+    stops = [rgb(RED), rgb(BARMID), rgb(GREEN)]
+    strip = Image.new("RGB", (w, 1))
+    px = strip.load()
+    for i in range(w):
+        t = i / max(w - 1, 1) * 2
+        k = min(int(t), 1)
+        f = t - k
+        px[i, 0] = tuple(int(stops[k][c] * (1 - f) + stops[k + 1][c] * f) for c in range(3))
+    strip = strip.resize((w, h))
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, w - 1, h - 1), radius=h // 2, fill=255)
+    img.paste(strip, (int(x), int(y)), mask)
 
-    cy += section_h + 0.35
 
-    # --- Definitions strip -- same precedent as gex_vex.py's existing --
-    # per-ticker card renderers (which already carry a compact GEX/VEX/
-    # Walls/Gamma Flip key), extended here to cover every jargon term
-    # actually used on THIS card. Sized to the real wrapped text height,
-    # not guessed, same discipline as every other section of this file.
-    definitions = (
-        "LONG GAMMA: price tends to get pulled back toward the range if it swings too far -- moves stay more contained.  \u00b7  "
-        "SHORT GAMMA: less cushion against big moves -- once a level breaks, price can run further than usual.  \u00b7  "
-        "GAMMA FLIP: the price level where that behavior switches from one to the other.  \u00b7  "
-        "PUT WALL / CALL WALL: strikes where options positioning is heaviest -- tend to act like a floor or ceiling.  \u00b7  "
-        "NET GEX: total gamma exposure -- the sign shows long or short gamma overall.  \u00b7  "
-        "NET VEX: how sensitive that positioning is to changes in volatility.  \u00b7  "
-        "EXPECTED MOVE: how far the options market is pricing this to move by Friday."
-    )
-    def_fontsize = 7.6
-    def_x0 = x0
-    def_w = FIG_W - 2 * x0
-    def_sample = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ "
-    def_avg_char_w = measure_text_width(fig, ax, def_sample, def_fontsize, fontweight="normal") / len(def_sample)
-    def_inner_pad = 0.35
-    def_chars_per_line = max(30, int((def_w - 2 * def_inner_pad) / def_avg_char_w))
-    def_wrapped = "\n".join(textwrap.wrap(definitions, width=def_chars_per_line))
-    def_text_h = measure_text_height(fig, ax, def_wrapped, def_fontsize)
+def dashed_vline(draw, x, y0, y1, color, width=4, on=8, off=6):
+    y = y0
+    while y < y1:
+        draw.line((x, y, x, min(y + on, y1)), fill=color, width=width)
+        y += on + off
 
-    def_header_h = 0.32
-    def_box_h = def_header_h + def_text_h + 0.30
-    ax.add_patch(FancyBboxPatch((def_x0, cy), def_w, def_box_h,
-                                boxstyle="round,pad=0.02,rounding_size=0.06",
-                                facecolor=CARD_BG, edgecolor=BORDER, linewidth=0.9, zorder=2))
-    ax.text(def_x0 + 0.30, cy + 0.18, "KEY TERMS", fontsize=9.0, fontweight="bold", color=TEXT3, va="top", zorder=3)
-    ax.text(def_x0 + 0.30, cy + def_header_h + 0.14, esc(def_wrapped), fontsize=def_fontsize,
-            color=TEXT2, va="top", zorder=3)
 
-    cy += def_box_h + 0.35
+def decollide(widths, centers, lo, hi, gap=LABEL_GAP):
+    """Left edges for labels (already sorted by centre). Push right to keep
+    `gap`, clamp inside [lo, hi], then re-resolve leftwards."""
+    n = len(widths)
+    left = [c - w / 2 for c, w in zip(centers, widths)]
+    left = [max(l, lo) for l in left]
+    for i in range(1, n):
+        left[i] = max(left[i], left[i - 1] + widths[i - 1] + gap)
+    if n and left[-1] + widths[-1] > hi:
+        left[-1] = hi - widths[-1]
+        for i in range(n - 2, -1, -1):
+            left[i] = min(left[i], left[i + 1] - widths[i] - gap)
+    return left
 
-    fig.set_size_inches(FIG_W, cy)
-    ax.set_ylim(cy, 0)
-    ax.set_xlim(0, FIG_W)
 
-    plt.savefig(out_path, facecolor=BG, bbox_inches="tight", pad_inches=0.3)
-    plt.close(fig)
+def tick_bar(img, draw, x, y, w, h, *, spot, put_wall, call_wall, gamma_flip,
+             label_size, bg):
+    """Shared put-wall -> call-wall bar. (x, y) = top-left of the bar.
+    Returns dict with the ticks drawn and label boxes (for invariants)."""
+    vals = [put_wall, call_wall] + ([gamma_flip] if gamma_flip is not None else [])
+    lo, hi = min(vals + [spot]), max(vals + [spot])
+    span = (hi - lo) or abs(spot) * 0.01 or 1.0
+    lo -= 0.07 * span
+    hi += 0.03 * span
+
+    def X(v):
+        return x + (v - lo) / (hi - lo) * w
+
+    gradient_bar(img, x, y, w, h)
+    cy = y + h / 2
+    ext = 9
+    drawn = {}
+
+    if gamma_flip is not None:
+        dashed_vline(draw, X(gamma_flip), y - ext, y + h + ext, rgb(AMBER))
+        drawn["flip"] = gamma_flip
+    for key, v, col in (("put", put_wall, RED), ("call", call_wall, GREEN)):
+        draw.line((X(v), y - ext, X(v), y + h + ext), fill=rgb(col), width=5)
+        drawn[key] = v
+
+    r = h * 0.62
+    draw.ellipse((X(spot) - r, cy - r, X(spot) + r, cy + r), fill=rgb(WHITE),
+                 outline=rgb(bg), width=4)
+
+    ticks = [("put", put_wall, RED)] + \
+            ([("flip", gamma_flip, AMBER)] if gamma_flip is not None else []) + \
+            [("call", call_wall, GREEN)]
+    ticks.sort(key=lambda t: X(t[1]))
+    f = font(label_size, True)
+    texts = [fmt_px(t[1]) for t in ticks]
+    widths = [tw(draw, s, f) for s in texts]
+    lefts = decollide(widths, [X(t[1]) for t in ticks], x, x + w)
+    ly = y + h + ext + 8
+    boxes = []
+    for (key, v, col), s, wd, l in zip(ticks, texts, widths, lefts):
+        draw.text((l, ly), s, font=f, fill=rgb(col), anchor="la")
+        boxes.append((l, l + wd))
+
+    # invariants: no overlap, inside the bar
+    for (a0, a1), (b0, b1) in zip(boxes, boxes[1:]):
+        assert b0 - a1 >= LABEL_GAP - 0.01, "tick labels overlap"
+    assert not boxes or (boxes[0][0] >= x - 0.01 and boxes[-1][1] <= x + w + 0.01), \
+        "tick labels escape the bar"
+    assert ("flip" in drawn) == (gamma_flip is not None)
+    return dict(drawn=drawn, boxes=boxes)
+
+
+def segments(draw, x, y, parts, size, anchor_h="l"):
+    """Draw [(text, color, bold)] left to right at baseline-middle y."""
+    for text, color, bold in parts:
+        f = font(size, bold)
+        draw.text((x, y), text, font=f, fill=rgb(color), anchor="lm")
+        x += tw(draw, text, f)
+
+
+def segments_width(draw, parts, size):
+    return sum(tw(draw, t, font(size, b)) for t, _, b in parts)
+
+
+# ------------------------------------------------------------------ render
+def render_day(day, out_path):
+    tall = Image.new("RGB", (W, 6000), rgb(BG))
+    d = ImageDraw.Draw(tall)
+    inner_w = W - 2 * MARGIN
+    y = 44
+
+    # 1. header
+    d.text((W / 2, y), "DAILY GEX / VEX", font=font(84, True), fill=rgb(TEXT), anchor="ma")
+    y += 108
+    d.text((W / 2, y), f"{day['week_label']}  ·  {day['brand']}", font=font(34),
+           fill=rgb(BLUE), anchor="ma")
+    y += 78
+
+    # 2. verdict band
+    headline, accent, body = verdict(day)
+    bf = font(31)
+    lines = wrap(d, body, bf, inner_w - 2 * 44 - 16)
+    vh = 30 + 50 + 12 + len(lines) * 44 + 24
+    rrect(d, (MARGIN, y, W - MARGIN, y + vh), 18, fill=rgb(CARD), outline=rgb(BORDER), width=2)
+    d.rounded_rectangle((MARGIN, y + 14, MARGIN + 12, y + vh - 14), radius=6, fill=rgb(accent))
+    d.text((MARGIN + 44, y + 28), headline, font=font(42, True), fill=rgb(accent), anchor="la")
+    ty = y + 28 + 50 + 12
+    for ln in lines:
+        d.text((MARGIN + 44, ty), ln, font=bf, fill=rgb(TEXT), anchor="la")
+        ty += 44
+    y += vh + 30
+
+    # 3. index cards
+    gap = 30
+    cw = (inner_w - 2 * gap) / 3
+    pad = 36
+    ch = 440
+    for n, ix in enumerate(day["indexes"]):
+        cx = MARGIN + n * (cw + gap)
+        rrect(d, (cx, y, cx + cw, y + ch), 22, fill=rgb(CARD), outline=rgb(BORDER), width=2)
+        short = is_short(ix["net_gex"])
+        rc = RED if short else GREEN
+        # row 1
+        tf = font(52, True)
+        tick_s = f"${ix['ticker']}"
+        d.text((cx + pad, y + 28), tick_s, font=tf, fill=rgb(TEXT), anchor="la")
+        pill(d, cx + pad + tw(d, tick_s, tf) + 26, y + 34, 54,
+             "SHORT GAMMA" if short else "LONG GAMMA", rc, 26, CARD)
+        d.text((cx + cw - pad, y + 24), f"{ix['spot']:,.2f}", font=font(46, True),
+               fill=rgb(TEXT), anchor="ra")
+        chg = day_change_pct(ix)
+        if chg is not None:
+            arrow = "▲" if chg >= 0 else "▼"
+            d.text((cx + cw - pad, y + 84), f"{arrow} {abs(chg):.1f}% vs yesterday", font=font(26),
+                   fill=rgb(GREEN if chg >= 0 else RED), anchor="ra")
+        # row 2
+        by = y + 192
+        d.text((cx + pad, y + 150), "PUT WALL", font=font(24, True), fill=rgb(RED), anchor="la")
+        d.text((cx + cw - pad, y + 150), "CALL WALL", font=font(24, True), fill=rgb(GREEN), anchor="ra")
+        tick_bar(tall, d, int(cx + pad), by, int(cw - 2 * pad), 28, spot=ix["spot"],
+                 put_wall=ix["put_wall"], call_wall=ix["call_wall"],
+                 gamma_flip=ix["gamma_flip"], label_size=28, bg=CARD)
+        # row 3
+        em_d = exp_move_dollar({"spot": ix["spot"], "exp_move_pct": ix["exp_move_pct"]})
+        gex_s = f"{'-' if ix['net_gex'] < 0 else '+'}${abs(ix['net_gex']) / 1e9:.2f}B"
+        vex_s = f"{ix['net_vex'] / 1e9:+.2f}B"
+        line1 = [("Gamma flip ", MUTED, False),
+                 (fmt_px(ix["gamma_flip"]) if ix["gamma_flip"] is not None else "N/A", TEXT, True),
+                 ("   Expected move ", MUTED, False),
+                 (f"±{ix['exp_move_pct']:.2f}% (±{money(em_d)})", AMBER, True)]
+        line2 = [("Net GEX ", MUTED, False), (gex_s, RED if ix["net_gex"] < 0 else GREEN, True),
+                 ("   Net VEX ", MUTED, False), (vex_s, RED if ix["net_vex"] < 0 else GREEN, True)]
+        size = 25
+        avail = cw - 2 * pad
+        if max(segments_width(d, line1, size), segments_width(d, line2, size)) > avail:
+            size = MIN_FONT
+        assert max(segments_width(d, line1, size), segments_width(d, line2, size)) <= avail, \
+            "stat lines do not fit card"
+        segments(d, cx + pad, y + ch - 92, line1, size)
+        segments(d, cx + pad, y + ch - 46, line2, size)
+    y += ch + 30
+
+    # 4. mag 7
+    rows = day["mag7"]
+    row_h = 126
+    head_h = 150
+    mh = head_h + row_h * len(rows) + 20
+    rrect(d, (MARGIN, y, W - MARGIN, y + mh), 22, fill=rgb(CARD), outline=rgb(BORDER), width=2)
+    px0, px1 = MARGIN + 44, W - MARGIN - 44
+    d.text((px0, y + 26), "MAG 7 POSITIONING", font=font(42, True), fill=rgb(TEXT), anchor="la")
+    # legend (right-aligned, laid out right -> left)
+    lf = font(26)
+    ly = y + 46
+    t3 = "red = put wall · green = call wall"
+    xr = px1
+    d.text((xr, ly), t3, font=lf, fill=rgb(MUTED), anchor="rm")
+    xr -= tw(d, t3, lf) + 40
+    d.text((xr, ly), "gamma flip", font=lf, fill=rgb(MUTED), anchor="rm")
+    xr -= tw(d, "gamma flip", lf) + 12
+    dashed_vline(d, xr - 30, ly - 14, ly + 14, rgb(AMBER), width=3, on=6, off=4)  # dashed marker
+    xr -= 60
+    d.text((xr, ly), "spot price", font=lf, fill=rgb(MUTED), anchor="rm")
+    xr -= tw(d, "spot price", lf) + 12
+    d.ellipse((xr - 20, ly - 10, xr, ly + 10), fill=rgb(MUTED))
+
+    col_ticker, col_regime, col_spot, col_bar = px0, px0 + 270, px0 + 520, px0 + 780
+    bar_w = 1180
+    cf = font(24, True)
+    cy0 = y + 108
+    for label, cxp, anc in (("TICKER", col_ticker, "l"), ("REGIME", col_regime, "l"),
+                            ("SPOT", col_spot, "l"), ("POSITIONING", col_bar, "l")):
+        d.text((cxp, cy0), label, font=cf, fill=rgb(MUTED), anchor="lm")
+    d.text((px1, cy0), "EXP MOVE", font=cf, fill=rgb(MUTED), anchor="rm")
+
+    ry = y + head_h
+    for i, m in enumerate(rows):
+        if i:
+            d.line((MARGIN + 20, ry - 4, W - MARGIN - 20, ry - 4), fill=rgb(BORDER), width=1)
+        short = is_short(m["net_gex"])
+        rc = RED if short else GREEN
+        d.text((col_ticker, ry + 34), f"${m['ticker']}", font=font(40, True), fill=rgb(TEXT), anchor="lm")
+        pill(d, col_regime, ry + 10, 48, "SHORT" if short else "LONG", rc, 26, CARD, min_w=150)
+        d.text((col_spot, ry + 34), f"{m['spot']:,.2f}", font=font(36), fill=rgb(TEXT), anchor="lm")
+        tick_bar(tall, d, col_bar, ry + 22, bar_w, 26, spot=m["spot"], put_wall=m["put_wall"],
+                 call_wall=m["call_wall"], gamma_flip=m["gamma_flip"], label_size=26, bg=CARD)
+        dollar = f" (±{money(exp_move_dollar(m))})"
+        d_w = tw(d, dollar, font(26))
+        d.text((px1, ry + 34), dollar, font=font(26), fill=rgb(MUTED), anchor="rm")
+        d.text((px1 - d_w, ry + 34), f"±{m['exp_move_pct']:.2f}%", font=font(36, True),
+               fill=rgb(AMBER), anchor="rm")
+        ry += row_h
+    y += mh + 40
+
+    # 5. today's focus
+    picks = pick_focus(day)
+    assert 0 <= len(picks) <= 3
+    if picks:
+        d.text((MARGIN + 12, y), "TODAY'S FOCUS", font=font(42, True), fill=rgb(TEXT), anchor="la")
+        y += 76
+        bf = font(30)
+        wrapped = [wrap(d, p["blurb"], bf, cw - 2 * pad) for p in picks]
+        fh = 34 + 62 + 18 + max(len(w) for w in wrapped) * 42 + 30
+        for n, (p, lines) in enumerate(zip(picks, wrapped)):
+            cx = MARGIN + n * (cw + gap)
+            rrect(d, (cx, y, cx + cw, y + fh), 22, fill=rgb(CARD), outline=rgb(BORDER), width=2)
+            tag_w = pill(d, cx + pad, y + 30, 54, p["tag"], p["tag_color"], 24, CARD)
+            d.text((cx + pad + tag_w + 26, y + 57), f"${p['ticker']}", font=font(46, True),
+                   fill=rgb(TEXT), anchor="lm")
+            ty = y + 34 + 62 + 18
+            for ln in lines:
+                d.text((cx + pad, ty), ln, font=bf, fill=rgb(TEXT), anchor="la")
+                ty += 42
+        y += fh + 34
+
+    # 6. footer
+    d.line((MARGIN, y, W - MARGIN, y), fill=rgb(BORDER), width=2)
+    foot = ("Walls = heaviest positioning, act as floor & ceiling · Short gamma = breaks can "
+            "run · Long gamma = moves fade · Full glossary pinned in this channel")
+    fs = 28
+    while tw(d, foot, font(fs)) > inner_w and fs > MIN_FONT:
+        fs -= 1
+    assert tw(d, foot, font(fs)) <= inner_w, "footer does not fit"
+    d.text((W / 2, y + 26), foot, font=font(fs), fill=rgb(MUTED), anchor="ma")
+    y += 26 + fs + 40
+
+    out = tall.crop((0, 0, W, y))
+    out.save(out_path, optimize=True)
+    if os.path.getsize(out_path) >= MAX_BYTES:
+        out.quantize(colors=128).save(out_path, optimize=True)
+    assert os.path.getsize(out_path) < MAX_BYTES, "PNG exceeds Discord 8MB limit"
+    return out_path
+
+
+# ------------------------------------------------------------- adapter
+def build_day(core_results, mag7_results, comparisons, week_label, brand="BlueMoonTrades"):
+    """gex_vex.compute_gex_vex() results + gex_vex_history comparisons -> day dict.
+    prev_close is back-derived from the stored day-over-day % change;
+    regime_prev is the opposite regime iff history flagged a regime flip."""
+    def em_pct(r):
+        em = r.get("expected_move") or {}
+        return em.get("pct")
+
+    indexes = []
+    for r in core_results:
+        if "error" in r:
+            continue
+        c = comparisons.get(r["ticker"], {})
+        pct = c.get("spot_change_pct") if c.get("has_comparison") else None
+        now = regime_of(r["net_gex"])
+        prev = ("LONG" if now == "SHORT" else "SHORT") if c.get("regime_flipped") else now
+        indexes.append(dict(
+            ticker=r["ticker"], spot=r["spot"],
+            prev_close=(r["spot"] / (1 + pct / 100)) if pct is not None else None,
+            put_wall=r["put_wall"], call_wall=r["call_wall"], gamma_flip=r.get("gamma_flip"),
+            exp_move_pct=em_pct(r) or 0.0, net_gex=r["net_gex"], net_vex=r["net_vex"],
+            regime_prev=prev))
+    mag7 = [dict(ticker=r["ticker"], spot=r["spot"], put_wall=r["put_wall"],
+                 call_wall=r["call_wall"], gamma_flip=r.get("gamma_flip"),
+                 exp_move_pct=em_pct(r) or 0.0, net_gex=r["net_gex"])
+            for r in mag7_results if "error" not in r]
+    return dict(week_label=week_label, brand=brand, indexes=indexes, mag7=mag7)
+
 
 
 def get_week_label(today=None):
@@ -750,14 +729,12 @@ def main():
         if c["regime_flipped"]:
             print(f"  {r['ticker']}: REGIME FLIP ({c['flip_direction']})")
 
-    print("\nPicking Today's Focus...")
-    focus_items = pick_todays_focus(core_results, mag7_results, comparisons)
-    for t, color, tag, desc in focus_items:
-        print(f"  {t['ticker']}: {tag}")
-
-    print("\nRendering unified card...")
+    print("\nRendering unified card (v2 verdict-first layout)...")
+    day = build_day(core_results, mag7_results, comparisons, week_label)
+    for p in pick_focus(day):
+        print(f"  focus: {p['ticker']}: {p['tag']}")
     out_path = "gex_unified_test.png"
-    render_unified_card(core_results, mag7_results, focus_items, comparisons, week_label, out_path)
+    render_day(day, out_path)
     print(f"  saved to {out_path}")
 
     print("\nPosting to test webhook...")
