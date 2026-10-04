@@ -252,6 +252,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, Circle
 from bmt_watchlist_card_v3 import render_watchlist_card, build_setup_dict_from_v3
+try:
+    import bmt_idea_gate as _gate   # evidence-based suppression + idea logging; fail-open (see that file)
+except Exception as _e:             # any import problem => gate simply doesn't exist, post is unchanged
+    _gate = None
+    print(f"  [GATE WARN] bmt_idea_gate unavailable: {_e}")
 from apscheduler.schedulers.background import BackgroundScheduler
 import pg8000.native as _pg8000
 
@@ -2255,6 +2260,18 @@ def main():
                 continue
         eligible.append(c)
 
+    # IDEA GATE (2026-10-04): drop idea buckets the graded history shows are consistently weak
+    # (rule + fail-open behavior documented in bmt_idea_gate.py). Suppressed ideas are still
+    # levels/strike-computed and logged as SHADOW ideas so they keep being measured.
+    shadow = []
+    if _gate is not None:
+        try:
+            eligible, suppressed = _gate.apply_gate(eligible)
+            shadow = suppressed[:TOP_N]
+        except Exception as e:
+            print(f"  [GATE WARN] gate failed open: {e}")
+            shadow = []
+
     selected = eligible[:TOP_N]
 
     # MEGA-CAP RESERVED FLOOR (2026-09-04, direct user decision): if no
@@ -2289,7 +2306,7 @@ def main():
         return
 
     print("\nComputing trade levels and selecting strikes...")
-    for c in selected:
+    for c in selected + shadow:
         current_price = get_quote_change(c["ticker"]).get("price")
         if not current_price:
             print(f"  [WARN] {c['ticker']}: no current price -- dropping from selected")
@@ -2308,6 +2325,7 @@ def main():
         c["strike"] = strike
         c["premium"] = premium
     selected = [c for c in selected if "strike" in c]
+    shadow = [c for c in shadow if "strike" in c]
 
     print("\nComputing analyst target + company name + time-pressure + technical detail for final selections...")
     for c in selected:
@@ -2385,6 +2403,12 @@ def main():
 
     print(f"\nSaving {len(selected)} setup idea(s) to DB for results tracking...")
     save_setup_ideas(selected, target_date)
+    if _gate is not None:
+        for c in selected:
+            c["is_mega"] = c["ticker"] in MEGA_CAP_TIER
+        for c in shadow:
+            c["is_mega"] = c["ticker"] in MEGA_CAP_TIER
+        _gate.log_ideas(selected, shadow, target_date)   # best-effort; never raises
 
     print(f"\nRendering {len(selected)} chart(s)...")
     for c in selected:
