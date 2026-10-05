@@ -203,6 +203,15 @@ def money(v):
     return f"${v:,.2f}"
 
 
+def ref_level(i):
+    """A price to quote in prose for 'near X': the put wall if there is one, else the gamma flip,
+    else the call wall, else spot. Walls can be None when gex_vex.py rejects a weak wall."""
+    for k in ("put_wall", "gamma_flip", "call_wall"):
+        if i.get(k) is not None:
+            return i[k]
+    return i["spot"]
+
+
 # ------------------------------------------------------- derived helpers
 def is_short(net_gex):
     return net_gex < 0
@@ -251,7 +260,7 @@ def verdict(day):
                          f"once a level breaks, the move can run further than usual.")
     if long_:
         def near(i):
-            return fmt_px(i["gamma_flip"] if i["gamma_flip"] is not None else i["put_wall"])
+            return fmt_px(i["gamma_flip"] if i["gamma_flip"] is not None else ref_level(i))
 
         def flipped(i):
             return regime_of(i["net_gex"]) != i["regime_prev"]
@@ -289,7 +298,7 @@ def pick_focus(day):
             if chg is not None:
                 move = f"{t} {'down' if chg < 0 else 'up'} {'barely ' if abs(chg) < 0.3 else ''}{abs(chg):.1f}%, but"
             lead = move if move else f"{t}:"
-            blurb = (f"{lead} this setup got less stable — near {fmt_px(ix['put_wall'])} "
+            blurb = (f"{lead} this setup got less stable — near {fmt_px(ref_level(ix))} "
                      f"there's less to slow a move down. Swings could run further than a normal "
                      f"session: trade smaller, and don't expect dips to get bought back fast.")
         else:
@@ -299,7 +308,7 @@ def pick_focus(day):
                 move = f"{t} {'down' if chg < 0 else 'up'} {abs(chg):.1f}% yet"
             lead = move if move else f"{t}"
             near = (f"near the {fmt_px(ix['gamma_flip'])} flip" if ix["gamma_flip"] is not None
-                    else f"near {fmt_px(ix['put_wall'])}")
+                    else f"near {fmt_px(ref_level(ix))}")
             blurb = (f"{lead} flipped into a steadier setup {near} — price has a natural "
                      f"brake now. Fast moves in either direction are more likely to fade than "
                      f"follow through: lean on the range, don't chase breakouts.")
@@ -383,7 +392,9 @@ def tick_bar(img, draw, x, y, w, h, *, spot, put_wall, call_wall, gamma_flip,
              label_size, bg):
     """Shared put-wall -> call-wall bar. (x, y) = top-left of the bar.
     Returns dict with the ticks drawn and label boxes (for invariants)."""
-    vals = [put_wall, call_wall] + ([gamma_flip] if gamma_flip is not None else [])
+    # A wall can legitimately be None (gex_vex.py rejects a wall holding < MIN_WALL_SHARE of the
+    # band's gamma -- e.g. QQQ's put wall on 2026-10-05). Draw only the levels that exist.
+    vals = [v for v in (put_wall, call_wall, gamma_flip) if v is not None]
     lo, hi = min(vals + [spot]), max(vals + [spot])
     span = (hi - lo) or abs(spot) * 0.01 or 1.0
     lo -= 0.07 * span
@@ -401,6 +412,8 @@ def tick_bar(img, draw, x, y, w, h, *, spot, put_wall, call_wall, gamma_flip,
         dashed_vline(draw, X(gamma_flip), y - ext, y + h + ext, rgb(AMBER))
         drawn["flip"] = gamma_flip
     for key, v, col in (("put", put_wall, RED), ("call", call_wall, GREEN)):
+        if v is None:
+            continue
         draw.line((X(v), y - ext, X(v), y + h + ext), fill=rgb(col), width=5)
         drawn[key] = v
 
@@ -408,9 +421,9 @@ def tick_bar(img, draw, x, y, w, h, *, spot, put_wall, call_wall, gamma_flip,
     draw.ellipse((X(spot) - r, cy - r, X(spot) + r, cy + r), fill=rgb(WHITE),
                  outline=rgb(bg), width=4)
 
-    ticks = [("put", put_wall, RED)] + \
+    ticks = ([("put", put_wall, RED)] if put_wall is not None else []) + \
             ([("flip", gamma_flip, AMBER)] if gamma_flip is not None else []) + \
-            [("call", call_wall, GREEN)]
+            ([("call", call_wall, GREEN)] if call_wall is not None else [])
     ticks.sort(key=lambda t: X(t[1]))
     f = font(label_size, True)
     texts = [fmt_px(t[1]) for t in ticks]
@@ -428,6 +441,8 @@ def tick_bar(img, draw, x, y, w, h, *, spot, put_wall, call_wall, gamma_flip,
     assert not boxes or (boxes[0][0] >= x - 0.01 and boxes[-1][1] <= x + w + 0.01), \
         "tick labels escape the bar"
     assert ("flip" in drawn) == (gamma_flip is not None)
+    assert ("put" in drawn) == (put_wall is not None)
+    assert ("call" in drawn) == (call_wall is not None)
     return dict(drawn=drawn, boxes=boxes)
 
 
@@ -496,8 +511,12 @@ def render_day(day, out_path):
                    fill=rgb(GREEN if chg >= 0 else RED), anchor="ra")
         # row 2
         by = y + 192
-        d.text((cx + pad, y + 150), "PUT WALL", font=font(24, True), fill=rgb(RED), anchor="la")
-        d.text((cx + cw - pad, y + 150), "CALL WALL", font=font(24, True), fill=rgb(GREEN), anchor="ra")
+        put_hd = "PUT WALL" if ix["put_wall"] is not None else "PUT WALL: none clear"
+        call_hd = "CALL WALL" if ix["call_wall"] is not None else "CALL WALL: none clear"
+        d.text((cx + pad, y + 150), put_hd, font=font(24, True),
+               fill=rgb(RED if ix["put_wall"] is not None else MUTED), anchor="la")
+        d.text((cx + cw - pad, y + 150), call_hd, font=font(24, True),
+               fill=rgb(GREEN if ix["call_wall"] is not None else MUTED), anchor="ra")
         tick_bar(tall, d, int(cx + pad), by, int(cw - 2 * pad), 28, spot=ix["spot"],
                  put_wall=ix["put_wall"], call_wall=ix["call_wall"],
                  gamma_flip=ix["gamma_flip"], label_size=28, bg=CARD)

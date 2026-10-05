@@ -171,6 +171,42 @@ def test_flip_drawn_iff_present():
     assert "flip" not in a["drawn"] and "flip" in b["drawn"]
 
 
+def test_missing_walls_render_without_crashing():
+    # 2026-10-05 production crash: gex_vex.py rejects a wall holding < MIN_WALL_SHARE of the band
+    # (QQQ put wall, 8.4% < 10%) and returns None; tick_bar() then did min([None, ...]).
+    d = copy.deepcopy(DAY)
+    d["indexes"][1].update(put_wall=None)                  # QQQ: regime flip + no put wall
+    d["indexes"][0].update(call_wall=None)                 # SPY: no call wall
+    d["mag7"][0].update(put_wall=None, call_wall=None, gamma_flip=None)   # no levels at all
+    d["mag7"][1].update(put_wall=None)
+    render(d)
+    # every focus/verdict path that quotes a level must tolerate the gap
+    g.verdict(d)
+    g.pick_focus(d)
+
+
+def test_tick_bar_with_missing_walls():
+    from PIL import ImageDraw
+    img = Image.new("RGB", (1200, 300), g.rgb(g.CARD))
+    d = ImageDraw.Draw(img)
+    a = g.tick_bar(img, d, 50, 40, 1000, 26, spot=10, put_wall=None, call_wall=12, gamma_flip=None,
+                   label_size=26, bg=g.CARD)
+    b = g.tick_bar(img, d, 50, 120, 1000, 26, spot=10, put_wall=9, call_wall=None, gamma_flip=10.5,
+                   label_size=26, bg=g.CARD)
+    c = g.tick_bar(img, d, 50, 200, 1000, 26, spot=10, put_wall=None, call_wall=None, gamma_flip=None,
+                   label_size=26, bg=g.CARD)
+    assert "put" not in a["drawn"] and "call" in a["drawn"]
+    assert "call" not in b["drawn"] and "flip" in b["drawn"]
+    assert c["drawn"] == {} and c["boxes"] == []
+
+
+def test_ref_level_falls_back():
+    assert g.ref_level(dict(put_wall=9, gamma_flip=10, call_wall=12, spot=11)) == 9
+    assert g.ref_level(dict(put_wall=None, gamma_flip=10, call_wall=12, spot=11)) == 10
+    assert g.ref_level(dict(put_wall=None, gamma_flip=None, call_wall=12, spot=11)) == 12
+    assert g.ref_level(dict(put_wall=None, gamma_flip=None, call_wall=None, spot=11)) == 11
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     for name, fn in tests:
