@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -12,7 +12,7 @@ import asyncio
 
 from models import FlowAlert
 from scoring import auto_score_alert
-from flow_filters import filter_flow_items, is_high_conviction
+from flow_filters import filter_flow_items, is_high_conviction, MAX_DTE_DAYS
 from market_hours import is_market_open, market_closed_reason
 from weekly_recap import build_weekly_recap, render_weekly_recap_card, post_weekly_recap_image
 from flow_heatmap import heatmap_job
@@ -127,6 +127,27 @@ def save_alert(alert: FlowAlert, score: int) -> None:
     )
 
 
+def jarvis_flow_arguments(ticker: str) -> dict:
+    """Arguments for stock_ticker_unusual_options_data.
+
+    Server-side filters (JARVIS_SERVER_FILTERS, default on) ask Jarvis only for the rows our
+    pre-filter could ever keep -- OTM, BOUGHT, expiring within MAX_DTE_DAYS -- instead of the 300
+    most recent rows of every kind, ~97% fewer bytes (usage spike 2026-10-05). The local
+    passes_basic_filters() still runs on whatever comes back (premium, conviction, exact DTE),
+    so the result is the same; the expiry range is one day wider than MAX_DTE_DAYS as a buffer.
+    Set JARVIS_SERVER_FILTERS=false on Railway to revert to the old ticker-only request."""
+    args = {"filter_by_Ticker": ticker}
+    if os.getenv("JARVIS_SERVER_FILTERS", "true").lower() == "true":
+        today = datetime.now(timezone.utc).date()   # same date basis as flow_filters.compute_dte_days
+        args.update({
+            "filter_by_moneyNess": "OTM",
+            "filter_by_impliedAction": "BOUGHT",
+            "filter_by_expiration_date_range_from": today.strftime("%m/%d/%Y"),
+            "filter_by_expiration_date_range_to": (today + timedelta(days=MAX_DTE_DAYS + 1)).strftime("%m/%d/%Y"),
+        })
+    return args
+
+
 async def fetch_jarvis_flow(ticker: str):
     if not JARVIS_API_KEY:
         raise ValueError("JARVIS_API_KEY is missing")
@@ -137,7 +158,7 @@ async def fetch_jarvis_flow(ticker: str):
         "method": "tools/call",
         "params": {
             "name": "stock_ticker_unusual_options_data",
-            "arguments": {"filter_by_Ticker": ticker}
+            "arguments": jarvis_flow_arguments(ticker)
         }
     }
     headers = {

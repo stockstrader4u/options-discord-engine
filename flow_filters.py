@@ -23,7 +23,12 @@ MAX_DTE_DAYS = 14
 ALLOWED_MONEYNESS = {"OTM"}
 REQUIRED_SIDE = "BOUGHT"
 MIN_PREMIUM = 100_000
-ALLOWED_CONVICTION = {"HIGH", "VERY HIGH", "EXTREMELY HIGH"}
+# JarvisFlow's interpreted_Conviction labels are exactly: NORMAL < HIGH < HIGHER < HIGHEST
+# (verified on ~20k real rows, 2026-10-05). "HIGH or above" therefore means these three.
+# The previous set {"HIGH", "VERY HIGH", "EXTREMELY HIGH"} used labels Jarvis never sends, so
+# HIGHER and HIGHEST -- the two strongest tiers -- were silently dropped. Note the "Very High" /
+# "High" shown on posted cards is a DIFFERENT thing: our own score label (formatter.py).
+ALLOWED_CONVICTION = {"HIGH", "HIGHER", "HIGHEST"}
 HIGH_CONVICTION_VALUE = "HIGH"
 
 
