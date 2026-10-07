@@ -1082,6 +1082,31 @@ Return ONLY valid JSON, nothing else, no markdown code fences, in exactly this s
 }}"""
 
 
+NARRATIVE_ATTEMPT_DEADLINE_S = 150   # hard wall-clock limit per OpenRouter attempt (see write_setup_narratives)
+
+
+def _post_with_deadline(url: str, headers: dict, payload: dict, deadline_s: float):
+    """requests.post with a TRUE wall-clock limit. requests' own (connect, read) timeout only bounds the
+    gap between bytes, so a slow reasoning call could run 300-400s (seen 2026-10-05/06). The request runs
+    in a daemon thread; if it hasn't finished within deadline_s we give up on it (it can't block exit)."""
+    out = {}
+
+    def _run():
+        try:
+            out["resp"] = requests.post(url, headers=headers, json=payload, timeout=(10, deadline_s))
+        except Exception as e:           # surfaced to the caller below
+            out["err"] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(deadline_s)
+    if t.is_alive():
+        raise requests.exceptions.Timeout(f"no complete response within {deadline_s}s")
+    if "err" in out:
+        raise out["err"]
+    return out["resp"]
+
+
 def write_setup_narratives(selected: list, market_context: dict, target_date: datetime) -> dict:
     source_data = build_narrative_source_data(selected, market_context, target_date)
     prompt = NARRATIVE_PROMPT_TEMPLATE.format(
@@ -1123,8 +1148,22 @@ def write_setup_narratives(selected: list, market_context: dict, target_date: da
     #      automatic retry with an even tighter reasoning cap runs
     #      before giving up -- a single bad reasoning-length roll no
     #      longer crashes the entire nightly run.
-    REASONING_MAX_TOKENS_ATTEMPTS = [3000, 1200]
+    # NARRATIVE RELIABILITY FIX (2026-10-06): on 2026-10-06 the run failed with NO post -- attempt 1
+    # took 417s and returned empty content, attempt 2 returned JSON cut off mid-string. 2026-10-05
+    # showed the same pattern (attempt 1: 295s, truncated; attempt 2 only just worked). Kimi K2.6
+    # does NOT reliably honor `reasoning.max_tokens`: it reasons for thousands of tokens (hence 100-400s
+    # calls) and then either runs out of the total budget with nothing written or is cut off mid-answer,
+    # and the old retry used the same model, so it could fail the same way twice. Fix (prompt, format
+    # and rendering are untouched): (1) a real wall-clock limit per attempt, (2) four attempts that
+    # alternate K2.6 with kimi-k2-0905 -- same model family, no reasoning phase, JSON mode -- so a bad
+    # reasoning roll can't sink the night, (3) an unexpected API response retries instead of aborting.
     TOTAL_MAX_TOKENS = 16000
+    NARRATIVE_ATTEMPTS = [
+        {"model": "moonshotai/kimi-k2.6", "reasoning": {"max_tokens": 1200}, "max_tokens": TOTAL_MAX_TOKENS, "json_mode": False},
+        {"model": "moonshotai/kimi-k2-0905", "reasoning": None, "max_tokens": 8000, "json_mode": True},
+        {"model": "moonshotai/kimi-k2.6", "reasoning": {"max_tokens": 1200}, "max_tokens": TOTAL_MAX_TOKENS, "json_mode": False},
+        {"model": "moonshotai/kimi-k2-0905", "reasoning": None, "max_tokens": 8000, "json_mode": True},
+    ]
 
     raw = None
     message = None
@@ -1132,9 +1171,10 @@ def write_setup_narratives(selected: list, market_context: dict, target_date: da
     parsed_result = None
     last_parse_error = None
 
-    for attempt, reasoning_cap in enumerate(REASONING_MAX_TOKENS_ATTEMPTS, start=1):
-        print(f"  [NARRATIVE] calling OpenRouter, attempt {attempt}/{len(REASONING_MAX_TOKENS_ATTEMPTS)} "
-              f"(reasoning capped at {reasoning_cap} tokens, {TOTAL_MAX_TOKENS} total budget)...", flush=True)
+    for attempt, spec in enumerate(NARRATIVE_ATTEMPTS, start=1):
+        print(f"  [NARRATIVE] calling OpenRouter, attempt {attempt}/{len(NARRATIVE_ATTEMPTS)} "
+              f"(model {spec['model']}, reasoning {spec['reasoning'] or 'none'}, "
+              f"max {spec['max_tokens']} tokens, {NARRATIVE_ATTEMPT_DEADLINE_S}s limit)...", flush=True)
         call_started = time.time()
         # NETWORK-HANG BUGFIX (2026-08-11): confirmed via direct curl
         # test that OpenRouter itself responds instantly -- the hang
@@ -1149,11 +1189,7 @@ def write_setup_narratives(selected: list, market_context: dict, target_date: da
         # underneath requests -- this protects both local `railway
         # run` testing and the actual deployed Railway service from
         # hanging forever on a bad network layer.
-        try:
-            resp = requests.post(
-                f"{OPENROUTER_BASE}/chat/completions",
-                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-                json={"model": "moonshotai/kimi-k2.6", "max_tokens": TOTAL_MAX_TOKENS,
+        payload = {"model": spec["model"], "max_tokens": spec["max_tokens"],
                       # NARRATIVE-VARIETY BUGFIX (2026-08-29): was
                       # "temperature": 0. At temperature 0 the model
                       # always emits its single most-probable
@@ -1170,37 +1206,49 @@ def write_setup_narratives(selected: list, market_context: dict, target_date: da
                       # this module's own docstring for the full
                       # three-part diagnosis and fix.
                       "temperature": 0.7,
-                      "reasoning": {"max_tokens": reasoning_cap},
-                      "messages": [{"role": "user", "content": prompt}]},
-                timeout=(10, 120)
-            )
+                      "messages": [{"role": "user", "content": prompt}]}
+        if spec["reasoning"] is not None:
+            payload["reasoning"] = spec["reasoning"]
+        if spec["json_mode"]:
+            payload["response_format"] = {"type": "json_object"}
+        try:
+            resp = _post_with_deadline(
+                f"{OPENROUTER_BASE}/chat/completions",
+                {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+                payload, NARRATIVE_ATTEMPT_DEADLINE_S)
         except requests.exceptions.RequestException as e:
-            # A connect/read timeout (or any other network failure) is
-            # now caught explicitly instead of crashing the run with
-            # an uncaught traceback -- treated the same as an
-            # empty-content response: log it and fall through to the
-            # retry-with-tighter-cap attempt (or raise cleanly if this
+            # A connect/read timeout, the wall-clock limit, or any other network failure is
+            # caught explicitly instead of crashing the run -- treated like an empty-content
+            # response: log it and move on to the next attempt (or raise cleanly if this
             # was the last attempt).
             print(f"  [NARRATIVE WARN] attempt {attempt}: network error after "
                   f"{time.time() - call_started:.1f}s: {type(e).__name__}: {e}")
-            if attempt < len(REASONING_MAX_TOKENS_ATTEMPTS):
-                print("  [NARRATIVE] retrying with a tighter reasoning cap...", flush=True)
+            if attempt < len(NARRATIVE_ATTEMPTS):
+                print("  [NARRATIVE] retrying with the next attempt...", flush=True)
                 continue
             raise ValueError(f"write_setup_narratives: network error on final attempt: {e}") from e
         print(f"  [NARRATIVE] response received after {time.time() - call_started:.1f}s", flush=True)
-        raw = resp.json()
-        if "choices" not in raw:
-            print("  [NARRATIVE ERROR] unexpected response (no 'choices' key):")
+        try:
+            raw = resp.json()
+        except ValueError:
+            raw = {"error": f"non-JSON response, HTTP {resp.status_code}: {resp.text[:300]}"}
+        if "choices" not in raw or not raw["choices"]:
+            print("  [NARRATIVE WARN] unexpected response (no 'choices'):")
             print(f"  {json.dumps(raw, indent=2)[:1000]}")
+            if attempt < len(NARRATIVE_ATTEMPTS):
+                print("  [NARRATIVE] retrying with the next attempt...", flush=True)
+                continue
             raise ValueError("write_setup_narratives: unexpected API response shape")
+        print(f"  [NARRATIVE] finish_reason={raw['choices'][0].get('finish_reason')} "
+              f"usage={json.dumps(raw.get('usage'))[:300]}", flush=True)
         message = raw["choices"][0]["message"]
         content = message.get("content")
         if not content:
             print(f"  [NARRATIVE WARN] attempt {attempt}: empty/None content -- likely the model used its "
                   f"whole reasoning budget before writing an answer:")
             print(f"  {json.dumps(message, indent=2)[:1000]}")
-            if attempt < len(REASONING_MAX_TOKENS_ATTEMPTS):
-                print("  [NARRATIVE] retrying with a tighter reasoning cap...", flush=True)
+            if attempt < len(NARRATIVE_ATTEMPTS):
+                print("  [NARRATIVE] retrying with the next attempt...", flush=True)
             continue
 
         # TRUNCATED-JSON BUGFIX (2026-08-20): confirmed in production
@@ -1239,8 +1287,8 @@ def write_setup_narratives(selected: list, market_context: dict, target_date: da
             last_parse_error = e
             print(f"  [NARRATIVE WARN] attempt {attempt}: content was non-empty but failed to parse as "
                   f"JSON ({e}) -- likely truncated mid-response. First 300 chars: {cleaned[:300]!r}")
-            if attempt < len(REASONING_MAX_TOKENS_ATTEMPTS):
-                print("  [NARRATIVE] retrying with a tighter reasoning cap...", flush=True)
+            if attempt < len(NARRATIVE_ATTEMPTS):
+                print("  [NARRATIVE] retrying with the next attempt...", flush=True)
             continue
 
     if parsed_result is None:
