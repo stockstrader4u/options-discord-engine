@@ -13,7 +13,7 @@ import asyncio
 from models import FlowAlert
 from scoring import auto_score_alert
 from flow_filters import filter_flow_items, is_high_conviction, MAX_DTE_DAYS
-from market_hours import is_market_open, market_closed_reason
+from market_hours import is_market_open, market_closed_reason, is_trading_day, MARKET_OPEN, MARKET_CLOSE, EASTERN
 from weekly_recap import build_weekly_recap, render_weekly_recap_card, post_weekly_recap_image
 from flow_heatmap import heatmap_job
 from enrichment import enrich_alert, enrichment_summary, compute_levels
@@ -46,6 +46,15 @@ HEATMAP_WEBHOOK_URL = os.getenv("HEATMAP_WEBHOOK_URL") or os.getenv("CHART_WEBHO
 JARVIS_MCP_URL = "https://api.jarvisflow.io/.well-known/mcp"
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 AUTO_POLL_ENABLED = os.getenv("AUTO_POLL_ENABLED", "true").lower() == "true"
+# ALERT_POLL_MODE (2026-10-06): "batch" (default) queries JarvisFlow once per 15-minute window and posts
+# what qualified in that window (26 runs/day ~ 2,600 calls) instead of polling all tickers every minute
+# (~39,000 calls/day, which tripped the vendor's usage limits). "interval" restores the old
+# POLL_INTERVAL_SECONDS behavior -- set it on Railway to roll back without a code change.
+ALERT_POLL_MODE = os.getenv("ALERT_POLL_MODE", "batch").lower()
+BATCH_WINDOW_MINUTES = 15
+# Trades from up to this long BEFORE the window start are still considered, so a trade Jarvis reports a
+# little late (or a run delayed by a restart) isn't lost. The same-day dedupe prevents any repost.
+BATCH_GRACE_MINUTES = int(os.getenv("BATCH_GRACE_MINUTES", "3"))
 DEDUPE_WINDOW_MINUTES = int(os.getenv("DEDUPE_WINDOW_MINUTES", "30"))
 # How much bigger same-day premium must be on a repeat contract+sentiment
 # for it to be treated as materially new information rather than a
@@ -73,6 +82,45 @@ logger = logging.getLogger("options-discord-engine")
 
 scheduler = AsyncIOScheduler()
 jarvis_semaphore: asyncio.Semaphore | None = None
+
+
+def batch_window(now_et: datetime):
+    """The 15-minute window a batch run at now_et should cover, as (start, end) in ET -- or None when
+    there is nothing to cover (weekend/holiday, or outside the session). Windows are anchored to the
+    open: 9:30-9:45 ... 15:45-16:00. A run at 9:46/10:01/10:16/... (the minute after a window closes)
+    covers the window that just ended; the 16:01 run covers the last one."""
+    if not is_trading_day(now_et.date()):
+        return None
+    end = now_et.replace(minute=(now_et.minute // BATCH_WINDOW_MINUTES) * BATCH_WINDOW_MINUTES,
+                         second=0, microsecond=0)
+    start = end - timedelta(minutes=BATCH_WINDOW_MINUTES)
+    open_dt = datetime.combine(now_et.date(), MARKET_OPEN, tzinfo=EASTERN)
+    close_dt = datetime.combine(now_et.date(), MARKET_CLOSE, tzinfo=EASTERN)
+    if end <= open_dt or end > close_dt:
+        return None
+    return start, end
+
+
+def item_trade_time_et(item: dict):
+    """Trade time of a raw Jarvis item as an aware ET datetime, or None. Jarvis stamps trades with
+    naive ET wall-clock time (verified: 09:30-16:00 across 20k rows), e.g. '2026-10-05T10:37:57.88'."""
+    raw = item.get("transaction_DateTime") or item.get("transactionDateTime")
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(str(raw)[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=EASTERN)
+    except ValueError:
+        return None
+
+
+def filter_items_since(items: list, since: datetime) -> list:
+    """Keep items whose trade time is at or after `since` (items with no readable time are dropped)."""
+    out = []
+    for it in items:
+        t = item_trade_time_et(it)
+        if t is not None and t >= since:
+            out.append(it)
+    return out
 
 
 def make_alert_hash(alert: FlowAlert) -> str:
@@ -258,17 +306,45 @@ def build_discord_message(alert: FlowAlert, final_score: int, score_reasons: lis
     return "\n".join(lines)
 
 
+_discord_post_lock: asyncio.Lock | None = None
+
+
 async def post_to_discord(message: str) -> bool:
-    async with httpx.AsyncClient() as client:
-        response = await client.post(DISCORD_WEBHOOK_URL, json={"content": message})
-    return response.status_code in [200, 204]
+    """Post one alert. Posts are serialized and spaced ~0.6s apart (a batch run can have several alerts to
+    send at once; Discord allows only ~5 webhook posts per 2s), and a 429 is retried after the
+    Retry-After Discord asks for (max 2 retries). Any other failure logs the status and body."""
+    global _discord_post_lock
+    if _discord_post_lock is None:
+        _discord_post_lock = asyncio.Lock()
+    async with _discord_post_lock:
+        for attempt in range(3):
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(DISCORD_WEBHOOK_URL, json={"content": message})
+            if response.status_code in (200, 204):
+                await asyncio.sleep(0.6)
+                return True
+            if response.status_code == 429 and attempt < 2:
+                try:
+                    wait = float(response.json().get("retry_after", 2.0))
+                except Exception:
+                    wait = float(response.headers.get("Retry-After", 2.0) or 2.0)
+                wait = min(max(wait, 0.5), 10.0)
+                logger.warning("discord_rate_limited retry_in=%.1fs attempt=%d", wait, attempt + 1)
+                await asyncio.sleep(wait)
+                continue
+            logger.warning("discord_post_failed status=%s body=%s", response.status_code, response.text[:200])
+            return False
+        return False
 
 
-async def process_jarvis_ticker(ticker: str, limit: int = 25):
+async def process_jarvis_ticker(ticker: str, limit: int = 25, since: datetime | None = None):
+    """since=None is the legacy every-minute behavior (market-hours gate applied here). With `since`
+    (batch mode) only trades at/after that ET time are considered, and the batch job has already
+    gated the session itself (the 16:01 run for the last window is after the 16:00 close)."""
     if not DISCORD_WEBHOOK_URL:
         return {"ok": False, "error": "DISCORD_WEBHOOK_URL is missing"}
 
-    closed_reason = market_closed_reason()
+    closed_reason = market_closed_reason() if since is None else None
     if closed_reason:
         return {
             "ok": True, "ticker": ticker, "posted": 0,
@@ -281,6 +357,8 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25):
             return {"ok": False, "error": "No flow items returned"}
 
         filtered_items, skipped_filter = filter_flow_items(flow_items)
+        if since is not None:
+            filtered_items = filter_items_since(filtered_items, since)
 
         posted = skipped = skipped_score = skipped_classifier = 0
         skipped_dedupe = skipped_post_error = 0
@@ -373,10 +451,10 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25):
         }
 
 
-async def poll_single_ticker(ticker: str) -> dict:
+async def poll_single_ticker(ticker: str, since: datetime | None = None) -> dict:
     """Poll one ticker and return its result. Errors are caught and logged."""
     try:
-        result = await process_jarvis_ticker(ticker=ticker, limit=25)
+        result = await process_jarvis_ticker(ticker=ticker, limit=25, since=since)
         if result.get("posted", 0) > 0:
             logger.info("poll_posted ticker=%s result=%s", ticker, result)
         return result
@@ -402,6 +480,25 @@ async def scheduled_poll_job():
         "scheduled_poll_complete tickers=%d checked=%d posted=%d",
         len(WATCHLIST), total_checked, total_posted,
     )
+
+
+async def batch_poll_job():
+    """Once per 15-minute window: query every WATCHLIST ticker one time, and post whatever qualified.
+    Runs at 9:46, 10:01, 10:16 ... 15:46, 16:01 ET (see lifespan). If nothing qualified, nothing posts."""
+    now_et = datetime.now(EASTERN)
+    window = batch_window(now_et)
+    if window is None:
+        logger.info("batch_poll_skipped now_et=%s (weekend/holiday or outside the session)", now_et.strftime("%a %H:%M"))
+        return
+    start, end = window
+    since = start - timedelta(minutes=BATCH_GRACE_MINUTES)
+    logger.info("batch_poll_start window=%s-%s ET since=%s tickers=%d",
+                start.strftime("%H:%M"), end.strftime("%H:%M"), since.strftime("%H:%M"), len(WATCHLIST))
+    results = await asyncio.gather(*[poll_single_ticker(t, since=since) for t in WATCHLIST])
+    total_posted = sum(r.get("posted", 0) for r in results if isinstance(r, dict))
+    total_checked = sum(r.get("checked", 0) for r in results if isinstance(r, dict))
+    logger.info("batch_poll_complete window=%s-%s ET tickers=%d checked=%d posted=%d",
+                start.strftime("%H:%M"), end.strftime("%H:%M"), len(WATCHLIST), total_checked, total_posted)
 
 
 async def weekly_recap_job():
@@ -513,11 +610,24 @@ async def lifespan(app: FastAPI):
     logger.info("db_backend=%s", backend)
 
     if AUTO_POLL_ENABLED:
-        scheduler.add_job(
-            scheduled_poll_job, "interval",
-            seconds=POLL_INTERVAL_SECONDS,
-            id="jarvis_auto_poll", replace_existing=True, max_instances=1
-        )
+        if ALERT_POLL_MODE == "interval":
+            scheduler.add_job(
+                scheduled_poll_job, "interval",
+                seconds=POLL_INTERVAL_SECONDS,
+                id="jarvis_auto_poll", replace_existing=True, max_instances=1
+            )
+        else:
+            # Batch mode: 9:46 (covers 9:30-9:45), then :01/:16/:31/:46 from 10:01 to 15:46, then 16:01
+            # (covers 15:45-16:00) -- 26 runs per trading day. batch_poll_job() re-checks holidays.
+            for hour, minute, job_id in (("10-15", "1,16,31,46", "jarvis_batch_poll_midday"),
+                                         ("9", "46", "jarvis_batch_poll_open"),
+                                         ("16", "1", "jarvis_batch_poll_close")):
+                scheduler.add_job(
+                    batch_poll_job, "cron",
+                    day_of_week="mon-fri", hour=hour, minute=minute, timezone="America/New_York",
+                    id=job_id, replace_existing=True, max_instances=1,
+                    misfire_grace_time=300, coalesce=True,
+                )
         scheduler.add_job(
             weekly_recap_job, "cron",
             day_of_week="fri", hour=16, minute=32, timezone="America/New_York",
@@ -538,8 +648,8 @@ async def lifespan(app: FastAPI):
         )
         scheduler.start()
         logger.info(
-            "scheduler_started watchlist=%d interval=%s dedupe_window=%s concurrency=%s dedupe_premium_multiplier=%s",
-            len(WATCHLIST), POLL_INTERVAL_SECONDS, DEDUPE_WINDOW_MINUTES, JARVIS_CONCURRENCY, DEDUPE_PREMIUM_MULTIPLIER,
+            "scheduler_started watchlist=%d mode=%s interval=%s dedupe_window=%s concurrency=%s dedupe_premium_multiplier=%s",
+            len(WATCHLIST), ALERT_POLL_MODE, POLL_INTERVAL_SECONDS, DEDUPE_WINDOW_MINUTES, JARVIS_CONCURRENCY, DEDUPE_PREMIUM_MULTIPLIER,
         )
         logger.info("weekly_recap_job_registered fri_16:32_ET finnhub_configured=%s", bool(FINNHUB_API_KEY))
         logger.info("heatmap_job_registered mon-fri_16:30_ET webhook_configured=%s", bool(HEATMAP_WEBHOOK_URL))
