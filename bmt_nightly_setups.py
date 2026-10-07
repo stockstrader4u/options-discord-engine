@@ -278,23 +278,23 @@ MIN_PREMIUM = 50_000
 TOP_N       = 5
 
 FULL_WATCHLIST = [
-    "TDOC","DDOG","DOCU","MDB","ANET","TWLO","ETSY","CRM","UBER","ROKU",
-    "NFLX","NVDA","OKTA","SBUX","FTNT","SHOP","AAPL","Z","TSLA","MA",
-    "AMZN","ZS","DIS","SE","NOW","CRWD","SNAP","BABA","UPST","QRVO",
-    "QCOM","AMD","BA","PINS","CELH","DKNG","PLTR","CHWY","LULU","COIN",
-    "MRNA","SNOW","AFRM","MSFT","ABNB","ADSK","MRVL","RBLX","SOFI","SPOT",
-    "META","WMT","TGT","HD","TSM","AI","MU","NET","U","GOOGL",
+    "DDOG","DOCU","MDB","ANET","TWLO","ETSY","CRM","UBER","ROKU",
+    "NFLX","NVDA","OKTA","SBUX","FTNT","SHOP","AAPL","TSLA",
+    "AMZN","ZS","DIS","SE","NOW","CRWD", "BABA","UPST",
+    "QCOM","AMD","BA","PINS","CELH","DKNG","PLTR", "LULU","COIN",
+    "MRNA","SNOW","AFRM","MSFT","ABNB", "MRVL","RBLX","SOFI","SPOT",
+    "META","WMT","TGT","HD","TSM", "MU","NET","U","GOOGL",
     "RIVN","JNJ","INTC","MARA","RIOT","XOM","OXY","CVX","CVNA","ENPH",
-    "FDX","SMCI","ARM","LRCX","PANW","BIDU","JD","XPEV","PDD","FUTU",
-    "MSTR","ORCL","HOOD","CMG","UPS","DELL","LMT","CAT","CAVA","RDDT",
-    "CART","DASH","HIMS","AVGO","ADBE","MMM","NKE","GS","RTX","GTLB",
-    "CLSK","IBM","TEAM","LLY","RGTI","QUBT","IBIT","TEM","VST","UAL",
+    "FDX","SMCI","ARM","LRCX","PANW","BIDU","JD","PDD","FUTU",
+    "MSTR","ORCL","HOOD","CMG","UPS","DELL","CAVA","RDDT",
+    "CART","DASH","HIMS","AVGO","ADBE","NKE", "GTLB",
+    "CLSK","IBM","TEAM","LLY","RGTI","QUBT","TEM","VST","UAL",
     "OKLO","NNE","RKLB","NBIS","CEG","IONQ","XYZ","PYPL","QBTS","APP",
     "CRWV","GME","UNH","CRCL","FSLR","SMR","OSCR","ACHR","ASTS","BMNR",
-    "FIG","GLXY","SBET","VKTX","IREN","UUUU","BLSH","SNPS","FLY","POET",
-    "CIFR","BE","EOSE","ONDS","SNDK","PATH","LMND","JPM","ZM","AMAT",
-    "RKT","NVO","DUOL","AXTI","FIGR","RBRK","ALAB","CAR","QS","CSCO",
-    "AAOI","SPCX","AEHR","SKHY","AKAM","FISV","LUV",
+    "FIG","GLXY","SBET","VKTX","IREN","UUUU", "SNPS", "POET",
+    "CIFR","BE","EOSE","ONDS","SNDK","PATH","JPM","ZM","AMAT",
+    "DUOL","AXTI","FIGR","RBRK","ALAB","CSCO",
+    "AAOI","SPCX","AEHR","SKHY","AKAM"
 ]
 
 EXCLUDE_FROM_CANDIDATES = {
