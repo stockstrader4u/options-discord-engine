@@ -482,7 +482,14 @@ def render_stat_grid(draw, x0, y0, w, setup, derived, boxes):
         cx = x0 + col * col_w
         cy = y0 + row * row_h
         draw_text(draw, (cx, cy), label, label_font, TEXT_DIM, track_boxes=boxes, label=f"stat_{label}_label")
-        draw_text(draw, (cx, cy + 34), value, value_font, color, track_boxes=boxes, label=f"stat_{label}_value")
+        # Shrink only when the value would run into the next column (e.g. a 4-digit-price
+        # entry range like LLY's); anything that already fits renders exactly as before.
+        vf = value_font
+        for size in range(34, 21, -1):
+            vf = font(size, bold=True)
+            if text_w(draw, value, vf) <= col_w - 24:
+                break
+        draw_text(draw, (cx, cy + 34), value, vf, color, track_boxes=boxes, label=f"stat_{label}_value")
     return y0 + row_h * 2
 
 
