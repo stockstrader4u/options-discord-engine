@@ -128,7 +128,7 @@ def _compute_dte(expiry_str: str) -> int | None:
 def _dte_to_bucket(dte: int) -> DTEBucket:
     if dte <= 7:
         return "weeklies"
-    if dte <= 14:
+    if dte <= 21:
         return "next_week"
     if dte <= 45:
         return "monthly"

@@ -10,7 +10,7 @@ Filter criteria (ALL must pass):
   - implied_Bought_Or_Sold == "BOUGHT"
   - total_Option_Premium_For_Trade >= $100,000
   - interpreted_Conviction is HIGH or above (never NORMAL)
-  - DTE between 0 and 14 days inclusive
+  - DTE between 0 and 21 days inclusive
 
 Applies identically to every ticker — no symbol-based restrictions.
 """
@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-MAX_DTE_DAYS = 14
+MAX_DTE_DAYS = 21
 ALLOWED_MONEYNESS = {"OTM"}
 REQUIRED_SIDE = "BOUGHT"
 MIN_PREMIUM = 100_000
@@ -93,7 +93,7 @@ def passes_basic_filters(item: dict) -> bool:
     if conviction not in ALLOWED_CONVICTION:
         return False
 
-    # DTE: 0-14 days
+    # DTE: 0-21 days
     expiry_raw = item.get("expriation_Date") or item.get("expriationDate")
     dte_days = compute_dte_days(expiry_raw)
     if dte_days is None:
