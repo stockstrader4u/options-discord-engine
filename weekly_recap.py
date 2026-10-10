@@ -1,68 +1,45 @@
 """
-weekly_recap.py — Friday end-of-week alert performance recap.
+weekly_recap.py — Friday end-of-week "Week in Flow" recap.
 
-Posts one consolidated Discord message every Friday at market close (or
-the last real trading day if Friday is a holiday) summarizing how the
-past 5 trading days' alerts performed, using underlying spot price
-movement (high/low/close vs entry spot) — not option premium.
+A neutral record of what we PUBLISHED this week and what each contract did
+afterward. It is deliberately NOT a scorecard:
 
-Scope, by design:
-  - Spot price movement only, no premium/Greeks estimation
-  - Direction-aware win/loss: a put profiting from a price drop is a win
-  - Top 10 winners and top 10 losers shown in full detail; everything
-    else folded into aggregate stats only, so the card never grows
-    unbounded even on a busy week
-  - Every quote failure is shown explicitly ("no data"), never silently
-    dropped
-  - Does not touch scoring, gating, dedup, or the entry-card formatter —
-    this is a separate, additive feature reading from flow_events after
-    the fact
+  - no WIN / LOSS labels, no win rate, no "winners" or "laggards"
+  - the flows are observations of options activity, not trade calls, so the
+    card never implies a position was recommended
+  - every number is the OPTION CONTRACT's own traded price (Alpaca option
+    bars), not the stock price:
+        ALERT  last traded contract price at the moment the flow was published
+        HIGH   highest traded price between publish and the end of the window
+        LOW    lowest traded price in the same span
+        LAST   latest traded price, or the settlement value if it expired
+    plus a small path sparkline so you can see HOW it got there.
+  - the stock's move since the alert is shown as context only.
 
-Does NOT track entries beyond this 5-trading-day window — there is no
-day-to-day carryover. Each Friday's recap is self-contained.
+Window and DB source are unchanged (flow_events rows for the last
+TRADING_DAYS_IN_WINDOW trading days). build_weekly_recap() stays pure
+computation (network reads only, no matplotlib); render_weekly_recap_card()
+draws the PNG; post_weekly_recap_image() posts it.
 
-── VISUAL REDESIGN (2026-09-07) ─────────────────────────────────────────────
-Per direct user feedback: the plain-text Discord message gave "very
-little value" — only the top 3 winners/losers were shown in detail,
-with everything else folded into a vague "+21 other alerts this week"
-line, and even the shown rows were a dense wall of text.
-
-Changes:
-  1. TOP_N_PER_SIDE raised from 3 to 10 per side — with a typical ~25-30
-     alert week, this now covers the large majority of alerts in full
-     detail (entry/high/low/close), leaving only a handful in the
-     aggregate remainder line instead of the bulk of the week.
-  2. The recap is now rendered as a PNG card (render_weekly_recap_card())
-     instead of a plain-text Discord message — colored left-accent rows
-     per alert (green for winners, red for laggards), matching the
-     visual language already established across BMT's other dashboards
-     (bmt_weekly_insights.py / bmt_weekend_analytics.py's dark palette)
-     and the same top-N-highlights row layout already validated with
-     the user in er_lotto_report_card.py.
-  3. format_weekly_recap_message() is replaced by
-     format_weekly_recap_caption() — a single short line (date range,
-     total alerts, win rate, avg move) posted as the image's caption,
-     since the detail now lives in the card itself rather than in message
-     text.
-  4. post_weekly_recap() is replaced by post_weekly_recap_image(), which
-     posts the rendered PNG + caption instead of a bare text message.
-
-build_weekly_recap() remains PURE COMPUTATION -- no matplotlib, no
-network -- so it stays independently testable exactly as before.
-Rendering and posting are separate steps, same architectural split the
-module already had between build/post.
+Env: ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY (option + stock bars).
+     FINNHUB_API_KEY is now only a fallback for the stock's latest price.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+import os
+import statistics
+import time
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 from matplotlib.patches import FancyBboxPatch
 
 from market_hours import most_recent_trading_day, trading_days_before
@@ -70,66 +47,124 @@ from db import get_flow_events_in_range
 
 logger = logging.getLogger("options-weekly-recap")
 
+ET = ZoneInfo("America/New_York")
 FINNHUB_QUOTE_URL = "https://finnhub.io/api/v1/quote"
+ALPACA_DATA = "https://data.alpaca.markets"
 TRADING_DAYS_IN_WINDOW = 5
-# VISUAL REDESIGN (2026-09-07): raised from 3 -- see module docstring.
-TOP_N_PER_SIDE = 10
+BAR_TIMEFRAME = "5Min"
+SESSION_MINUTES = 390          # 9:30-16:00
+MAX_ROWS = 36                  # rows drawn in full; the rest fold into one summary line
+DATA_DELAY = timedelta(minutes=16)   # the data plan refuses requests whose end is within ~15 min of now
+SYMBOL_BATCH = 25              # option symbols per Alpaca request
 
 
 class QuoteUnavailable(Exception):
-    """Raised when a ticker's current quote can't be fetched. Callers
-    surface this as an explicit '⚠️ no data' line — never silently
-    dropped, per design."""
+    """Raised when a ticker's current quote can't be fetched."""
     def __init__(self, ticker: str, reason: str):
         self.ticker = ticker
         self.reason = reason
         super().__init__(f"{ticker}: {reason}")
 
 
+class MarketDataError(Exception):
+    """Alpaca request failed (after retries)."""
+
+
 # ---------------------------------------------------------------------------
-# Finnhub quote fetch
+# Market data
 # ---------------------------------------------------------------------------
 
 def get_quote(ticker: str, api_key: str, timeout: float = 10.0) -> dict[str, float]:
-    """
-    Fetch current/high/low quote for a ticker from Finnhub.
-
-    Returns {"current": float, "high": float, "low": float}.
-    Raises QuoteUnavailable on any failure.
-    """
+    """Finnhub quote (fallback for the stock's latest price only)."""
     if not api_key:
         raise QuoteUnavailable(ticker, "FINNHUB_API_KEY not configured")
-
     try:
-        resp = httpx.get(
-            FINNHUB_QUOTE_URL,
-            params={"symbol": ticker, "token": api_key},
-            timeout=timeout,
-        )
+        resp = httpx.get(FINNHUB_QUOTE_URL, params={"symbol": ticker, "token": api_key}, timeout=timeout)
     except httpx.RequestError as e:
         raise QuoteUnavailable(ticker, f"network error: {e}")
-
-    if resp.status_code == 429:
-        raise QuoteUnavailable(ticker, "rate limited (429)")
     if resp.status_code != 200:
         raise QuoteUnavailable(ticker, f"HTTP {resp.status_code}")
-
     try:
         data = resp.json()
     except ValueError:
         raise QuoteUnavailable(ticker, "invalid JSON response")
-
-    current = data.get("c")
-    high = data.get("h")
-    low = data.get("l")
-
-    # Finnhub returns all-zero fields for an unrecognized/delisted symbol
-    # rather than an error status — this is the real "bad symbol" failure
-    # mode and needs an explicit check, not just a None check.
-    if current is None or current == 0:
+    if not data.get("c"):
         raise QuoteUnavailable(ticker, "no data returned (symbol may be invalid)")
+    return {"current": data["c"], "high": data.get("h"), "low": data.get("l")}
 
-    return {"current": current, "high": high, "low": low}
+
+def _alpaca_headers() -> dict[str, str]:
+    return {"APCA-API-KEY-ID": os.environ.get("ALPACA_API_KEY_ID", ""),
+            "APCA-API-SECRET-KEY": os.environ.get("ALPACA_API_SECRET_KEY", "")}
+
+
+def alpaca_configured() -> bool:
+    return bool(os.environ.get("ALPACA_API_KEY_ID") and os.environ.get("ALPACA_API_SECRET_KEY"))
+
+
+def _paged_bars(path: str, params: dict) -> dict[str, list[dict]]:
+    """GET an Alpaca bars endpoint, following next_page_token. Returns {symbol: [bar,...]}."""
+    out: dict[str, list[dict]] = {}
+    p = dict(params)
+    for _ in range(60):
+        r = None
+        for attempt in range(4):
+            r = httpx.get(ALPACA_DATA + path, headers=_alpaca_headers(), params=p, timeout=30.0)
+            if r.status_code == 429:
+                time.sleep(2 * (attempt + 1))
+                continue
+            break
+        if r is None or r.status_code != 200:
+            raise MarketDataError(f"{path} HTTP {getattr(r, 'status_code', '?')}: {getattr(r, 'text', '')[:160]}")
+        j = r.json()
+        for sym, rows in (j.get("bars") or {}).items():
+            out.setdefault(sym, []).extend(rows)
+        tok = j.get("next_page_token")
+        if not tok:
+            break
+        p["page_token"] = tok
+    return out
+
+
+def _utc_str(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_bar(b: dict) -> tuple[datetime, float, float, float, float]:
+    ts = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(ET)
+    return ts, float(b["o"]), float(b["h"]), float(b["l"]), float(b["c"])
+
+
+def occ_symbol(ticker: str, expiry: date, put_call: str, strike: float) -> str:
+    cp = "C" if put_call.upper().startswith("C") else "P"
+    return f"{ticker.upper()}{expiry:%y%m%d}{cp}{int(round(float(strike) * 1000)):08d}"
+
+
+def fetch_option_bars(symbols: list[str], start: datetime, end: datetime) -> dict[str, list[tuple]]:
+    """{occ_symbol: [(ts_et, o, h, l, c), ...]} for 5-minute traded-price bars."""
+    result: dict[str, list[tuple]] = {}
+    for i in range(0, len(symbols), SYMBOL_BATCH):
+        chunk = symbols[i:i + SYMBOL_BATCH]
+        raw = _paged_bars("/v1beta1/options/bars", {
+            "symbols": ",".join(chunk), "timeframe": BAR_TIMEFRAME, "limit": 10000,
+            "start": _utc_str(start), "end": _utc_str(end), "sort": "asc"})
+        for sym, rows in raw.items():
+            result[sym] = [_parse_bar(b) for b in rows]
+    return result
+
+
+def fetch_stock_daily_closes(tickers: list[str], start: date, end: date) -> dict[str, dict[date, float]]:
+    """{ticker: {date: close}} daily closes (IEX feed; close can differ a few cents from consolidated)."""
+    out: dict[str, dict[date, float]] = {}
+    for i in range(0, len(tickers), SYMBOL_BATCH):
+        chunk = tickers[i:i + SYMBOL_BATCH]
+        raw = _paged_bars("/v2/stocks/bars", {
+            "symbols": ",".join(chunk), "timeframe": "1Day", "limit": 10000, "feed": "iex",
+            "adjustment": "split", "sort": "asc",
+            "start": start.isoformat(), "end": (end + timedelta(days=1)).isoformat()})
+        for sym, rows in raw.items():
+            out[sym] = {_parse_bar(b)[0].date(): float(b["c"]) for b in rows}
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -137,490 +172,524 @@ def get_quote(ticker: str, api_key: str, timeout: float = 10.0) -> dict[str, flo
 # ---------------------------------------------------------------------------
 
 def resolve_recap_window(as_of: date | None = None) -> tuple[date, date]:
-    """
-    Resolve the (start_date, end_date) window for the recap.
-
-    end_date is the most recent real trading day on or before as_of
-    (defaults to today) — this is what makes the Friday-is-a-holiday case
-    work correctly: if as_of falls on a holiday, end_date rolls back to
-    the last actual trading day rather than producing an empty/wrong window.
-
-    start_date is TRADING_DAYS_IN_WINDOW trading days before end_date.
-    """
+    """(start_date, end_date); end_date rolls back to the last real trading day."""
     if as_of is None:
         as_of = datetime.now(timezone.utc).date()
     end_date = most_recent_trading_day(as_of)
-    start_date = trading_days_before(end_date, TRADING_DAYS_IN_WINDOW)
+    # n-1 days back, so the window is exactly N trading days (end day included) and the
+    # previous Friday's flows belong to the previous recap
+    start_date = trading_days_before(end_date, TRADING_DAYS_IN_WINDOW - 1)
     return start_date, end_date
 
 
 # ---------------------------------------------------------------------------
-# Win/loss + per-alert result computation
+# Per-flow computation
 # ---------------------------------------------------------------------------
 
-def compute_alert_result(row: dict[str, Any], quote: dict[str, float]) -> dict[str, Any]:
-    """
-    Given a flow_events row and its current quote, compute the
-    direction-aware result for display.
+def _as_utc(dt: datetime) -> datetime:
+    if isinstance(dt, str):
+        dt = datetime.fromisoformat(dt)
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
-    Win definition: a CALL wins if close > entry spot; a PUT wins if
-    close < entry spot. This matches the green/red logic used elsewhere —
-    a put profiting from a price drop is a win, not a loss.
-    """
-    entry_spot = row.get("spot_price")
-    close = quote["current"]
+
+def _session_minute(ts: datetime) -> float:
+    m = (ts.hour * 60 + ts.minute + ts.second / 60) - (9 * 60 + 30)
+    return min(max(m, 0.0), float(SESSION_MINUTES))
+
+
+def trading_x(ts: datetime, origin: datetime) -> float:
+    """Position in 'trading minutes' since origin: overnight/weekend gaps collapse to nothing."""
+    days = int(np.busday_count(origin.date(), ts.date()))
+    return days * SESSION_MINUTES + _session_minute(ts) - _session_minute(origin)
+
+
+def _is_expired(expiry: date, now_et: datetime) -> bool:
+    return expiry < now_et.date() or (expiry == now_et.date() and now_et.hour >= 16)
+
+
+def compute_flow_result(row: dict[str, Any], bars: list[tuple] | None,
+                        daily_closes: dict[date, float] | None,
+                        spot_last: float | None, now_et: datetime) -> dict[str, Any]:
+    """One published flow -> neutral facts about what its contract traded at afterward."""
+    alerted_at = _as_utc(row["ingested_at"]).astimezone(ET)
     put_call = (row.get("put_call") or "").upper()
+    strike = row.get("strike")
+    expiry = date.fromisoformat(str(row["expiry_date"])[:10]) if row.get("expiry_date") else None
+    spot_alert = row.get("spot_price")
 
-    if entry_spot is None or entry_spot == 0:
-        pct_move = None
-        is_win = None
+    res: dict[str, Any] = {
+        "ticker": row["ticker"], "contract": row.get("contract"), "put_call": put_call,
+        "strike": strike, "expiry": expiry, "premium": row.get("premium") or 0,
+        "alerted_at": alerted_at, "alert_hash": row.get("alert_hash"),
+        "spot_alert": spot_alert, "spot_last": spot_last,
+        "spot_chg_pct": ((spot_last - spot_alert) / spot_alert * 100) if (spot_last and spot_alert) else None,
+        "ok": False, "reason": None, "expired": bool(expiry and _is_expired(expiry, now_et)),
+    }
+    if expiry is None or strike is None or not put_call:
+        res["reason"] = "contract details missing"
+        return res
+    if not bars:
+        res["reason"] = "no option trades found"
+        return res
+
+    # ALERT price: last traded bar at or before the publish time (same session), else the first trade after it.
+    cutoff = alerted_at.replace(second=0, microsecond=0)
+    before = [b for b in bars if b[0] <= alerted_at and b[0].date() == alerted_at.date()]
+    after = [b for b in bars if b[0] > alerted_at]
+    if before:
+        alert_px, alert_note = before[-1][4], None
+    elif after and (after[0][0] - alerted_at) <= timedelta(hours=2):
+        alert_px, alert_note = after[0][1], "first trade after publish"
     else:
-        pct_move = (close - entry_spot) / entry_spot * 100
-        if put_call == "PUT":
-            is_win = close < entry_spot
-            # For display, flip the sign for puts so "+X%" always means
-            # "moved favorably for this position", matching the win flag.
-            display_pct = -pct_move
+        res["reason"] = "no trade near publish time"
+        return res
+
+    window = [b for b in bars if b[0] >= cutoff - timedelta(minutes=5)]
+    if not window:
+        res["alert_px"] = alert_px
+        res["reason"] = "published after the close — no trades since"
+        return res
+
+    hi_bar = max(window, key=lambda b: b[2])
+    lo_bar = min(window, key=lambda b: b[3])
+    high_px, low_px = max(hi_bar[2], alert_px), min(lo_bar[3], alert_px)
+
+    # path (for the sparkline): alert point, then each bar's close, in trading-minute space
+    path = [(0.0, alert_px)]
+    for b in window:
+        if b[0] > alerted_at:
+            path.append((trading_x(b[0], alerted_at), b[4]))
+
+    if res["expired"]:
+        close = (daily_closes or {}).get(expiry)
+        if close is not None:
+            last_px = max(0.0, close - strike) if put_call == "CALL" else max(0.0, strike - close)
+            last_note = "settled"
         else:
-            is_win = close > entry_spot
-            display_pct = pct_move
+            last_px, last_note = window[-1][4], "last trade"
+        end_x = trading_x(datetime(expiry.year, expiry.month, expiry.day, 16, 0, tzinfo=ET), alerted_at)
+    else:
+        last_px, last_note = window[-1][4], None
+        end_x = trading_x(now_et if now_et.hour < 16 else now_et.replace(hour=16, minute=0), alerted_at)
+    end_x = max(end_x, path[-1][0])
+    path.append((end_x, last_px))
 
-    return {
-        "ticker": row["ticker"],
-        "contract": row["contract"],
-        "put_call": put_call,
-        "entry_spot": entry_spot,
-        "high": quote.get("high"),
-        "low": quote.get("low"),
-        "close": close,
-        "pct_move_display": display_pct if entry_spot else None,
-        "is_win": is_win,
-        "score": row.get("score"),
-        "alert_hash": row.get("alert_hash"),
-        "quote_failed": False,
-    }
-
-
-def compute_failed_result(row: dict[str, Any], reason: str) -> dict[str, Any]:
-    """Result entry for a row whose quote lookup failed — shown
-    explicitly in the card rather than dropped."""
-    return {
-        "ticker": row["ticker"],
-        "contract": row["contract"],
-        "put_call": (row.get("put_call") or "").upper(),
-        "entry_spot": row.get("spot_price"),
-        "high": None,
-        "low": None,
-        "close": None,
-        "pct_move_display": None,
-        "is_win": None,
-        "score": row.get("score"),
-        "alert_hash": row.get("alert_hash"),
-        "quote_failed": True,
-        "fail_reason": reason,
-    }
+    pct = lambda px: (px / alert_px - 1.0) * 100.0
+    res.update(
+        ok=True, alert_px=alert_px, alert_note=alert_note,
+        high_px=high_px, low_px=low_px, last_px=last_px, last_note=last_note,
+        high_pct=pct(high_px), low_pct=pct(low_px), last_pct=pct(last_px),
+        path=path, path_pct=[(x, pct(y)) for x, y in path], end_x=end_x,
+    )
+    return res
 
 
 # ---------------------------------------------------------------------------
 # Recap assembly
 # ---------------------------------------------------------------------------
 
-def build_weekly_recap(api_key: str, as_of: date | None = None) -> dict[str, Any]:
+def build_weekly_recap(api_key: str = "", as_of: date | None = None) -> dict[str, Any]:
     """
-    Pull this window's flow_events, fetch quotes, compute results, and
-    return a structured recap (results, highlights, stats, caption).
-
-    Does not post to Discord and does not render any image — pure
-    computation, so it can be tested and previewed independently of any
-    network or matplotlib side effects. See render_weekly_recap_card()
-    for turning this dict into the actual PNG.
+    Pull the window's published flows, fetch each contract's traded prices from
+    Alpaca, and return a neutral recap dict. `api_key` is the optional Finnhub key
+    (used only if Alpaca has no daily bar for a stock).
     """
     start_date, end_date = resolve_recap_window(as_of)
     rows = get_flow_events_in_range(start_date.isoformat(), end_date.isoformat())
+    now_et = datetime.now(ET)
 
-    # One quote call per unique ticker, not per alert — avoids redundant
-    # calls when the same ticker fired multiple times in the window.
-    unique_tickers = sorted({r["ticker"] for r in rows})
-    quotes: dict[str, dict] = {}
-    quote_failures: dict[str, str] = {}
-
-    for ticker in unique_tickers:
+    flows: list[dict[str, Any]] = []
+    if rows and alpaca_configured():
+        syms: dict[int, str] = {}
+        for i, r in enumerate(rows):
+            if r.get("expiry_date") and r.get("strike") is not None and r.get("put_call"):
+                syms[i] = occ_symbol(r["ticker"], date.fromisoformat(str(r["expiry_date"])[:10]),
+                                     r["put_call"], r["strike"])
+        first_alert = min(_as_utc(r["ingested_at"]) for r in rows)
+        bars_by_sym: dict[str, list[tuple]] = {}
         try:
-            quotes[ticker] = get_quote(ticker, api_key)
-        except QuoteUnavailable as e:
-            quote_failures[ticker] = e.reason
-            logger.warning("weekly_recap quote_failed ticker=%s reason=%s", ticker, e.reason)
+            bars_by_sym = fetch_option_bars(sorted(set(syms.values())), first_alert - timedelta(hours=1),
+                                            datetime.now(timezone.utc) - DATA_DELAY)
+        except MarketDataError as e:
+            logger.warning("weekly_recap option_bars_failed %s", e)
+        tickers = sorted({r["ticker"] for r in rows})
+        closes: dict[str, dict[date, float]] = {}
+        try:
+            closes = fetch_stock_daily_closes(tickers, first_alert.astimezone(ET).date(),
+                                              max(end_date, now_et.date()))
+        except MarketDataError as e:
+            logger.warning("weekly_recap stock_daily_failed %s", e)
 
-    results = []
-    for row in rows:
-        ticker = row["ticker"]
-        if ticker in quotes:
-            results.append(compute_alert_result(row, quotes[ticker]))
-        else:
-            results.append(compute_failed_result(row, quote_failures.get(ticker, "unknown error")))
+        for i, r in enumerate(rows):
+            tk = r["ticker"]
+            tick_closes = closes.get(tk) or {}
+            spot_last = tick_closes[max(tick_closes)] if tick_closes else None
+            if spot_last is None and api_key:
+                try:
+                    spot_last = get_quote(tk, api_key)["current"]
+                except QuoteUnavailable:
+                    pass
+            flows.append(compute_flow_result(r, bars_by_sym.get(syms.get(i, "")), tick_closes, spot_last, now_et))
+    else:
+        for r in rows:
+            f = compute_flow_result(r, None, None, None, now_et)
+            f["reason"] = "Alpaca keys not configured" if not alpaca_configured() else f["reason"]
+            flows.append(f)
 
-    # Split into resolved (has a real pct_move) vs failed, for ranking
-    resolved = [r for r in results if not r["quote_failed"]]
-    failed = [r for r in results if r["quote_failed"]]
-
-    resolved_sorted = sorted(resolved, key=lambda r: r["pct_move_display"], reverse=True)
-    winners = resolved_sorted[:TOP_N_PER_SIDE]
-    losers = resolved_sorted[-TOP_N_PER_SIDE:] if resolved_sorted else []
-    # avoid double-listing the same alerts as both winners and losers on a
-    # very small week (e.g. with only 2 results, winners[:10] and
-    # losers[-10:] would otherwise both grab the same rows)
-    highlighted_hashes = {r["alert_hash"] for r in winners} | {r["alert_hash"] for r in losers}
-    remainder = [r for r in resolved_sorted if r["alert_hash"] not in highlighted_hashes]
-
-    total = len(results)
-    win_count = sum(1 for r in resolved if r["is_win"])
-    loss_count = sum(1 for r in resolved if r["is_win"] is False)
-    win_rate = (win_count / len(resolved) * 100) if resolved else None
-    avg_move = (sum(r["pct_move_display"] for r in resolved) / len(resolved)) if resolved else None
-
+    stats = _summarize(flows)
     return {
-        "start_date": start_date,
-        "end_date": end_date,
-        "total_alerts": total,
-        "resolved_count": len(resolved),
-        "failed_count": len(failed),
-        "win_count": win_count,
-        "loss_count": loss_count,
-        "win_rate": win_rate,
-        "avg_move": avg_move,
-        "winners": winners,
-        "losers": losers,
-        "remainder": remainder,
-        "failed": failed,
-        "caption": format_weekly_recap_caption(start_date, end_date, total, win_rate, avg_move),
-        # HOTFIX (2026-09-07): "message" kept as an alias of "caption",
-        # purely so an old caller that hasn't been updated yet
-        # (main.py was still doing recap["message"]) degrades to a
-        # short plain-text post instead of crashing with a KeyError.
-        # Remove once main.py is confirmed updated to use "caption"
-        # and render_weekly_recap_card() directly.
-        "message": format_weekly_recap_caption(start_date, end_date, total, win_rate, avg_move),
+        "start_date": start_date, "end_date": end_date,
+        "total_alerts": len(flows), "flows": flows, "stats": stats,
+        "caption": format_weekly_recap_caption(start_date, end_date, stats),
+    }
+
+
+def _summarize(flows: list[dict[str, Any]]) -> dict[str, Any]:
+    ok = [f for f in flows if f["ok"]]
+    calls = [f for f in flows if f["put_call"] == "CALL"]
+    puts = [f for f in flows if f["put_call"] == "PUT"]
+    prem = lambda xs: sum(f["premium"] for f in xs)
+    tickers: dict[str, int] = {}
+    for f in flows:
+        tickers[f["ticker"]] = tickers.get(f["ticker"], 0) + 1
+    return {
+        "count": len(flows), "with_data": len(ok), "unique_tickers": len(tickers),
+        "calls": len(calls), "puts": len(puts),
+        "call_premium": prem(calls), "put_premium": prem(puts), "total_premium": prem(flows),
+        "median_high_pct": statistics.median(f["high_pct"] for f in ok) if ok else None,
+        "median_low_pct": statistics.median(f["low_pct"] for f in ok) if ok else None,
+        "repeat_tickers": sorted(((t, n) for t, n in tickers.items() if n > 1), key=lambda x: -x[1]),
     }
 
 
 # ---------------------------------------------------------------------------
-# Caption (short, posted alongside the image — see render section below
-# for where the actual detail now lives)
+# Caption
 # ---------------------------------------------------------------------------
 
-def format_weekly_recap_caption(
-    start_date: date,
-    end_date: date,
-    total_alerts: int,
-    win_rate: float | None,
-    avg_move: float | None,
-) -> str:
-    date_range = f"{start_date.strftime('%b %d')}\u2013{end_date.strftime('%b %d')}"
-    win_rate_str = f"{win_rate:.0f}%" if win_rate is not None else "N/A"
-    avg_move_str = f"{avg_move:+.1f}%" if avg_move is not None else "N/A"
-    return (f"**Weekly Recap \u2014 {date_range}**   "
-            f"{total_alerts} alerts \u00b7 {win_rate_str} win rate \u00b7 {avg_move_str} avg move")
+def _fmt_prem(v: float) -> str:
+    if v >= 1e6:
+        return f"${v / 1e6:.2f}M" if v < 1e7 else f"${v / 1e6:.1f}M"
+    if v >= 1e3:
+        return f"${v / 1e3:.0f}K"
+    return f"${v:.0f}"
+
+
+def format_weekly_recap_caption(start_date: date, end_date: date, stats: dict[str, Any]) -> str:
+    date_range = f"{start_date.strftime('%b %d')}–{end_date.strftime('%b %d')}"
+    return (f"**Week in Flow — {date_range}**   {stats['count']} flows published · "
+            f"{_fmt_prem(stats['total_premium'])} premium · {stats['calls']} calls / {stats['puts']} puts\n"
+            f"*A recap of published flow and how each contract traded afterward — not trade recommendations.*")
 
 
 # ---------------------------------------------------------------------------
-# Card rendering (2026-09-07 redesign)
+# Card rendering
+#
+# Discord shows an attached image ~500px wide in the chat, so the cards are drawn on a
+# NARROW canvas (8in) with large type, and a big week is split across pages: one summary
+# page followed by detail pages of ROWS_PER_PAGE flows each. Readability does not degrade
+# as the number of published flows grows -- only the page count does.
 # ---------------------------------------------------------------------------
 
 DARK_BG      = "#0a0e1c"
 PANEL_BG     = "#12172a"
 PANEL_BORDER = "#252c47"
 TXT_LIGHT    = "#f2f4f8"
-TXT_DIM      = "#8891a7"
-GREEN        = "#22d3a8"
-RED          = "#ef4444"
-GRAY         = "#5b6478"
-GOLD         = "#f5a623"
+TXT_DIM      = "#9aa3b8"
+GRAY         = "#6b7488"
+# Deliberately NOT green/red: those read as "good/bad". Blue = contract price above its price
+# at publish, amber = below it. Calls/puts get quiet hues of their own.
+UP           = "#6ea8ff"
+DOWN         = "#f0a04b"
+CALL_HUE     = "#9fb3d9"
+PUT_HUE      = "#c4a7e7"
 HEADER_FONT  = "DejaVu Sans"
 DATA_FONT    = "DejaVu Sans Mono"
 
+W = 8.0
+LEFT, RIGHT = 0.40, W - 0.40
+CENTER = W / 2
+ROWS_PER_PAGE = 6
+ROW_H = 1.52
+DPI = 200
+DISCLAIMER = ("Recap of options flow we published · contract traded prices (Alpaca) · "
+              "not trade recommendations · not financial advice")
+
 
 def _esc(text: str) -> str:
-    """Matplotlib treats a PAIR of unescaped '$' as LaTeX math-mode
-    delimiters -- every row here has several dollar amounts, so this is
-    not optional. Same fix already applied in er_lotto_report_card.py."""
+    """Matplotlib treats a pair of unescaped '$' as math-mode delimiters."""
     return text.replace("$", r"\$")
 
 
-def _fmt_money(v: float | None) -> str:
+def _fmt_px(v: float | None) -> str:
     return f"${v:,.2f}" if v is not None else "N/A"
 
 
-def _row_line1(r: dict) -> str:
-    pc = "CALL" if r["put_call"] == "CALL" else "PUT" if r["put_call"] == "PUT" else "?"
-    return f"${r['ticker']}  {pc}  \u00b7  entry {_fmt_money(r['entry_spot'])}"
+def _fmt_pct(v: float | None) -> str:
+    if v is None:
+        return "N/A"
+    return f"{v:+.0f}%" if abs(v) >= 10 else f"{v:+.1f}%"
 
 
-def _row_line2(r: dict) -> str:
-    """No longer includes the trailing (+X.X%) -- that number now lives
-    in the magnitude bar + bold label on the row's right side instead
-    (see draw_section in render_weekly_recap_card), so it isn't stated
-    twice in two different visual forms on the same row."""
-    return f"High {_fmt_money(r['high'])}  \u00b7  Low {_fmt_money(r['low'])}  \u00b7  Close {_fmt_money(r['close'])}"
+def _fmt_strike(k: float) -> str:
+    return f"{k:g}"
 
 
-def _raw_move_pct(r: dict) -> float | None:
-    """
-    VISUAL FIX (2026-09-07, same-day follow-up): the actual stock price
-    % move, direction as-stated -- deliberately NOT pct_move_display
-    (which is sign-flipped for puts so a favorable move always reads
-    positive, for ranking/section-placement purposes). Confirmed
-    directly by the user: showing that flipped number on a green bar
-    made a winning PUT on a FALLING stock look like the stock went UP,
-    which is backwards from what green/positive means on every quote
-    screen. This function recovers the real, unflipped move so the
-    magnitude bar can answer "which way did the stock actually move"
-    correctly regardless of call/put -- win/loss is shown separately
-    now, via its own WIN/LOSS pill badge, never folded into this color
-    or sign.
-    """
-    entry = r.get("entry_spot")
-    close = r.get("close")
-    if entry is None or close is None or entry == 0:
-        return None
-    return (close - entry) / entry * 100
+def _clock(ts: datetime) -> str:
+    h = ts.hour % 12 or 12
+    return f"{ts.strftime('%a')} {h}:{ts.minute:02d}{'a' if ts.hour < 12 else 'p'}"
 
 
-def render_weekly_recap_card(recap: dict[str, Any], out_path: str) -> None:
-    """
-    Renders the top-N winners/losers as a dark-themed PNG card.
-
-    VISUAL UPGRADE (2026-09-07, same-day follow-up): each row now also
-    carries a length-proportional magnitude bar + bold %-move label on
-    its right side, scaled against the single biggest move shown this
-    week (winners and losers share one scale, so a +22% winner's bar is
-    visibly ~4x a +5.7% winner's, and a -12% loser's bar is visibly the
-    longest red bar) -- same "leaderboard" pattern already used for
-    Calls vs Puts / Top Symbols in bmt_weekly_insights.py's dashboard,
-    applied here so the reader can see relative magnitude before
-    reading a single number, not just after. Entry/high/low/close text
-    detail is unchanged -- this adds a visual on top of it, it doesn't
-    replace it.
-
-    Section headers now read "TOP N WINNERS"/"TOP N LAGGARDS" with the
-    actual count shown (== TOP_N_PER_SIDE, i.e. "TOP 10", whenever the
-    week has at least that many on that side) rather than a hardcoded
-    label -- keeps the header honest on a lighter week with fewer than
-    10 real winners or losers to show.
-    """
-    W = 12.2
-    row_h = 0.60
-    section_header_h = 0.42
-    gap_between_sections = 0.32
-    footer_h = 0.55
-
-    TITLE_Y0 = 0.55
-    SUBTITLE_GAP = 0.50
-    STATS_GAP = 0.62
-    STATS_BLOCK_H = 0.80
-    HEADER_PAD_BOTTOM = 0.30
-
-    header_h = TITLE_Y0 + SUBTITLE_GAP + STATS_GAP + STATS_BLOCK_H + HEADER_PAD_BOTTOM
-
-    winners = recap["winners"]
-    losers = recap["losers"]
-    remainder = recap["remainder"]
-    failed = recap["failed"]
-
-    n_winners = len(winners)
-    n_losers = len(losers)
-
-    H = header_h
-    if n_winners:
-        H += section_header_h + n_winners * row_h + gap_between_sections
-    if n_losers:
-        H += section_header_h + n_losers * row_h
-    if remainder:
-        H += 0.40
-    if failed:
-        H += 0.30 + len(failed) * 0.26
-    H += footer_h
-
-    fig = plt.figure(figsize=(W, H), facecolor=DARK_BG)
+def _canvas(height: float):
+    fig = plt.figure(figsize=(W, height), facecolor=DARK_BG)
     ax = fig.add_axes([0, 0, 1, 1])
     ax.set_xlim(0, W)
-    ax.set_ylim(H, 0)
+    ax.set_ylim(height, 0)
     ax.axis("off")
-    ax.set_facecolor(DARK_BG)
 
-    LEFT, RIGHT = 0.75, W - 0.75
-    CENTER = W / 2
+    def T(x, y, s, **kw):
+        kw.setdefault("va", "top")
+        return ax.text(x, y, _esc(s), **kw)
+    return fig, ax, T
 
-    # Magnitude-bar geometry: text occupies the left portion of the row;
-    # a fixed-width WIN/LOSS pill sits between the text and the bar; the
-    # bar + bold %-move label occupy the remaining right portion. One
-    # shared scale across BOTH winners and losers so bar lengths are
-    # directly comparable across the whole card, not just within a
-    # section.
-    text_right_edge = LEFT + (RIGHT - LEFT) * 0.50
-    pill_w, pill_h = 0.62, 0.24
-    pill_x0 = text_right_edge + 0.15
-    pct_label_w = 0.85
-    bar_x0 = pill_x0 + pill_w + 0.30
-    bar_max_w = (RIGHT - pct_label_w) - bar_x0
-    all_shown = winners + losers
-    max_abs_pct = max((abs(_raw_move_pct(r)) for r in all_shown
-                        if _raw_move_pct(r) is not None), default=1.0) or 1.0
 
-    y = TITLE_Y0
-    ax.text(CENTER, y, "WEEKLY RECAP", ha="center", va="top",
-             fontsize=15, color=TXT_DIM, fontweight="bold", fontfamily=HEADER_FONT)
-    y += SUBTITLE_GAP
-    date_range = f"{recap['start_date'].strftime('%b %d')}\u2013{recap['end_date'].strftime('%b %d, %Y')}"
-    ax.text(CENTER, y, date_range, ha="center", va="top",
-             fontsize=12.5, color=TXT_DIM, fontfamily=HEADER_FONT)
-    y += STATS_GAP
+def _footer(T, ax, H, page_label: str):
+    ax.plot([LEFT, RIGHT], [H - 0.62, H - 0.62], color=PANEL_BORDER, linewidth=1)
+    T(CENTER, H - 0.50, DISCLAIMER, ha="center", fontsize=7.8, color=GRAY, fontfamily=HEADER_FONT)
+    T(CENTER, H - 0.28, page_label, ha="center", fontsize=8.5, color=TXT_DIM, fontfamily=HEADER_FONT)
 
-    stat_y = y
-    win_rate = recap["win_rate"]
-    avg_move = recap["avg_move"]
-    stats = [
-        (str(recap["total_alerts"]), "ALERTS", TXT_LIGHT),
-        (f"{win_rate:.0f}%" if win_rate is not None else "N/A", "WIN RATE",
-         GREEN if (win_rate or 0) >= 50 else RED),
-        (f"{avg_move:+.1f}%" if avg_move is not None else "N/A", "AVG MOVE",
-         GREEN if (avg_move or 0) >= 0 else RED),
+
+def _range(recap) -> str:
+    return f"{recap['start_date'].strftime('%b %d')}–{recap['end_date'].strftime('%b %d, %Y')}"
+
+
+def _outcome_buckets(flows: list[dict]) -> list[tuple[str, int, str]]:
+    """Neutral distribution of where each contract stood at the end of the window."""
+    ok = [f for f in flows if f["ok"]]
+    defs = [
+        ("Expired worthless", lambda f: f["expired"] and f["last_px"] <= 0.005, DOWN),
+        ("Down 50% or more", lambda f: f["last_pct"] <= -50, DOWN),
+        ("Down 10–50%", lambda f: -50 < f["last_pct"] <= -10, DOWN),
+        ("Within 10% of publish price", lambda f: -10 < f["last_pct"] < 10, GRAY),
+        ("Up 10–50%", lambda f: 10 <= f["last_pct"] < 50, UP),
+        ("Up 50% or more", lambda f: f["last_pct"] >= 50, UP),
     ]
-    col_w = (RIGHT - LEFT) / 3
-    for i, (num, label, color) in enumerate(stats):
-        cx = LEFT + col_w * i + col_w / 2
-        ax.text(cx, stat_y, num, ha="center", va="top", fontsize=24,
-                 color=color, fontweight="bold", fontfamily=HEADER_FONT)
-        ax.text(cx, stat_y + 0.40, label, ha="center", va="top",
-                 fontsize=9, color=TXT_DIM, fontweight="bold", fontfamily=HEADER_FONT)
-        if i > 0:
-            div_x = LEFT + col_w * i
-            ax.plot([div_x, div_x], [stat_y - 0.05, stat_y + 0.55], color=PANEL_BORDER, linewidth=1)
+    out, taken = [], set()
+    for label, test, color in defs:
+        hit = [id(f) for f in ok if id(f) not in taken and test(f)]
+        taken.update(hit)
+        out.append((label, len(hit), color))
+    return out
 
-    y = header_h - 0.20
-    ax.plot([LEFT, RIGHT], [y, y], color=PANEL_BORDER, linewidth=1)
-    y += 0.20
 
-    def draw_section(suffix, color, items):
-        nonlocal y
-        title = f"TOP {len(items)} {suffix}"
-        ax.add_patch(plt.Rectangle((LEFT, y + 0.02), 0.11, 0.11, facecolor=color, edgecolor="none"))
-        ax.text(LEFT + 0.24, y, title, ha="left", va="top",
-                 fontsize=12.5, color=color, fontweight="bold", fontfamily=HEADER_FONT)
-        y += section_header_h + 0.12
-        for r in items:
-            bar_top = y - 0.06
-            bar_bot = y + row_h - 0.22
-            ax.plot([LEFT, LEFT], [bar_top, bar_bot], color=color, linewidth=3, solid_capstyle="butt")
-            ax.text(LEFT + 0.2, y, _esc(_row_line1(r)), ha="left", va="top",
-                     fontsize=10.5, color=TXT_LIGHT, fontweight="bold", fontfamily=DATA_FONT)
-            ax.text(LEFT + 0.2, y + 0.30, _esc(_row_line2(r)), ha="left", va="top",
-                     fontsize=9.5, color=TXT_DIM, fontfamily=DATA_FONT)
+def render_summary_card(recap: dict[str, Any], out_path: str, pages: int = 1) -> None:
+    stats, flows = recap["stats"], recap["flows"]
+    by_day: dict[date, list] = {}
+    for f in flows:
+        by_day.setdefault(f["alerted_at"].date(), []).append(f)
+    buckets = _outcome_buckets(flows)
+    nodata = [f for f in flows if not f["ok"]]
 
-            pct = _raw_move_pct(r)
-            row_cy = y + row_h / 2 - 0.11
+    H = 1.9 + 2.75 + (0.62 + len(by_day) * 0.52) + (0.62 + len(buckets) * 0.52 + (0.40 if nodata else 0)) + 0.95
+    fig, ax, T = _canvas(H)
 
-            # WIN/LOSS pill -- independent of the bar's color/sign below.
-            # This is the ONLY place trade outcome is shown; the bar to
-            # its right is purely about which way the stock itself moved.
-            if r["is_win"] is True:
-                pill_color, pill_label = GREEN, "WIN"
-            elif r["is_win"] is False:
-                pill_color, pill_label = RED, "LOSS"
-            else:
-                pill_color, pill_label = GRAY, "N/A"
-            ax.add_patch(FancyBboxPatch(
-                (pill_x0, row_cy - pill_h / 2), pill_w, pill_h,
-                boxstyle=f"round,pad=0,rounding_size={pill_h * 0.4}",
-                linewidth=0, facecolor=pill_color, zorder=4))
-            ax.text(pill_x0 + pill_w / 2, row_cy, pill_label, ha="center", va="center",
-                     fontsize=8, color="#0a0e1c", fontweight="bold", fontfamily=HEADER_FONT, zorder=5)
+    T(CENTER, 0.40, "WEEK IN FLOW", ha="center", fontsize=26, color=TXT_LIGHT, fontweight="bold", fontfamily=HEADER_FONT)
+    T(CENTER, 1.00, _range(recap), ha="center", fontsize=15, color=TXT_DIM, fontfamily=HEADER_FONT)
+    T(CENTER, 1.45, "The options flow we published this week,\nand how each contract traded afterward", ha="center",
+      fontsize=11.5, color=GRAY, fontfamily=HEADER_FONT, linespacing=1.4)
 
-            # Magnitude bar -- colored and signed by the ACTUAL stock
-            # move (green=up, red=down), never by win/loss. See
-            # _raw_move_pct()'s docstring for why these must stay separate.
-            if pct is not None:
-                bar_color = GREEN if pct >= 0 else RED
-                bw = max((abs(pct) / max_abs_pct) * bar_max_w, 0.06)
-                bar_h = 0.20
-                ax.add_patch(plt.Rectangle((bar_x0, row_cy - bar_h / 2), bw, bar_h,
-                                            facecolor=bar_color, edgecolor="none"))
-                pct_str = f"{pct:+.1f}%"
-                pct_color = bar_color
-            else:
-                pct_str = "N/A"
-                pct_color = GRAY
-            ax.text(RIGHT, row_cy, pct_str, ha="right", va="center",
-                     fontsize=10.5, color=pct_color, fontweight="bold", fontfamily=DATA_FONT)
-            y += row_h
+    tw, th, tg = (RIGHT - LEFT - 0.2) / 2, 1.25, 0.2
+    ty = 1.95
 
-    if n_winners:
-        draw_section("WINNERS", GREEN, winners)
-        y += gap_between_sections
-    if n_losers:
-        draw_section("LAGGARDS", RED, losers)
+    def tile(col, row):
+        x0, y0 = LEFT + col * (tw + tg), ty + row * (th + tg)
+        ax.add_patch(FancyBboxPatch((x0, y0), tw, th, boxstyle="round,pad=0,rounding_size=0.09",
+                                    linewidth=1, edgecolor=PANEL_BORDER, facecolor=PANEL_BG))
+        return x0 + tw / 2, y0
 
-    if remainder:
-        rem_wins = sum(1 for r in remainder if r["is_win"])
-        rem_avg = sum(r["pct_move_display"] for r in remainder) / len(remainder)
-        y += 0.10
-        ax.text(LEFT, y, f"+ {len(remainder)} other alert(s) this week \u2014 "
-                          f"{rem_wins}/{len(remainder)} favorable, avg {rem_avg:+.1f}%",
-                 ha="left", va="top", fontsize=9, color=TXT_DIM, fontfamily=DATA_FONT)
-        y += 0.30
+    cx, y0 = tile(0, 0)
+    T(cx, y0 + 0.15, str(stats["count"]), ha="center", fontsize=30, color=TXT_LIGHT, fontweight="bold", fontfamily=HEADER_FONT)
+    T(cx, y0 + 0.82, f"FLOWS PUBLISHED · {stats['unique_tickers']} TICKERS", ha="center", fontsize=9.5, color=TXT_DIM, fontweight="bold", fontfamily=HEADER_FONT)
+    cx, y0 = tile(1, 0)
+    T(cx, y0 + 0.15, _fmt_prem(stats["total_premium"]), ha="center", fontsize=30, color=TXT_LIGHT, fontweight="bold", fontfamily=HEADER_FONT)
+    T(cx, y0 + 0.82, "TOTAL PREMIUM IN THOSE FLOWS", ha="center", fontsize=9.5, color=TXT_DIM, fontweight="bold", fontfamily=HEADER_FONT)
 
-    if failed:
-        y += 0.05
-        for r in failed:
-            ax.text(LEFT, y, _esc(f"\u26a0 ${r['ticker']} \u00b7 no current quote available "
-                                    f"({r.get('fail_reason', 'unknown')})"),
-                     ha="left", va="top", fontsize=8.5, color=GRAY, fontfamily=DATA_FONT)
-            y += 0.26
+    cx, y0 = tile(0, 1)
+    tot = max(stats["call_premium"] + stats["put_premium"], 1)
+    bx0, bx1 = cx - tw / 2 + 0.3, cx + tw / 2 - 0.3
+    cw = (bx1 - bx0) * stats["call_premium"] / tot
+    T(cx, y0 + 0.13, f"{stats['calls']} calls  ·  {stats['puts']} puts", ha="center", fontsize=17, color=TXT_LIGHT, fontweight="bold", fontfamily=HEADER_FONT)
+    ax.add_patch(plt.Rectangle((bx0, y0 + 0.66), cw, 0.14, facecolor=CALL_HUE, edgecolor="none"))
+    ax.add_patch(plt.Rectangle((bx0 + cw, y0 + 0.66), (bx1 - bx0) - cw, 0.14, facecolor=PUT_HUE, edgecolor="none"))
+    T(cx, y0 + 0.90, f"BY PREMIUM  {stats['call_premium'] / tot * 100:.0f}% CALLS / {stats['put_premium'] / tot * 100:.0f}% PUTS",
+      ha="center", fontsize=9, color=TXT_DIM, fontweight="bold", fontfamily=HEADER_FONT)
 
-    footer_y = H - footer_h + 0.22
-    ax.text(CENTER, footer_y, "Spot price movement only \u2014 not option premium. Not financial advice.",
-             ha="center", va="top", fontsize=8.5, color=GRAY, fontfamily=HEADER_FONT)
+    cx, y0 = tile(1, 1)
+    mh, ml = stats["median_high_pct"], stats["median_low_pct"]
+    if mh is not None:
+        T(cx - 0.12, y0 + 0.17, _fmt_pct(mh), ha="right", fontsize=24, color=UP, fontweight="bold", fontfamily=HEADER_FONT)
+        T(cx, y0 + 0.17, "/", ha="center", fontsize=24, color=GRAY, fontfamily=HEADER_FONT)
+        T(cx + 0.12, y0 + 0.17, _fmt_pct(ml), ha="left", fontsize=24, color=DOWN, fontweight="bold", fontfamily=HEADER_FONT)
+    T(cx, y0 + 0.82, "TYPICAL HIGH / LOW AFTER PUBLISH", ha="center", fontsize=9.5, color=TXT_DIM, fontweight="bold", fontfamily=HEADER_FONT)
 
-    fig.savefig(out_path, facecolor=DARK_BG, dpi=200)
+    y = ty + 2 * th + tg + 0.40
+    # flows by day --------------------------------------------------------------
+    T(LEFT, y, "FLOWS PUBLISHED BY DAY", fontsize=12, color=TXT_LIGHT, fontweight="bold", fontfamily=HEADER_FONT)
+    y += 0.50
+    max_n = max((len(v) for v in by_day.values()), default=1)
+    bar_x0, bar_max = LEFT + 1.55, 2.9
+    for d in sorted(by_day):
+        fs = by_day[d]
+        T(LEFT, y, d.strftime("%a %b %d"), fontsize=12, color=TXT_LIGHT, fontfamily=DATA_FONT)
+        ax.add_patch(plt.Rectangle((bar_x0, y + 0.03), max(len(fs) / max_n * bar_max, 0.05), 0.24, facecolor=CALL_HUE, edgecolor="none", alpha=0.85))
+        T(bar_x0 + len(fs) / max_n * bar_max + 0.12, y, f"{len(fs)} · {_fmt_prem(sum(f['premium'] for f in fs))}",
+          fontsize=11.5, color=TXT_DIM, fontfamily=DATA_FONT)
+        y += 0.52
+    y += 0.30
+    # where contracts stood ------------------------------------------------------
+    T(LEFT, y, "WHERE THE CONTRACTS STOOD AT WEEK’S END", fontsize=12, color=TXT_LIGHT, fontweight="bold", fontfamily=HEADER_FONT)
+    y += 0.50
+    max_c = max((c for _, c, _ in buckets), default=1) or 1
+    bar_x0, bar_max = LEFT + 3.05, 2.6
+    for label, count, color in buckets:
+        T(LEFT, y, label, fontsize=11.5, color=TXT_LIGHT, fontfamily=HEADER_FONT)
+        if count:
+            ax.add_patch(plt.Rectangle((bar_x0, y + 0.03), count / max_c * bar_max, 0.24, facecolor=color, edgecolor="none", alpha=0.9))
+        T(bar_x0 + (count / max_c * bar_max if count else 0) + 0.12, y, str(count), fontsize=12, color=TXT_DIM, fontweight="bold", fontfamily=DATA_FONT)
+        y += 0.52
+    if nodata:
+        T(LEFT, y + 0.02, f"+ {len(nodata)} flow(s) with no trades since being published", fontsize=10.5, color=GRAY, fontfamily=HEADER_FONT)
+
+    _footer(T, ax, H, f"Summary · flow-by-flow detail on the next {pages - 1} page{'s' if pages != 2 else ''}" if pages > 1 else "Summary")
+    fig.savefig(out_path, facecolor=DARK_BG, dpi=DPI)
     plt.close(fig)
+
+
+def render_detail_page(recap: dict[str, Any], flows: list[dict], page_no: int, pages: int, out_path: str) -> None:
+    head = 1.55
+    H = head + len(flows) * ROW_H + 0.85
+    fig, ax, T = _canvas(H)
+    T(LEFT, 0.28, "WEEK IN FLOW", fontsize=15, color=TXT_LIGHT, fontweight="bold", fontfamily=HEADER_FONT)
+    T(LEFT, 0.62, _range(recap), fontsize=10.5, color=TXT_DIM, fontfamily=HEADER_FONT)
+    T(RIGHT, 0.28, f"Page {page_no} of {pages}", ha="right", fontsize=11, color=TXT_DIM, fontfamily=HEADER_FONT)
+
+    SP_X0, SP_X1 = LEFT + 0.22, LEFT + 3.25
+    COL = [LEFT + 4.05, LEFT + 5.25, LEFT + 6.45]
+    ly = 1.00
+    ax.plot([SP_X0, SP_X0 + 0.28], [ly + 0.07, ly + 0.07], color=GRAY, linewidth=1, linestyle=(0, (3, 2)))
+    T(SP_X0 + 0.34, ly - 0.02, "price when published", fontsize=8.8, color=TXT_DIM, fontfamily=HEADER_FONT)
+    T(SP_X0, ly + 0.24, "PRICE PATH SINCE FLOW PUBLISHED", fontsize=8.5, color=GRAY, fontweight="bold", fontfamily=HEADER_FONT)
+    for cx, lab in zip(COL, ("HIGH", "LOW", "LAST")):
+        T(cx, ly + 0.24, lab, ha="center", fontsize=9, color=GRAY, fontweight="bold", fontfamily=HEADER_FONT)
+    ax.plot([LEFT, RIGHT], [head - 0.12, head - 0.12], color=PANEL_BORDER, linewidth=1)
+
+    y = head
+    for f in flows:
+        _draw_row(ax, T, f, y, SP_X0, SP_X1, COL)
+        y += ROW_H
+    _footer(T, ax, H, f"Page {page_no} of {pages}")
+    fig.savefig(out_path, facecolor=DARK_BG, dpi=DPI)
+    plt.close(fig)
+
+
+def _draw_row(ax, T, f, y, SP_X0, SP_X1, COL):
+    ax.add_patch(FancyBboxPatch((LEFT, y), RIGHT - LEFT, ROW_H - 0.14, boxstyle="round,pad=0,rounding_size=0.07",
+                                linewidth=0, facecolor=PANEL_BG, zorder=0))
+    cp = f["put_call"] or "?"
+    hue = CALL_HUE if cp == "CALL" else PUT_HUE if cp == "PUT" else GRAY
+    ax.plot([LEFT + 0.02, LEFT + 0.02], [y + 0.08, y + ROW_H - 0.22], color=hue, linewidth=3.5, solid_capstyle="butt")
+    k = _fmt_strike(f["strike"]) if f.get("strike") is not None else "?"
+    exp = f["expiry"].strftime("%b %d") if f.get("expiry") else "?"
+    T(LEFT + 0.22, y + 0.10, f"${f['ticker']}", fontsize=16, color=TXT_LIGHT, fontweight="bold", fontfamily=DATA_FONT)
+    T(LEFT + 1.55, y + 0.14, f"{cp} {k} · {exp}", fontsize=12.5, color=hue, fontweight="bold", fontfamily=DATA_FONT)
+    T(RIGHT - 0.18, y + 0.14, f"{_fmt_prem(f['premium'])} flow", ha="right", fontsize=12.5, color=TXT_LIGHT, fontweight="bold", fontfamily=DATA_FONT)
+    sub = f"{_clock(f['alerted_at'])}"
+    if f.get("alert_px") is not None:
+        sub += f" · {_fmt_px(f['alert_px'])} when published"
+    T(LEFT + 0.22, y + 0.47, sub, fontsize=10.5, color=TXT_DIM, fontfamily=DATA_FONT)
+    if f.get("spot_chg_pct") is not None:
+        T(RIGHT - 0.18, y + 0.47, f"stock {f['spot_chg_pct']:+.1f}%", ha="right", fontsize=10.5, color=GRAY, fontfamily=DATA_FONT)
+
+    if not f["ok"]:
+        T((LEFT + RIGHT) / 2, y + 0.90, f.get("reason") or "no contract data", ha="center", fontsize=10.5, color=GRAY, fontfamily=DATA_FONT)
+        return
+
+    pts = f["path_pct"]
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    lo_v, hi_v = min(min(ys), -12.0), max(max(ys), 12.0)
+    pad = (hi_v - lo_v) * 0.08
+    lo_v, hi_v = lo_v - pad, hi_v + pad
+    top, bot = y + 0.82, y + ROW_H - 0.28
+    xmax = max(xs[-1], 1.0)
+    mx = lambda x: SP_X0 + (x / xmax) * (SP_X1 - SP_X0)
+    my = lambda v: bot - (v - lo_v) / (hi_v - lo_v) * (bot - top)
+    base_y = my(0.0)
+    ax.plot([SP_X0, SP_X1], [base_y, base_y], color=GRAY, linewidth=0.9, linestyle=(0, (3, 2)), zorder=2)
+    sx, sy = [mx(xs[0])], [my(ys[0])]
+    for (x0_, y0_), (x1_, y1_) in zip(pts, pts[1:]):
+        sx += [mx(x1_), mx(x1_)]
+        sy += [my(y0_), my(y1_)]
+    color = UP if ys[-1] >= 0 else DOWN
+    ax.fill_between(sx, sy, base_y, color=color, alpha=0.17, linewidth=0, zorder=2)
+    ax.plot(sx, sy, color=color, linewidth=2.0, zorder=3, solid_joinstyle="miter")
+    hi_i, lo_i = int(np.argmax(ys)), int(np.argmin(ys))
+    ax.scatter([mx(xs[hi_i])], [my(ys[hi_i])], s=26, color=UP, zorder=4, edgecolors=DARK_BG, linewidths=0.8)
+    ax.scatter([mx(xs[lo_i])], [my(ys[lo_i])], s=26, color=DOWN, zorder=4, edgecolors=DARK_BG, linewidths=0.8)
+
+    vals = [(f["high_pct"], f["high_px"]), (f["low_pct"], f["low_px"]), (f["last_pct"], f["last_px"])]
+    for i, (cx, (pc, px)) in enumerate(zip(COL, vals)):
+        c = UP if pc > 0.05 else DOWN if pc < -0.05 else TXT_DIM
+        T(cx, y + 0.84, _fmt_pct(pc), ha="center", fontsize=15, color=c, fontweight="bold", fontfamily=DATA_FONT)
+        sub = _fmt_px(px)
+        if i == 2 and f["expired"]:
+            sub = "expired " + sub
+        T(cx, y + 1.12, sub, ha="center", fontsize=9.5, color=TXT_DIM, fontfamily=DATA_FONT)
+
+
+def render_weekly_recap_cards(recap: dict[str, Any], out_dir: str) -> list[str]:
+    """Render the summary page + detail pages (ROWS_PER_PAGE flows each, chronological).
+    Returns the PNG paths in posting order."""
+    os.makedirs(out_dir, exist_ok=True)
+    flows = sorted(recap["flows"], key=lambda f: f["alerted_at"])
+    chunks = [flows[i:i + ROWS_PER_PAGE] for i in range(0, len(flows), ROWS_PER_PAGE)]
+    pages = 1 + len(chunks)
+    paths = [os.path.join(out_dir, "recap_00_summary.png")]
+    render_summary_card(recap, paths[0], pages)
+    for n, chunk in enumerate(chunks, start=1):
+        pth = os.path.join(out_dir, f"recap_{n:02d}_flows.png")
+        render_detail_page(recap, chunk, n + 1, pages, pth)
+        paths.append(pth)
+    return paths
 
 
 # ---------------------------------------------------------------------------
 # Posting
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# HOTFIX (2026-09-07): post_weekly_recap() was removed in the visual
-# redesign in favor of post_weekly_recap_image(), but main.py's
-# top-level `from weekly_recap import build_weekly_recap,
-# post_weekly_recap` is a MODULE-LEVEL import -- its absence crashed
-# uvicorn at boot, taking down the entire service, not just the weekly
-# recap feature. Restoring this function (old plain-text behavior)
-# immediately unblocks the service from crashing on startup while
-# main.py itself gets updated to call render_weekly_recap_card() +
-# post_weekly_recap_image() instead. DELETE this function once main.py
-# is confirmed updated -- it exists only to prevent an import crash,
-# not because the plain-text format is coming back on purpose.
-# ---------------------------------------------------------------------------
-
 async def post_weekly_recap(webhook_url: str, message: str) -> bool:
-    """DEPRECATED -- old plain-text poster, kept temporarily so an
-    unmigrated caller's import doesn't crash the whole service. See
-    post_weekly_recap_image() for the current image-card version."""
+    """DEPRECATED plain-text poster, kept only so an old import can't crash the service."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(webhook_url, json={"content": message})
     return resp.status_code in (200, 204)
 
 
 async def post_weekly_recap_image(webhook_url: str, image_path: str, caption: str) -> bool:
-    """
-    Posts the rendered recap card + a short caption. Replaces the old
-    post_weekly_recap() (plain-text message) -- per the 2026-09-07
-    visual redesign, the detail lives in the image now, so the message
-    itself only needs the one-line headline the caption already is.
-    """
-    with open(image_path, "rb") as f:
-        files = {"file": ("weekly_recap.png", f, "image/png")}
-        data = {"content": caption}
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(webhook_url, data=data, files=files)
-    return resp.status_code in (200, 204)
+    """Posts one rendered card + a short caption (kept for compatibility)."""
+    return await post_weekly_recap_images(webhook_url, [image_path], caption)
+
+
+async def post_weekly_recap_images(webhook_url: str, image_paths: list[str], caption: str) -> bool:
+    """Posts the cards in order, up to 10 per Discord message (caption on the first message)."""
+    ok = True
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for n in range(0, len(image_paths), 10):
+            batch = image_paths[n:n + 10]
+            handles = [open(p, "rb") for p in batch]
+            try:
+                files = {f"files[{i}]": (os.path.basename(p), h, "image/png") for i, (p, h) in enumerate(zip(batch, handles))}
+                content = caption if n == 0 else "*Week in Flow — continued*"
+                resp = await client.post(webhook_url, data={"content": content}, files=files)
+            finally:
+                for h in handles:
+                    h.close()
+            ok = ok and resp.status_code in (200, 204)
+    return ok

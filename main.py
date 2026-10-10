@@ -14,7 +14,7 @@ from models import FlowAlert
 from scoring import auto_score_alert
 from flow_filters import filter_flow_items, is_high_conviction, MAX_DTE_DAYS
 from market_hours import is_market_open, market_closed_reason, is_trading_day, MARKET_OPEN, MARKET_CLOSE, EASTERN
-from weekly_recap import build_weekly_recap, render_weekly_recap_card, post_weekly_recap_image
+from weekly_recap import build_weekly_recap, render_weekly_recap_cards, post_weekly_recap_images, alpaca_configured
 from flow_heatmap import heatmap_job
 from enrichment import enrich_alert, enrichment_summary, compute_levels
 from classifier import classify_alert
@@ -513,20 +513,20 @@ async def weekly_recap_job():
     if not DISCORD_WEBHOOK_URL:
         logger.warning("weekly_recap_skipped reason=DISCORD_WEBHOOK_URL_missing")
         return
-    if not FINNHUB_API_KEY:
-        logger.warning("weekly_recap_skipped reason=FINNHUB_API_KEY_missing")
+    if not alpaca_configured():
+        logger.warning("weekly_recap_skipped reason=ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY_missing")
         return
 
     try:
-        recap = build_weekly_recap(api_key=FINNHUB_API_KEY)
+        recap = await asyncio.to_thread(build_weekly_recap, api_key=FINNHUB_API_KEY or "")
     except Exception as e:
         logger.exception("weekly_recap_build_failed error=%s", str(e))
         return
 
     logger.info(
-        "weekly_recap_built window=%s_to_%s total=%d resolved=%d failed=%d",
+        "weekly_recap_built window=%s_to_%s total=%d with_contract_data=%d",
         recap["start_date"], recap["end_date"],
-        recap["total_alerts"], recap["resolved_count"], recap["failed_count"],
+        recap["total_alerts"], recap["stats"]["with_data"],
     )
 
     if recap["total_alerts"] == 0:
@@ -534,17 +534,13 @@ async def weekly_recap_job():
         return
 
     try:
-        import os, tempfile
-        fd, card_path = tempfile.mkstemp(suffix=".png", prefix="weekly_recap_")
-        os.close(fd)
+        import shutil, tempfile
+        card_dir = tempfile.mkdtemp(prefix="weekly_recap_")
         try:
-            render_weekly_recap_card(recap, card_path)
-            posted = await post_weekly_recap_image(DISCORD_WEBHOOK_URL, card_path, recap["caption"])
+            card_paths = render_weekly_recap_cards(recap, card_dir)
+            posted = await post_weekly_recap_images(DISCORD_WEBHOOK_URL, card_paths, recap["caption"])
         finally:
-            try:
-                os.remove(card_path)
-            except OSError:
-                pass
+            shutil.rmtree(card_dir, ignore_errors=True)
     except Exception as e:
         logger.exception("weekly_recap_post_failed error=%s", str(e))
         return
