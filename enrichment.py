@@ -32,7 +32,7 @@ JARVIS_API_KEY = os.getenv("JARVIS_API_KEY")
 JARVIS_MCP_URL = "https://api.jarvisflow.io/.well-known/mcp"
 
 # Tickers confirmed (via direct API check) to return no candle data from
-# JarvisFlow's get_candle_stick_data_for_ticker — likely ETF tickers
+# JarvisFlow's get_daily_candle_stick_data_for_ticker — likely ETF tickers
 # aren't covered by this tool even though individual stocks are, and even
 # though SPY/QQQ ARE covered by the options-flow tool. Checked first to
 # skip a guaranteed-empty network call rather than wait on it.
@@ -221,7 +221,7 @@ def _fetch_latest_candle(ticker: str) -> dict | None:
     payload = {
         "jsonrpc": "2.0", "id": 1,
         "method": "tools/call",
-        "params": {"name": "get_candle_stick_data_for_ticker", "arguments": {"ticker": ticker}},
+        "params": {"name": "get_daily_candle_stick_data_for_ticker", "arguments": {"ticker": ticker}},
     }
     try:
         # Short timeout — this call happens inside the live polling loop
