@@ -222,6 +222,16 @@ changed -- main() is byte-for-byte the same function.
   * An exception inside the job is logged and swallowed (exit code 0)
     so Railway's restart-on-failure policy can never re-run the job
     and double-post to subscribers midway through a partial failure.
+
+CHART / READ REDESIGN (2026-10-11, NOT YET LIVE -- off unless the env flags below are set on the bmt-trade-ideas service):
+  NEW_CHARTS=1  hourly chart (setup_chart.py + setup_market.py): 1h candles from Alpaca 1-minute IEX bars (needs ALPACA_API_KEY_ID and
+                ALPACA_API_SECRET_KEY on the service), EMA 34/50 cloud, volume by price, prior-day levels, relative strength vs SPY, call/put wall,
+                max pain, expected move for the idea's expiry, the flow print behind the pick, entry/stop/targets, plain-English notes.
+  NEW_READ=1    roles + risk label computed in code (setup_roles.py), ONE validated 2-sentence read per setup from x-ai/grok-4.3 with the chart
+                attached (setup_read.py; deterministic fallback), one-embed-per-setup card (setup_embed.py). Optional READ_MODEL overrides the model.
+  setup_pipeline.prepare() glues them in and is wrapped in try/except: if it crashes, this run uses the old narrative + daily chart.
+  Selection, ranking, filters, strike/expiry, levels, scoring, DB saves and the idea log are untouched. Dry run (posts nothing):
+  python setup_dryrun.py. Tests: python -m pytest tests.
 """
 
 import os
@@ -559,7 +569,20 @@ def get_flow_for_ticker(ticker: str, session_date_mdy: str = None) -> dict:
         return {"bias": None, "premium": 0, "call_pct": None}
     call_pct = round(total_call / total * 100)
     bias = "Bullish" if call_pct > 55 else "Bearish" if call_pct < 45 else "Neutral"
-    return {"bias": bias, "premium": total, "call_pct": call_pct}
+    # NEW (chart/read redesign): remember the single largest bought print on the idea's own side so the chart can show the flow behind the
+    # pick. Extra key only -- bias/premium/call_pct above are computed exactly as before, so selection and ranking are unchanged.
+    top_print = None
+    try:
+        want = "CALL" if bias == "Bullish" else "PUT" if bias == "Bearish" else None
+        side = [f for f in bought_otm_atm if f.get("put_Or_Call") == want] if want else []
+        if side:
+            best = max(side, key=lambda f: float(f.get("total_Option_Premium_For_Trade", 0) or 0))
+            top_print = {"strike": float(best["strike_Price"]), "kind": "calls" if want == "CALL" else "puts", "side": "bought",
+                         "amount": int(float(best["total_Option_Premium_For_Trade"])), "order": (best.get("sweep_Or_Block") or "").lower(),
+                         "expiry": str(best["expriation_Date"])[:10], "date": str(best["transaction_DateTime"])[:10]}
+    except (KeyError, ValueError, TypeError):
+        top_print = None
+    return {"bias": bias, "premium": total, "call_pct": call_pct, "top_print": top_print}
 
 
 def get_daily_ohlc(ticker: str, sessions: int = 15) -> list:
@@ -2297,6 +2320,7 @@ def main():
         finnhub_er = earnings_map.get(c["ticker"])
         er_dates = [d for d in (yf_er, finnhub_er) if d]
         er_date = min(er_dates) if er_dates else None
+        c["er_date"] = er_date          # presentation only (chart earnings marker); the exclusion below is unchanged
         if er_date:
             if c.get("expiry_iso"):
                 blocks = er_date <= c["expiry_iso"]
@@ -2397,8 +2421,32 @@ def main():
         print(f"  {c['ticker']}: {c['time_pressure']['summary']} | {c['analyst_target']}")
         print(f"    tech: {c['tech_detail']}")
 
-    print(f"\nGenerating narrative content for {len(selected)} setup(s) (locked embed format)...")
-    narrative_result = write_setup_narratives(selected, market_context, target_date)
+    # NEW (chart/read redesign), behind env flags so it can be A/B'd and rolled back without a code change:
+    #   NEW_CHARTS=1 -> hourly chart (setup_chart.py) instead of the daily one
+    #   NEW_READ=1   -> roles + risk computed in code, one validated read per setup, new embed (setup_read.py / setup_roles.py / setup_embed.py)
+    # Nothing in this block changes selection, ranking, strikes, levels, the DB save or the idea log.
+    use_new_charts = os.environ.get("NEW_CHARTS") == "1"
+    use_new_read = os.environ.get("NEW_READ") == "1"
+    new_result = None
+    if use_new_charts or use_new_read:
+        print(f"\nNew chart/read pipeline (NEW_CHARTS={int(use_new_charts)}, NEW_READ={int(use_new_read)})...")
+        try:
+            import setup_pipeline
+            new_result = setup_pipeline.prepare(selected, market_context, data_date.date(), tone_fn=get_tone_phrase,
+                                                want_chart=True, want_read=use_new_read, api_key=OPENROUTER_API_KEY)
+        except Exception:
+            print("  [NEW PIPELINE ERROR] using the existing narrative/chart path for this run instead:")
+            traceback.print_exc()
+            use_new_charts = use_new_read = False
+            new_result = None
+
+    if use_new_read and new_result:
+        print("\nNarrative: NEW_READ=1 -- per-setup reads already written; skipping the combined narrative call.")
+        narrative_result = {"market_backdrop": new_result["market_backdrop"] or "", "top_pick_ticker": new_result["top_pick_ticker"],
+                            "top_pick_why": new_result["top_pick_why"] or "", "setups": {}}
+    else:
+        print(f"\nGenerating narrative content for {len(selected)} setup(s) (locked embed format)...")
+        narrative_result = write_setup_narratives(selected, market_context, target_date)
 
     all_tickers = [c["ticker"] for c in selected] + list(MARKET_CONTEXT_TICKERS)
     market_backdrop = clean_text_field(narrative_result.get("market_backdrop", ""), all_tickers)
@@ -2427,6 +2475,12 @@ def main():
     # mapping or leave a field blank.
     used_roles = set()
     for c in selected:
+        if use_new_read and new_result:
+            # roles/risk/read were set in code by setup_pipeline.prepare(); the model never writes them
+            if c.get("read"):
+                c["read"] = clean_text_field(c["read"], all_tickers)
+            print(f"  {c['ticker']}: {c['role']} | {c['risk']}")
+            continue
         s = setups_by_ticker.get(c["ticker"].upper(), {})
         if not s:
             print(f"  [NARRATIVE WARN] {c['ticker']}: no matching entry in model's 'setups' output "
@@ -2466,6 +2520,13 @@ def main():
         # chart's RSI/EMA/RVOL/Fib numbers are computed from the exact
         # same bars the write-up above already cited, not a second,
         # separately-fetched set that could theoretically differ.
+        if use_new_charts:
+            if c.get("_new_chart_path"):
+                c["_chart_path"] = c["_new_chart_path"]
+                print(f"  {c['ticker']}: new hourly chart at {c['_chart_path']}")
+            else:
+                print(f"  {c['ticker']}: no new chart available -- the card will post without a chart image")
+            continue
         chart_path = f"chart_{c['ticker']}.png"
         render_setup_chart(c, chart_path)
         c["_chart_path"] = chart_path
@@ -2479,8 +2540,15 @@ def main():
     print("Posting each setup, immediately followed by its own chart...")
     posted_all_setups = True
     for i, c in enumerate(selected):
-        setup_embed = build_setup_embed(c, rank=i + 1, is_top_pick=(c["ticker"] == top_pick_ticker))
-        ok = post_setup_with_chart(setup_embed, c["_chart_path"], c["ticker"], c["risk"])
+        if use_new_read and new_result:
+            from setup_embed import build_setup_embed_v2
+            setup_embed = build_setup_embed_v2(c, i + 1, c["ticker"] == top_pick_ticker, RISK_COLOR_MAP.get(c["risk"], COLOR_NEUTRAL))
+        else:
+            setup_embed = build_setup_embed(c, rank=i + 1, is_top_pick=(c["ticker"] == top_pick_ticker))
+        if c.get("_chart_path"):
+            ok = post_setup_with_chart(setup_embed, c["_chart_path"], c["ticker"], c["risk"])
+        else:
+            ok = post_embeds_to_discord([setup_embed])
         posted_all_setups = posted_all_setups and ok
 
     print("Posting contract list...")
