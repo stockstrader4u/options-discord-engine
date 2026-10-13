@@ -171,5 +171,8 @@ def test_right_axis_tags_are_only_stop_targets_and_the_two_walls(monkeypatch, tm
     real_close(seen["fig"])
     ax = seen["fig"].axes[0]
     tags = [t.get_text() for t in ax.texts if abs(t.get_position()[0] - (sc.N + 20.4)) < 1e-6]
+    last_tag = f"{float(BARS['NVDA'].Close.iloc[-1]):,.2f}"
+    assert last_tag in tags                                      # the dark last-price tag
+    tags = [t for t in tags if t != last_tag]
     assert len(tags) == 5, tags
     assert sorted(tg.split()[0] + (" " + tg.split()[1] if tg.startswith(("Call", "Put")) else "") for tg in tags) == ["Call wall", "Put wall", "STOP", "T1", "T2"]

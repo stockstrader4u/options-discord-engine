@@ -102,8 +102,9 @@ def compute_metrics(c: dict, df, spy, opts, earn, bet, session_day: dt.date, ben
             exp_d = None
 
     ext = [p for p in ([cw[0]] if cw and near(cw[0]) else []) + ([pw[0]] if pw and near(pw[0]) else []) + ([mp] if near(mp) else []) +
-           ([em_lo, em_hi] if em else []) + ([bet["strike"]] if bet and near(bet["strike"]) else [])]
-    ymin, ymax = min(prices + trade + ext + [lo]), max(prices + trade + ext + [hi])
+           ([bet["strike"]] if bet and near(bet["strike"]) else [])]
+    # fib levels (extensions) and the expected-move band no longer stretch the axis: they clip at the edge, so no dead space above/below the candles
+    ymin, ymax = min(trade + ext + [lo]), max(trade + ext + [hi])
 
     # volume by price
     bins = np.linspace(lo, hi, 31)
@@ -513,7 +514,7 @@ def render(m: M, notes: list, out_path, dpi: int = 110) -> None:
         ax.axhspan(m.em_lo, m.em_hi, color=EMC, alpha=.07, lw=0, zorder=0)
         for p in (m.em_lo, m.em_hi):
             ax.axhline(p, color=EMC, lw=.9, ls=(0, (1, 2)), alpha=.9, zorder=1)
-        ax.text(.8, m.em_lo, f"options-implied range to {exp_d.strftime('%b %d')}: {m.em_lo:,.2f} to {m.em_hi:,.2f}", color=EMC, fontsize=7, va="top", ha="left",
+        ax.text(.8, max(m.em_lo, ylo + vol_h * 1.25), f"options-implied range to {exp_d.strftime('%b %d')}: {m.em_lo:,.2f} to {m.em_hi:,.2f}", color=EMC, fontsize=7, va="top" if m.em_lo >= ylo + vol_h * 1.25 else "bottom", ha="left",
                 fontweight="bold", zorder=4, bbox=dict(fc=BG, ec="none", pad=.5, alpha=.8))
 
     # volume by price
@@ -577,9 +578,13 @@ def render(m: M, notes: list, out_path, dpi: int = 110) -> None:
                 tags.append([val, val, f"{nm}  {val:,.2f}", col, "key"])
     if bet and m.near(bet["strike"]):
         ax.axhline(bet["strike"], color=BETC, lw=1.1, ls=(0, (2, 2)), alpha=.75, zorder=4)
+    tags.append([last, last, f"{last:,.2f}", TXT, "last"])
     _spread(tags, yr * .029, ylo + yr * .012, yhi - yr * .012)
     for p, ty, txt, col, kind in tags:
-        if kind == "idea":
+        if kind == "last":
+            bb = dict(boxstyle="round,pad=0.25", fc=TXT, ec="none")
+            tc, fw = "white", "bold"
+        elif kind == "idea":
             bb = dict(boxstyle="round,pad=0.25", fc=BG, ec=col, lw=1.4)
             tc, fw = col, "bold"
         else:
@@ -640,6 +645,7 @@ def render(m: M, notes: list, out_path, dpi: int = 110) -> None:
         av.fill_between(x, r, 100, where=r >= 100, color=UP, alpha=.2, lw=0, interpolate=True)
         av.fill_between(x, r, 100, where=r < 100, color=DN, alpha=.2, lw=0, interpolate=True)
         av.axhline(100, color=MUTE, lw=.6, ls=(0, (3, 3)))
+        av.set_yticks([100])
         lo_r, hi_r = min(r.min(), 100), max(r.max(), 100)
         pad_r = max(hi_r - lo_r, 0.5)
         av.set_ylim(lo_r - pad_r * .1, hi_r + pad_r * .55)
