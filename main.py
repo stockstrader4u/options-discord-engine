@@ -514,7 +514,7 @@ async def weekly_recap_job():
         logger.warning("weekly_recap_skipped reason=DISCORD_WEBHOOK_URL_missing")
         return
     if not alpaca_configured():
-        logger.warning("weekly_recap_skipped reason=ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY_missing")
+        logger.error("weekly_recap_skipped reason=ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY_missing")
         return
 
     try:
@@ -648,6 +648,8 @@ async def lifespan(app: FastAPI):
             len(WATCHLIST), ALERT_POLL_MODE, POLL_INTERVAL_SECONDS, DEDUPE_WINDOW_MINUTES, JARVIS_CONCURRENCY, DEDUPE_PREMIUM_MULTIPLIER,
         )
         logger.info("weekly_recap_job_registered fri_16:32_ET finnhub_configured=%s", bool(FINNHUB_API_KEY))
+        if not alpaca_configured():
+            logger.error("weekly_recap_WILL_NOT_POST ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY not set on this service")
         logger.info("heatmap_job_registered mon-fri_16:30_ET webhook_configured=%s", bool(HEATMAP_WEBHOOK_URL))
         logger.info("daily_flow_summary_job_registered mon-fri_16:35_ET")
     else:
