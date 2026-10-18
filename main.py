@@ -68,7 +68,7 @@ DEDUPE_WINDOW_MINUTES = int(os.getenv("DEDUPE_WINDOW_MINUTES", "30"))
 DEDUPE_PREMIUM_MULTIPLIER = float(os.getenv("DEDUPE_PREMIUM_MULTIPLIER", "2.0"))
 ALERT_FORMAT_MODE = os.getenv("ALERT_FORMAT_MODE", "subscriber")
 WEEKLY_RECAP_ENABLED = os.getenv("WEEKLY_RECAP_ENABLED", "false").lower() == "true"
-# Where the 3:30 PM $1M+ flow report card posts; falls back to the main subscriber webhook.
+# Where the 4:32 PM $1M+ flow report card posts; falls back to the main subscriber webhook.
 BIG_FLOW_WEBHOOK_URL = os.getenv("BIG_FLOW_WEBHOOK_URL") or None
 WATCHLIST = {
     "DDOG","MDB","ANET","TWLO","CRM","UBER","NFLX","NVDA","AAPL","TSLA",
@@ -633,11 +633,14 @@ async def expiry_results_job():
 
 async def big_flow_report_job():
     """
-    3:30 PM ET "$1M+ Flow Report Card": every out-of-the-money, BOUGHT print of $1M+ premium JarvisFlow saw
-    today, market-wide (no watchlist or expiry filter), with how each contract has traded since. One JarvisFlow
-    call, priced from Alpaca option bars. Posts nothing if no flow qualified. See big_flow_report.py.
+    4:32 PM ET "$1M+ Flow Card" (between the 4:30 heatmap and the 4:35 flow summary): every out-of-the-money, BOUGHT print of $1M+ premium JarvisFlow saw today,
+    market-wide (no watchlist or expiry filter), as one image with a row per stock and the options details of
+    its largest print. One JarvisFlow call plus one Alpaca stock-price lookup. Posts nothing if no flow
+    qualified. A flow card only: no performance. See big_flow_report.py.
     """
     now_et = datetime.now(EASTERN)
+    # the card covers the regular session: the cutoff is the close, even though the job runs after it
+    now_et = min(now_et, now_et.replace(hour=16, minute=0, second=0, microsecond=0))
     if not is_trading_day(now_et.date()):
         logger.info("big_flow_report_skipped reason=not_a_trading_day")
         return
@@ -645,10 +648,6 @@ async def big_flow_report_job():
     if not webhook:
         logger.warning("big_flow_report_skipped reason=webhook_missing")
         return
-    if not alpaca_configured():
-        logger.error("big_flow_report_skipped reason=ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY_missing")
-        return
-
     try:
         items = await fetch_big_flows(now_et.date(), now_et, JARVIS_API_KEY or "")
     except Exception as e:
@@ -659,12 +658,12 @@ async def big_flow_report_job():
         return
 
     try:
-        report = await asyncio.to_thread(build_big_flow_report, items, now_et.date(), now_et, FINNHUB_API_KEY or "")
+        report = await asyncio.to_thread(build_big_flow_report, items, now_et.date(), now_et)
     except Exception as e:
         logger.exception("big_flow_report_build_failed error=%s", str(e))
         return
-    logger.info("big_flow_report_built flows=%d priced=%d total_premium=%d",
-                report["stats"]["count"], report["stats"]["with_data"], report["stats"]["total_premium"])
+    logger.info("big_flow_report_built flows=%d stocks=%d total_premium=%d",
+                report["stats"]["count"], report["stats"]["unique_tickers"], report["stats"]["total_premium"])
 
     import shutil, tempfile
     card_dir = tempfile.mkdtemp(prefix="big_flow_")
@@ -776,7 +775,7 @@ async def lifespan(app: FastAPI):
         )
         scheduler.add_job(
             big_flow_report_job, "cron",
-            day_of_week="mon-fri", hour=15, minute=30, timezone="America/New_York",
+            day_of_week="mon-fri", hour=16, minute=32, timezone="America/New_York",
             id="big_flow_report", replace_existing=True, max_instances=1,
             misfire_grace_time=600,
         )
@@ -801,7 +800,7 @@ async def lifespan(app: FastAPI):
                     bool(FINNHUB_API_KEY), WEEKLY_RECAP_ENABLED)
         if not alpaca_configured():
             logger.error("expiry_results_WILL_NOT_POST ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY not set on this service")
-        logger.info("big_flow_report_job_registered mon-fri_15:30_ET webhook=%s",
+        logger.info("big_flow_report_job_registered mon-fri_16:32_ET webhook=%s",
                     "BIG_FLOW_WEBHOOK_URL" if BIG_FLOW_WEBHOOK_URL else "DISCORD_WEBHOOK_URL")
         logger.info("heatmap_job_registered mon-fri_16:30_ET webhook_configured=%s", bool(HEATMAP_WEBHOOK_URL))
         logger.info("daily_flow_summary_job_registered mon-fri_16:35_ET")

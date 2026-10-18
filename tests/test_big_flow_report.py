@@ -1,11 +1,13 @@
 """
-Tests for the 3:30 PM ET $1M+ Flow Report Card: which prints qualify, the 300-row completeness guard, pricing and
-rendering, and the scheduled job. No network, no Discord, no DB.
+Tests for the post-close $1M+ Flow Card (a flow card, not a performance card): which prints qualify, the 300-row
+completeness guard, the options-specific figures (DTE, OTM, breakeven, volume vs open interest, running totals),
+grouping by stock, the one-image render, the stock-price lookup, and the scheduled job.
+No network, no Discord, no DB.
 """
 import asyncio
 import os
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -14,17 +16,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import big_flow_report as b
 
+_REAL_FETCH_STOCK_PRICES = b.fetch_stock_prices      # saved before the autouse stub replaces it
+
 ET = ZoneInfo("America/New_York")
 DAY = date(2026, 10, 16)
 NOW = datetime(2026, 10, 16, 15, 30, tzinfo=ET)
 
 
 def item(ticker="SPY", premium=1_500_000, pc="PUT", strike=700, expiry="2026-11-20T00:00:00", t="2026-10-16T13:09:00",
-         money="OTM", side="BOUGHT", day_total=None):
+         money="OTM", side="BOUGHT", day_total=None, spot=720.0, paid=3.0, size=5000, vol=9000, oi=3000, kind="SWEEP"):
     return {"ticker": ticker, "put_Or_Call": pc, "strike_Price": strike, "expriation_Date": expiry, "moneyNess": money,
             "implied_Bought_Or_Sold": side, "total_Option_Premium_For_Trade": premium, "transaction_DateTime": t,
             "total_Option_Premium_for_Same_Contract_Today": day_total if day_total is not None else premium,
-            "sweep_Or_Block": "SWEEP", "spot_Price": 690.0, "price_Of_Contract": 3.0}
+            "sweep_Or_Block": kind, "spot_Price": spot, "price_Of_Contract": paid, "size_Of_Trade": size,
+            "volume_When_Traded": vol, "open_Interest_When_Traded": oi}
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """Every report build goes through this stub, so no test can reach Alpaca."""
+    monkeypatch.setattr(b, "fetch_stock_prices", lambda tickers: {t: 100.0 + i for i, t in enumerate(sorted(tickers))})
+    monkeypatch.setattr(b, "load_stock_tickers", lambda: None)      # no SEC lookup; tests that need the list set it themselves
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +58,22 @@ def test_qualifies_requires_otm_bought_1m_same_day_before_cutoff():
 def test_no_watchlist_and_no_expiry_filter():
     for tk, exp in (("IWM", "2026-10-16T00:00:00"), ("EWY", "2027-04-16T00:00:00"), ("SOXX", "2028-01-21T00:00:00"), ("ZZZZ", "2026-11-20T00:00:00")):
         assert b.qualifies(item(ticker=tk, expiry=exp), DAY, NOW)
+
+
+def test_etfs_outside_the_allowlist_are_dropped(monkeypatch):
+    stocks = {"NVDA", "WMT", "GLD"}                                          # SEC list: operating companies (and the GLD trust)
+    monkeypatch.setattr(b, "load_stock_tickers", lambda: stocks)
+    rows = [item(t, 2_000_000) for t in ("NVDA", "SPY", "IWM", "EWY", "SOXX", "GLD", "WMT", "SOXL", "VIX", "XLK")]
+
+    async def fake(args, key):
+        return rows
+    monkeypatch.setattr(b, "_fetch", fake)
+    out = asyncio.run(b.fetch_big_flows(DAY, NOW, "key"))
+    assert sorted(i["ticker"] for i in out) == ["IWM", "NVDA", "SOXL", "SPY", "VIX", "WMT", "XLK"]   # EWY, SOXX, GLD dropped
+
+
+def test_when_the_stock_list_is_unavailable_only_known_trusts_are_dropped():
+    assert b.is_blocked_etf("GLD", None) and not b.is_blocked_etf("EWY", None) and not b.is_blocked_etf("SPY", None)
 
 
 def test_fetch_filters_sorts_and_dedupes(monkeypatch):
@@ -91,101 +119,172 @@ def test_missing_api_key_raises():
 
 
 # ---------------------------------------------------------------------------
-# Pricing + rendering
+# The options-specific figures for one print
 # ---------------------------------------------------------------------------
 
-def _bars(base, hours=(10, 11, 12, 13, 14)):
-    out, px = [], base
-    for h in hours:
-        for m in range(0, 60, 5):
-            ts = datetime(2026, 10, 16, h, m, tzinfo=ET)
-            px = max(0.05, px * (1.01 if h < 12 else 0.995))
-            out.append((ts, px, px * 1.02, px * 0.98, px))
-    return out
+def test_a_put_print_dte_otm_breakeven_and_volume_vs_open_interest():
+    p = b.make_print(item(pc="PUT", strike=700, spot=720.0, paid=5.0, vol=9000, oi=3000, size=4478, t="2026-10-16T13:09:00",
+                          expiry="2026-11-20T00:00:00"))
+    assert p["dte"] == 35 and p["strike"] == 700 and p["put_call"] == "PUT"
+    assert round(p["otm_pct"], 4) == round((1 - 700 / 720) * 100, 4)                # 2.78% below the stock
+    assert p["be_price"] == 695.0 and round(p["be_move_pct"], 4) == round((695 / 720 - 1) * 100, 4)   # needs a fall of ~3.47%
+    assert p["be_move_pct"] < 0 and p["vol_oi"] == 3.0 and p["size"] == 4478 and p["kind"] == "SWEEP"
 
 
-def _priced(monkeypatch, n):
-    import weekly_recap as w
-    monkeypatch.setattr(w, "alpaca_configured", lambda: True)
-    items = [item(f"T{i}", 3_000_000 - i * 50_000, pc="PUT" if i % 2 else "CALL", strike=100 + i,
-                  t=f"2026-10-16T{9 + (i % 5):02d}:{10 + i % 40:02d}:00") for i in range(n)]
-    bars = {w.occ_symbol(f"T{i}", date(2026, 11, 20), "put" if i % 2 else "call", float(100 + i)): _bars(2.0)
-            for i in range(n) if i != 3}                                     # flow 3 has no contract trades
-    monkeypatch.setattr(w, "fetch_option_bars", lambda syms, s, e: bars)
-    monkeypatch.setattr(w, "fetch_stock_daily_closes", lambda tickers, s, e: {})
-    return items
+def test_a_call_print_breakeven_is_strike_plus_what_was_paid():
+    p = b.make_print(item(ticker="SMH", pc="CALL", strike=620, spot=550.0, paid=15.25))
+    assert p["be_price"] == 635.25 and p["be_move_pct"] > 0
+    assert round(p["otm_pct"], 4) == round((620 / 550 - 1) * 100, 4)                # calls are OTM above the stock
 
 
-def test_report_prices_every_print_and_summarises(monkeypatch):
-    items = _priced(monkeypatch, 8)
-    report = b.build_big_flow_report(items, DAY, NOW)
-    st = report["stats"]
-    assert st["count"] == 8 and st["with_data"] == 7 and st["calls"] == 4 and st["puts"] == 4
-    assert st["total_premium"] == sum(i["total_Option_Premium_For_Trade"] for i in items)
-    assert [f["premium"] for f in report["flows"]] == sorted((f["premium"] for f in report["flows"]), reverse=True)
-    unpriced = [f for f in report["flows"] if not f["ok"]]
-    assert len(unpriced) == 1 and unpriced[0]["ticker"] == "T3"
-    assert "$1M+ Flow Report Card" in report["caption"] and "Fri Oct 16" in report["caption"] and "3:30 PM ET" in report["caption"]
+def test_volume_vs_open_interest_says_new_when_open_interest_was_zero():
+    assert b.make_print(item(vol=500, oi=0))["vol_oi"] == "new"
+    assert b.make_print(item(vol=None, oi=100))["vol_oi"] is None
 
 
-def test_report_pages_hold_every_ticker_with_the_summary_on_page_one(monkeypatch, tmp_path):
-    report = b.build_big_flow_report(_priced(monkeypatch, 40), DAY, NOW)
-    paths = b.render_report_cards(report, str(tmp_path))
-    assert len(paths) >= 3 and all(os.path.getsize(p) > 10_000 for p in paths)
-    pages = b.paginate(report["groups"])
-    shown = [blk[1]["ticker"] for pg in pages for blk in pg if blk[0] == "band"]
-    assert sorted(shown) == sorted(g["ticker"] for g in report["groups"])        # every ticker appears
-    assert len(b.render_report_cards(b.build_big_flow_report(_priced(monkeypatch, 3), DAY, NOW), str(tmp_path / "small"))) == 1
+def test_missing_payload_fields_give_none_not_a_crash():
+    bare = {"ticker": "ZZZ", "put_Or_Call": "CALL", "strike_Price": 10, "expriation_Date": "2026-11-20T00:00:00",
+            "total_Option_Premium_For_Trade": 1_200_000, "transaction_DateTime": "2026-10-16T10:00:00"}
+    p = b.make_print(bare)
+    assert p["otm_pct"] is None and p["be_move_pct"] is None and p["paid"] is None and p["vol_oi"] is None
+    assert p["size"] is None and p["kind"] is None and p["dte"] == 35 and p["premium"] == 1_200_000
 
 
-def _flow(ticker, pc, strike, premium, minute, expiry=date(2026, 11, 20), high=10.0, ok=True):
-    return {"ticker": ticker, "put_call": pc, "strike": strike, "expiry": expiry, "premium": premium, "ok": ok,
-            "alerted_at": datetime(2026, 10, 16, 12, minute, tzinfo=ET), "high_pct": high, "low_pct": -5.0, "last_pct": 1.0}
+# ---------------------------------------------------------------------------
+# JarvisFlow's same-contract figure is a RUNNING total
+# ---------------------------------------------------------------------------
+
+def test_contract_total_today_is_the_latest_running_total_and_only_shown_when_larger_than_the_print(monkeypatch):
+    soxx = [item("SOXX", 1_600_000, pc="CALL", strike=555, expiry="2028-01-21T00:00:00", t="2026-10-16T12:32:04", day_total=2_200_000),
+            item("SOXX", 1_195_500, pc="CALL", strike=555, expiry="2028-01-21T00:00:00", t="2026-10-16T12:32:52", day_total=3_395_500),
+            item("SOXX", 1_394_750, pc="CALL", strike=555, expiry="2028-01-21T00:00:00", t="2026-10-16T12:37:01", day_total=6_384_250)]
+    single = [item("IWM", 8_970_454, strike=258, day_total=8_970_454)]                    # nothing beyond the print itself
+    report = b.build_big_flow_report(soxx + single, DAY, NOW)
+    by = {g["ticker"]: g for g in report["groups"]}
+    assert by["SOXX"]["top"]["premium"] == 1_600_000                                      # largest print...
+    assert by["SOXX"]["top"]["day_total"] == 6_384_250                                    # ...but the contract's LATEST total
+    assert by["IWM"]["top"]["day_total"] is None
 
 
-def test_flows_group_by_ticker_biggest_total_first_with_a_call_put_split():
-    flows = [_flow("SPY", "PUT", 700, 1_500_000, 1), _flow("IWM", "PUT", 258, 9_000_000, 2),
-             _flow("SPY", "CALL", 720, 1_200_000, 3), _flow("SPY", "PUT", 690, 1_100_000, 4)]
-    groups = b.group_by_ticker(flows)
-    assert [g["ticker"] for g in groups] == ["IWM", "SPY"]                      # 9.0M vs 3.8M total
+# ---------------------------------------------------------------------------
+# Grouping by stock and the report's numbers
+# ---------------------------------------------------------------------------
+
+def _prints(*specs):
+    return [b.make_print(item(**s)) for s in specs]
+
+
+def test_stocks_group_biggest_total_first_and_each_row_describes_its_largest_print():
+    prints = _prints(dict(ticker="SPY", premium=1_500_000, pc="PUT", strike=700, t="2026-10-16T13:46:00"),
+                     dict(ticker="IWM", premium=9_000_000, pc="PUT", strike=258),
+                     dict(ticker="SPY", premium=2_600_000, pc="PUT", strike=728, t="2026-10-16T13:09:00"),
+                     dict(ticker="SPY", premium=1_200_000, pc="CALL", strike=800, t="2026-10-16T14:00:00"))
+    groups = b.group_by_ticker(prints, {"SPY": 762.85})
+    assert [g["ticker"] for g in groups] == ["IWM", "SPY"]                              # 9.0M vs 5.3M total
     spy = groups[1]
-    assert spy["n_flows"] == 3 and spy["total_premium"] == 3_800_000
-    assert spy["call_premium"] == 1_200_000 and spy["put_premium"] == 2_600_000
-    assert [r["strike"] for r in spy["rows"]] == [700, 720, 690]                 # contracts by premium within the ticker
+    assert spy["n_flows"] == 3 and spy["total_premium"] == 5_300_000 and spy["side"] == "both"
+    assert spy["call_premium"] == 1_200_000 and spy["put_premium"] == 4_100_000
+    assert spy["top"]["strike"] == 728 and spy["top"]["premium"] == 2_600_000           # the row describes the biggest print
+    assert spy["stock_px"] == 762.85 and groups[0]["stock_px"] is None                  # price only where Alpaca gave one
+    assert [p["alerted_at"].hour for p in spy["prints"]] == [13, 13, 14]                # all prints kept, in time order
 
 
-def test_every_print_keeps_its_own_row_and_the_rows_add_up_to_the_ticker_total():
-    first = _flow("SOXX", "CALL", 555, 1_600_000, 32, high=12.0)
-    later = _flow("SOXX", "CALL", 555, 1_200_000, 37, high=3.0)
-    other = _flow("SOXX", "CALL", 600, 1_000_000, 40)
-    g = b.group_by_ticker([later, other, first])[0]
-    assert g["n_flows"] == 3 and len(g["rows"]) == 3                       # header count == number of rows
-    assert sum(r["premium"] for r in g["rows"]) == g["total_premium"] == 3_800_000
-    assert [(r["strike"], r["alerted_at"].minute) for r in g["rows"]] == [(555, 32), (555, 37), (600, 40)]
-    assert g["rows"][0]["high_pct"] == 12.0 and g["rows"][1]["high_pct"] == 3.0   # each print keeps its own numbers
+def test_report_stats_count_flows_stocks_sides_sweeps_and_blocks():
+    items = [item("A", 3_000_000, pc="CALL", kind="SWEEP"), item("A", 1_000_000, pc="PUT", kind="BLOCK"),
+             item("B", 2_000_000, pc="PUT", kind="BLOCK"), item("C", 1_500_000, pc="CALL", kind="SWEEP")]
+    r = b.build_big_flow_report(items, DAY, NOW)
+    st = r["stats"]
+    assert st["count"] == 4 and st["unique_tickers"] == 3 and st["total_premium"] == 7_500_000
+    assert st["calls"] == 2 and st["puts"] == 2 and st["call_premium"] == 4_500_000 and st["put_premium"] == 3_000_000
+    assert st["sweeps"] == 2 and st["blocks"] == 2
+    assert sum(g["total_premium"] for g in r["groups"]) == st["total_premium"]
+    assert "$1M+ Flow Card" in r["caption"] and "Fri Oct 16" in r["caption"] and "3:30 PM ET" in r["caption"]
+    assert "performance" not in r["caption"].lower() and "traded since" not in r["caption"].lower()
 
 
-def test_on_a_real_style_report_every_group_adds_up(monkeypatch):
-    report = b.build_big_flow_report(_priced(monkeypatch, 30), DAY, NOW)
-    for g in report["groups"]:
-        assert g["n_flows"] == len(g["rows"])
-        assert sum(r["premium"] for r in g["rows"]) == g["total_premium"]
-    assert sum(g["total_premium"] for g in report["groups"]) == report["stats"]["total_premium"]
+def test_a_failed_price_lookup_never_fails_the_card(tmp_path):
+    items = [item("A", 3_000_000), item("B", 1_200_000, pc="CALL")]
+    r = b.build_big_flow_report(items, DAY, NOW, price_fn=lambda tickers: 1 / 0)
+    assert all(g["stock_px"] is None for g in r["groups"])
+    assert os.path.getsize(b.render_report_cards(r, str(tmp_path))[0]) > 10_000
 
 
-def test_pagination_keeps_a_ticker_header_with_its_rows_and_continues_long_tickers():
-    one = lambda t, n: {"ticker": t, "n_flows": n, "total_premium": n, "call_premium": n, "put_premium": 0,
-                        "rows": [{"premium": 1_000_000 + i} for i in range(n)]}
-    groups = [one(f"T{i}", 1) for i in range(5)] + [one("BIG", 30)] + [one(f"U{i}", 2) for i in range(6)]
-    pages = b.paginate(groups)
-    for pg in pages:
-        for i, blk in enumerate(pg):
-            if blk[0] == "band":
-                assert i + 1 < len(pg) and pg[i + 1][0] == "row"                   # never a header alone at a page end
-    big_bands = [blk for pg in pages for blk in pg if blk[0] == "band" and blk[1]["ticker"] == "BIG"]
-    assert len(big_bands) >= 2 and big_bands[0][2] is False and all(bb[2] for bb in big_bands[1:])   # "(cont.)" on later pages
-    rows = [blk for pg in pages for blk in pg if blk[0] == "row"]
-    assert len(rows) == 5 + 30 + 12                                                  # nothing dropped
+def test_the_report_carries_no_performance_data():
+    r = b.build_big_flow_report([item("A", 3_000_000)], DAY, NOW)
+    forbidden = {"high_pct", "low_pct", "last_pct", "entry_px", "alert_px", "hit_50_before_minus_50"}
+    assert not forbidden & set(r["groups"][0]["top"]) and not forbidden & set(r["stats"])
+
+
+# ---------------------------------------------------------------------------
+# One image
+# ---------------------------------------------------------------------------
+
+def test_the_card_is_exactly_one_image_however_many_stocks(tmp_path):
+    for n in (1, 5, 40):
+        items = [item(f"T{i}", 3_000_000 - i * 10_000, strike=100 + i) for i in range(n)]
+        paths = b.render_report_cards(b.build_big_flow_report(items, DAY, NOW), str(tmp_path / f"n{n}"))
+        assert len(paths) == 1 and os.path.getsize(paths[0]) > 10_000
+
+
+def test_card_is_landscape_and_rows_past_the_panel_cap_fold(tmp_path):
+    from PIL import Image
+    n = 2 * b.MAX_ROWS_PER_PANEL + 6
+    items = [item(f"T{i}", 3_000_000 - i * 10_000, strike=100 + i) for i in range(n)]
+    path = b.render_report_cards(b.build_big_flow_report(items, DAY, NOW), str(tmp_path))[0]
+    width, height = Image.open(path).size
+    assert width == 3600 and width > height
+
+
+def test_a_print_with_missing_fields_still_renders(tmp_path):
+    bare = {"ticker": "ZZZ", "put_Or_Call": "CALL", "strike_Price": 10, "expriation_Date": "2026-11-20T00:00:00",
+            "total_Option_Premium_For_Trade": 1_200_000, "transaction_DateTime": "2026-10-16T10:00:00", "moneyNess": "OTM",
+            "implied_Bought_Or_Sold": "BOUGHT"}
+    assert os.path.getsize(b.render_report_cards(b.build_big_flow_report([bare], DAY, NOW), str(tmp_path))[0]) > 10_000
+
+
+# ---------------------------------------------------------------------------
+# The stock's current price
+# ---------------------------------------------------------------------------
+
+class _Resp:
+    def __init__(self, data, status=200):
+        self._d, self.status_code = data, status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._d
+
+
+def test_stock_prices_come_from_the_latest_trade_with_fallbacks_and_skip_unknown_symbols(monkeypatch):
+    fetch = _REAL_FETCH_STOCK_PRICES
+    snaps = {"IWM": {"latestTrade": {"p": 270.41}, "minuteBar": {"c": 1.0}},
+             "SPY": {"minuteBar": {"c": 763.31}},                                    # no latest trade: minute bar
+             "Q": {"dailyBar": {"c": 115.18}},                                       # only a daily bar
+             "EMPTY": {}}                                                            # nothing usable: omitted
+    seen = []
+    monkeypatch.setattr(b.httpx, "get", lambda url, **kw: seen.append(kw["params"]) or _Resp(snaps))
+    monkeypatch.setattr(b.w, "_alpaca_headers", lambda: {})
+    out = fetch(["SPY", "IWM", "Q", "EMPTY", "SPY", "NOPE"])
+    assert out == {"IWM": 270.41, "SPY": 763.31, "Q": 115.18}
+    assert len(seen) == 1 and seen[0]["feed"] == "iex" and seen[0]["symbols"] == "EMPTY,IWM,NOPE,Q,SPY"   # deduped, one request
+
+
+def test_stock_price_lookup_batches_100_symbols_and_survives_a_failed_batch(monkeypatch):
+    fetch = _REAL_FETCH_STOCK_PRICES
+    calls = []
+
+    def fake(url, **kw):
+        calls.append(kw["params"]["symbols"].count(",") + 1)
+        if len(calls) == 1:
+            return _Resp({}, status=500)
+        return _Resp({"S120": {"latestTrade": {"p": 5.0}}})
+    monkeypatch.setattr(b.httpx, "get", fake)
+    monkeypatch.setattr(b.w, "_alpaca_headers", lambda: {})
+    out = fetch([f"S{i:03d}" for i in range(130)])
+    assert calls == [100, 30] and out == {"S120": 5.0}                               # first batch failed, second still used
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +296,6 @@ def job(monkeypatch):
     import main as m
     monkeypatch.setattr(m, "DISCORD_WEBHOOK_URL", "https://example.invalid/main")
     monkeypatch.setattr(m, "BIG_FLOW_WEBHOOK_URL", None)
-    monkeypatch.setattr(m, "alpaca_configured", lambda: True)
     monkeypatch.setattr(m, "is_trading_day", lambda d: True)
     log = {"fetched": 0, "posted": []}
 
@@ -205,8 +303,8 @@ def job(monkeypatch):
         log["fetched"] += 1
         return [item()]
     monkeypatch.setattr(m, "fetch_big_flows", fetch)
-    monkeypatch.setattr(m, "build_big_flow_report", lambda items, day, now, key: {
-        "stats": {"count": 1, "with_data": 1, "total_premium": 1}, "caption": "cap", "flows": []})
+    monkeypatch.setattr(m, "build_big_flow_report", lambda items, day, now: {
+        "stats": {"count": 1, "unique_tickers": 1, "total_premium": 1}, "caption": "cap", "groups": []})
     monkeypatch.setattr(m, "render_report_cards", lambda r, d: ["x.png"])
 
     async def post(webhook, paths, caption):
@@ -229,7 +327,14 @@ def test_job_uses_its_own_webhook_when_configured(job, monkeypatch):
     assert log["posted"][0][0] == "https://example.invalid/big"
 
 
-def test_job_skips_non_trading_days_and_empty_days_and_missing_keys(job, monkeypatch):
+def test_job_no_longer_needs_the_alpaca_keys_to_post(job, monkeypatch):
+    m, log = job
+    monkeypatch.setattr(m, "alpaca_configured", lambda: False)                   # a flow card; only the stock price needs Alpaca
+    asyncio.run(m.big_flow_report_job())
+    assert len(log["posted"]) == 1
+
+
+def test_job_skips_non_trading_days_and_empty_days(job, monkeypatch):
     m, log = job
     monkeypatch.setattr(m, "is_trading_day", lambda d: False)
     asyncio.run(m.big_flow_report_job())
@@ -241,9 +346,6 @@ def test_job_skips_non_trading_days_and_empty_days_and_missing_keys(job, monkeyp
     monkeypatch.setattr(m, "fetch_big_flows", none)
     asyncio.run(m.big_flow_report_job())
     assert log["posted"] == []                                              # nothing qualified: nothing posted
-    monkeypatch.setattr(m, "alpaca_configured", lambda: False)
-    asyncio.run(m.big_flow_report_job())
-    assert log["posted"] == []
 
 
 def test_job_survives_a_jarvis_failure(job, monkeypatch):
@@ -254,31 +356,3 @@ def test_job_survives_a_jarvis_failure(job, monkeypatch):
     monkeypatch.setattr(m, "fetch_big_flows", boom)
     asyncio.run(m.big_flow_report_job())                                     # logged, never raises
     assert log["posted"] == []
-
-
-# ---------------------------------------------------------------------------
-# Entry price: the card's percentages are measured from the price the flow printed at
-# ---------------------------------------------------------------------------
-
-def test_percentages_are_measured_from_the_print_price_and_the_entry_is_kept():
-    f = {"ok": True, "alert_px": 2.5, "high_px": 4.0, "low_px": 1.5, "last_px": 3.0,
-         "high_pct": 60.0, "low_pct": -40.0, "last_pct": 20.0}
-    b.rebase_to_print(f, 2.0)                                   # the flow actually printed at $2.00, not the bar close $2.50
-    assert f["entry_px"] == 2.0 and f["alert_px"] == 2.0
-    assert round(f["high_pct"], 6) == 100.0 and round(f["low_pct"], 6) == -25.0 and round(f["last_pct"], 6) == 50.0
-    g = {"ok": True, "alert_px": 1.0, "high_px": 1.2, "low_px": 0.9, "last_px": 1.1, "high_pct": 20.0, "low_pct": -10.0, "last_pct": 10.0}
-    b.rebase_to_print(g, 1.5)                                   # nothing traded above the print: high floors at the entry
-    assert g["high_px"] == 1.5 and g["high_pct"] == 0.0 and round(g["low_pct"], 6) == -40.0
-    h = {"ok": False, "alert_px": None}
-    b.rebase_to_print(h, 3.25)                                  # no later trades, but the entry price is still shown
-    assert h["entry_px"] == 3.25
-    k = {"ok": True, "alert_px": 2.5, "high_px": 4.0, "low_px": 1.5, "last_px": 3.0, "high_pct": 60.0, "low_pct": -40.0, "last_pct": 20.0}
-    b.rebase_to_print(k, None)                                  # no print price in the payload: keep the bar-based entry
-    assert k["entry_px"] == 2.5 and round(k["high_pct"], 6) == 60.0
-
-
-def test_report_rows_carry_the_print_price(monkeypatch):
-    report = b.build_big_flow_report(_priced(monkeypatch, 4), DAY, NOW)
-    assert all(f["entry_px"] == 3.0 for f in report["flows"])                   # item() prints at $3.00
-    priced = [f for f in report["flows"] if f["ok"]]
-    assert all(abs(f["last_pct"] - (f["last_px"] / 3.0 - 1) * 100) < 1e-6 for f in priced)

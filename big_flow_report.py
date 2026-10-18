@@ -1,9 +1,11 @@
 """
-big_flow_report.py -- the 3:30 PM ET "$1M+ Flow Report Card".
+big_flow_report.py -- the 4:32 PM ET (data through the 4:00 close) "$1M+ Flow Card".
 
 Every out-of-the-money, BOUGHT print of $1M+ premium that JarvisFlow saw today, market-wide: no watchlist
-restriction and no expiry filter. Each print is priced from its contract's own Alpaca option bars (price when
-the flow hit, then the high, low and latest price since), so the card shows how the flow has traded so far.
+restriction and no expiry filter, shown as ONE image with one row per stock, largest total premium first.
+This is a flow card, not a performance card: it describes the flow (the contract, how far out of the money it
+is, what was paid, the breakeven, volume vs open interest, size, sweep or block) and says nothing about how the
+contract has traded since.
 
 How the list is built:
   * One market-wide JarvisFlow call (OTM, BOUGHT, today's trade date) sorted by `Premium`. That sort orders by
@@ -14,23 +16,30 @@ How the list is built:
   * "At or above the ask" cannot be checked directly: the payload has no bid/ask. JarvisFlow's own BOUGHT
     classification (its tool docs map "hit the ask" to BOUGHT) is the proxy, same as the conviction baseline.
   * Premium is per print, like every other premium figure in this engine.
-Contract prices come from Alpaca's 5-minute option bars, which run ~15 minutes behind, so a 3:30 PM post
-reflects trading through about 3:14 PM.
+
+Each stock's row describes its LARGEST print, so every figure on it can be traced to one trade:
+  DTE        days from the print to expiry
+  OTM        how far the strike is from the stock price at the print
+  paid       the contract price the print traded at
+  BE         the stock's move from its price at the print to break even at expiry (strike +/- paid)
+  V/OI       the contract's volume vs its open interest when the print traded ("new" when OI was 0)
+  size       contracts in the print
+  today      the contract's total premium so far today (its latest running total), shown when it is larger than the print
+The stock's current price (PRICE) is Alpaca's latest trade at publish time; it is the only Alpaca call.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
-import statistics
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import httpx
-import matplotlib.pyplot as plt
-from matplotlib.patches import FancyBboxPatch
+from PIL import Image, ImageDraw, ImageFont
 
 import weekly_recap as w
 
@@ -40,6 +49,7 @@ ET = ZoneInfo("America/New_York")
 JARVIS_MCP_URL = os.getenv("JARVIS_MCP_URL", "https://api.jarvisflow.io/.well-known/mcp")
 MIN_PREMIUM = 1_000_000
 JARVIS_ROW_CAP = 300                       # JarvisFlow returns at most this many rows per call
+MAX_ROWS_PER_PANEL = 14                    # stocks drawn per side of the landscape card; the rest fold into a "+N more" line
 
 
 # ---------------------------------------------------------------------------
@@ -75,18 +85,23 @@ async def _fetch(args: dict, api_key: str) -> list[dict]:
     return _parse_mcp(resp.text)
 
 
+def _num(it: dict, *names: str) -> float | None:
+    for n in names:
+        v = it.get(n)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def _item_premium(it: dict) -> float:
-    try:
-        return float(it.get("total_Option_Premium_For_Trade") or it.get("totalOptionPremiumForTrade") or 0)
-    except (TypeError, ValueError):
-        return 0.0
+    return _num(it, "total_Option_Premium_For_Trade", "totalOptionPremiumForTrade") or 0.0
 
 
 def _contract_day_total(it: dict) -> float:
-    try:
-        return float(it.get("total_Option_Premium_for_Same_Contract_Today") or 0)
-    except (TypeError, ValueError):
-        return 0.0
+    return _num(it, "total_Option_Premium_for_Same_Contract_Today") or 0.0
 
 
 def trade_time_et(it: dict) -> datetime | None:
@@ -118,6 +133,37 @@ def _key(it: dict) -> tuple:
             it.get("transaction_DateTime"), _item_premium(it))
 
 
+# ETFs allowed on the card; every other ETF / fund / trust is dropped.
+ETF_ALLOWLIST = {"SPY", "QQQ", "IWM", "VIX", "TLT", "HYG", "XLK", "XLF", "XLE", "XLV", "XLU", "SMH", "TQQQ", "SOXL"}
+# Fund-like names that DO appear in the SEC's company list (grantor trusts), so the list alone would let them through.
+_TRUST_ETFS = {"GLD", "SLV", "IAU", "GLDM", "SLVP", "USO", "UNG", "UUP", "BITO", "IBIT", "FBTC", "GBTC", "ETHE", "ETHA", "SPY", "DIA", "VXX", "UVXY"}
+SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+_stock_tickers: set[str] | None = None
+
+
+def load_stock_tickers() -> set[str] | None:
+    """Tickers of operating companies (stocks and ADRs) from the SEC's public list; ETFs are not in it. Fetched once
+    per process; None if the lookup fails (then only the known-trust set is enforced)."""
+    global _stock_tickers
+    if _stock_tickers is None:
+        try:
+            r = httpx.get(SEC_TICKERS_URL, timeout=30.0, headers={"User-Agent": os.getenv("SEC_USER_AGENT", "options-discord-engine admin@example.com")})
+            r.raise_for_status()
+            _stock_tickers = {str(v["ticker"]).upper() for v in r.json().values()}
+        except Exception as e:
+            logger.warning("big_flow stock list unavailable, ETF filter limited to known trusts: %s", e)
+    return _stock_tickers
+
+
+def is_blocked_etf(ticker: str, stocks: set[str] | None) -> bool:
+    """True for an ETF outside ETF_ALLOWLIST: a known trust, or (when the stock list loaded) anything that is not an
+    operating company."""
+    t = (ticker or "").upper()
+    if t in ETF_ALLOWLIST:
+        return False
+    return t in _TRUST_ETFS or (stocks is not None and t not in stocks)
+
+
 async def fetch_big_flows(day: date, cutoff_et: datetime, api_key: str) -> list[dict]:
     """All qualifying prints for `day`, largest premium first."""
     if not api_key:
@@ -135,307 +181,369 @@ async def fetch_big_flows(day: date, cutoff_et: datetime, api_key: str) -> list[
             for r in await _fetch({**base, "filter_by_sweepOrBlock": kind}, api_key):
                 merged[_key(r)] = r
         rows = list(merged.values())
-    items = {_key(r): r for r in rows if qualifies(r, day, cutoff_et)}
+    stocks = await asyncio.to_thread(load_stock_tickers)
+    items = {_key(r): r for r in rows if qualifies(r, day, cutoff_et) and not is_blocked_etf(r.get("ticker"), stocks)}
     return sorted(items.values(), key=_item_premium, reverse=True)
 
 
 # ---------------------------------------------------------------------------
-# Pricing
+# The stock's current price (Alpaca)
 # ---------------------------------------------------------------------------
 
-def _row_from_item(it: dict) -> dict[str, Any]:
+def fetch_stock_prices(tickers: list[str]) -> dict[str, float]:
+    """Latest trade price for each stock / ETF, from Alpaca's snapshot endpoint (IEX feed: real time, though IEX
+    prints can lag a thin name by a few cents). One request per 100 symbols. Symbols Alpaca does not know are
+    simply missing from the result; any failure returns what was fetched so far, so the card shows '—' for a
+    price rather than failing."""
+    out: dict[str, float] = {}
+    syms = sorted({t for t in tickers if t})
+    for i in range(0, len(syms), 100):
+        try:
+            resp = httpx.get(f"{w.ALPACA_DATA}/v2/stocks/snapshots", headers=w._alpaca_headers(), timeout=20.0,
+                             params={"symbols": ",".join(syms[i:i + 100]), "feed": "iex"})
+            resp.raise_for_status()
+            snaps = resp.json()
+        except Exception as e:
+            logger.warning("big_flow stock_prices_failed %s", e)
+            continue
+        for sym, snap in (snaps or {}).items():
+            px = ((snap.get("latestTrade") or {}).get("p") or (snap.get("minuteBar") or {}).get("c")
+                  or (snap.get("dailyBar") or {}).get("c"))
+            if px:
+                out[sym] = float(px)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# One print -> options data
+# ---------------------------------------------------------------------------
+
+def make_print(it: dict) -> dict[str, Any]:
+    """One qualifying print with its options-specific figures. Anything the payload lacks is None."""
     t = trade_time_et(it)
-    pc = str(it.get("put_Or_Call") or "").lower()
-    strike = float(it["strike_Price"])
-    expiry = str(it["expriation_Date"])[:10]
+    pc = str(it.get("put_Or_Call") or "").upper()
+    strike = _num(it, "strike_Price", "strikePrice")
+    spot = _num(it, "spot_Price", "spotPrice")
+    paid = _num(it, "price_Of_Contract", "priceOfContract")
+    paid = paid if paid and paid > 0 else None
+    expiry = None
+    try:
+        expiry = date.fromisoformat(str(it.get("expriation_Date") or it.get("expriationDate"))[:10])
+    except ValueError:
+        pass
+    vol, oi = _num(it, "volume_When_Traded", "volumeWhenTraded"), _num(it, "open_Interest_When_Traded", "openInterestWhenTraded")
+    size = _num(it, "size_Of_Trade", "sizeOfTrade")
+    premium = int(_item_premium(it))
+
+    otm_pct = be_price = be_move_pct = None
+    if strike and spot and pc in ("CALL", "PUT"):
+        otm_pct = (strike / spot - 1.0) * 100.0 if pc == "CALL" else (1.0 - strike / spot) * 100.0
+        if paid:
+            be_price = strike + paid if pc == "CALL" else strike - paid
+            be_move_pct = (be_price / spot - 1.0) * 100.0
+    vol_oi = None                                       # "new" when open interest was zero
+    if vol is not None and oi is not None:
+        vol_oi = "new" if oi <= 0 else vol / oi
     return {
-        "id": None, "alert_hash": None, "ticker": str(it["ticker"]).upper(),
-        "contract": f"{str(it['ticker']).upper()} {expiry} {strike:g}{pc[:1].upper()}",
-        "premium": int(_item_premium(it)), "sentiment": "bullish" if pc == "call" else "bearish",
-        "put_call": pc, "strike": strike, "expiry_date": expiry,
-        "spot_price": float(it["spot_Price"]) if it.get("spot_Price") is not None else None,
-        "ingested_at": t.astimezone(timezone.utc).replace(tzinfo=None),
-        "sweep_or_block": str(it.get("sweep_Or_Block") or "").lower(),
-        "print_px": _print_price(it),
+        "ticker": str(it.get("ticker") or "").upper(), "put_call": pc, "strike": strike, "expiry": expiry,
+        "premium": premium, "alerted_at": t, "spot": spot, "paid": paid,
+        "dte": (expiry - t.date()).days if expiry and t else None,
+        "otm_pct": otm_pct, "be_price": be_price, "be_move_pct": be_move_pct,
+        "vol_oi": vol_oi, "size": int(size) if size is not None else None,
+        "kind": str(it.get("sweep_Or_Block") or "").upper() or None,
+        "running_total": _contract_day_total(it),         # the contract's premium so far today, as of THIS print
+        "day_total": None,                                # set in build_big_flow_report: the contract's latest total
     }
 
 
-def _print_price(it: dict) -> float | None:
-    """The contract price the flow actually printed at (JarvisFlow's price_Of_Contract): the true tape price."""
-    try:
-        px = float(it.get("price_Of_Contract") if it.get("price_Of_Contract") is not None else it.get("priceOfContract"))
-    except (TypeError, ValueError):
-        return None
-    return px if px > 0 else None
-
-
-def rebase_to_print(f: dict[str, Any], print_px: float | None) -> None:
-    """Make the flow's price journey start from the price the flow printed at. compute_flow_result's own entry
-    is the close of the 5-minute bar containing the print, which can be up to 5 minutes after it. High and low
-    are bar extremes after the print (never lower/higher than the entry itself); every percentage is re-based.
-    The entry price is kept even when no later contract trades exist, so the card can still show it."""
-    entry = print_px if print_px else f.get("alert_px")
-    f["entry_px"] = entry
-    if not f.get("ok") or not entry:
-        return
-    f["high_px"] = max(f["high_px"], entry)
-    f["low_px"] = min(f["low_px"], entry)
-    for key, px in (("high_pct", f["high_px"]), ("low_pct", f["low_px"]), ("last_pct", f["last_px"])):
-        f[key] = (px / entry - 1.0) * 100.0
-    f["alert_px"] = entry
-
-
-def group_by_ticker(flows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Group priced flows by stock symbol, biggest total premium first. Every print keeps its own row (its own
-    time, premium and entry price), so a ticker's header count equals its number of rows and its rows add up to
-    its total. Within a ticker, prints on the same contract sit together, the contract with the most premium
-    first and its prints in time order."""
+def group_by_ticker(prints: list[dict[str, Any]], prices: dict[str, float] | None = None) -> list[dict[str, Any]]:
+    """One summary per stock, biggest total premium first. A stock's row describes its LARGEST print (`top`);
+    `n_flows` and `total_premium` cover all of its prints, so the header always adds up."""
+    prices = prices or {}
     by_ticker: dict[str, list[dict[str, Any]]] = {}
-    for f in flows:
-        by_ticker.setdefault(f["ticker"], []).append(f)
+    for p in prints:
+        by_ticker.setdefault(p["ticker"], []).append(p)
     groups = []
-    for ticker, fs in by_ticker.items():
-        contracts: dict[tuple, list[dict[str, Any]]] = {}
-        for f in sorted(fs, key=lambda x: x["alerted_at"]):
-            contracts.setdefault((f["put_call"], f["strike"], f["expiry"]), []).append(f)
-        ordered = sorted(contracts.values(), key=lambda prints: sum(p["premium"] for p in prints), reverse=True)
-        rows = [p for prints in ordered for p in prints]
-        calls = sum(f["premium"] for f in fs if f["put_call"] == "CALL")
-        puts = sum(f["premium"] for f in fs if f["put_call"] == "PUT")
-        groups.append({"ticker": ticker, "rows": rows, "n_flows": len(rows), "total_premium": calls + puts,
-                       "call_premium": calls, "put_premium": puts})
+    for ticker, ps in by_ticker.items():
+        calls = sum(p["premium"] for p in ps if p["put_call"] == "CALL")
+        puts = sum(p["premium"] for p in ps if p["put_call"] == "PUT")
+        side = "both" if calls and puts else "calls" if calls else "puts"
+        groups.append({"ticker": ticker, "stock_px": prices.get(ticker), "n_flows": len(ps), "side": side,
+                       "total_premium": calls + puts, "call_premium": calls, "put_premium": puts,
+                       "top": max(ps, key=lambda p: p["premium"]), "prints": sorted(ps, key=lambda p: p["alerted_at"])})
     groups.sort(key=lambda g: g["total_premium"], reverse=True)
     return groups
 
 
-def build_big_flow_report(items: list[dict], day: date, now_et: datetime, api_key: str = "") -> dict[str, Any]:
-    """Price every qualifying print and group them by stock symbol. Pure computation plus Alpaca reads
-    (no DB, no Discord)."""
-    rows = [_row_from_item(it) for it in items]
-    flows = w.compute_flows_for_rows(rows, api_key, now_et, day) if rows else []
-    for f, r in zip(flows, rows):                       # compute_flows_for_rows keeps the input order
-        rebase_to_print(f, r["print_px"])
-    flows.sort(key=lambda f: f["premium"], reverse=True)
-    ok = [f for f in flows if f["ok"]]
-    calls = [f for f in flows if f["put_call"] == "CALL"]
-    puts = [f for f in flows if f["put_call"] == "PUT"]
-    prem = lambda xs: sum(f["premium"] for f in xs)
+def build_big_flow_report(items: list[dict], day: date, now_et: datetime, price_fn=None) -> dict[str, Any]:
+    """Turn the qualifying prints into the card's data, and look up each stock's current price (price_fn, default
+    fetch_stock_prices). One Alpaca call at most; no DB, no Discord."""
+    prints = [make_print(it) for it in items]
+    # JarvisFlow's same-contract figure is a RUNNING total, so a contract's total today is the largest one seen
+    # among its prints. Shown only when it is meaningfully more than the print itself.
+    latest: dict[tuple, float] = {}
+    for p in prints:
+        k = (p["ticker"], p["put_call"], p["strike"], p["expiry"])
+        latest[k] = max(latest.get(k, 0.0), p["running_total"])
+    for p in prints:
+        total = latest[(p["ticker"], p["put_call"], p["strike"], p["expiry"])]
+        p["day_total"] = total if total > p["premium"] * 1.05 else None
+    tickers = sorted({p["ticker"] for p in prints})
+    try:
+        prices = (price_fn or fetch_stock_prices)(tickers) if tickers else {}
+    except Exception as e:
+        logger.warning("big_flow stock price lookup failed: %s", e)
+        prices = {}
+    calls = [p for p in prints if p["put_call"] == "CALL"]
+    puts = [p for p in prints if p["put_call"] == "PUT"]
+    prem = lambda xs: sum(p["premium"] for p in xs)
     stats = {
-        "count": len(flows), "with_data": len(ok), "calls": len(calls), "puts": len(puts),
-        "call_premium": prem(calls), "put_premium": prem(puts), "total_premium": prem(flows),
-        "unique_tickers": len({f["ticker"] for f in flows}),
-        "median_high_pct": statistics.median(f["high_pct"] for f in ok) if ok else None,
-        "median_low_pct": statistics.median(f["low_pct"] for f in ok) if ok else None,
+        "count": len(prints), "unique_tickers": len(tickers), "total_premium": prem(prints),
+        "calls": len(calls), "puts": len(puts), "call_premium": prem(calls), "put_premium": prem(puts),
+        "sweeps": sum(1 for p in prints if p["kind"] == "SWEEP"), "blocks": sum(1 for p in prints if p["kind"] == "BLOCK"),
     }
-    return {"day": day, "as_of": now_et, "flows": flows, "groups": group_by_ticker(flows), "stats": stats,
+    return {"day": day, "as_of": now_et, "prints": prints, "groups": group_by_ticker(prints, prices), "stats": stats,
             "caption": format_caption(day, now_et, stats)}
 
 
 def format_caption(day: date, now_et: datetime, stats: dict[str, Any]) -> str:
     clock = now_et.strftime("%I:%M %p").lstrip("0")
-    return (f"**$1M+ Flow Report Card — {day.strftime('%a %b %d')}**   {stats['count']} flows · "
+    return (f"**$1M+ Flow Card — {day.strftime('%a %b %d')}**   {stats['count']} flows · {stats['unique_tickers']} stocks · "
             f"{w._fmt_prem(stats['total_premium'])} premium · {stats['calls']} calls / {stats['puts']} puts\n"
             f"*Out-of-the-money, bought (at/above the ask per JarvisFlow), single prints of $1M+, market-wide, "
-            f"through {clock} ET. How each contract has traded since — not trade recommendations.*")
+            f"through {clock} ET. Not trade recommendations.*")
 
 
 # ---------------------------------------------------------------------------
-# Rendering
+# Rendering: one wide landscape image, PUTS and CALLS as two tables side by side
 # ---------------------------------------------------------------------------
 
-TITLE = "$1M+ FLOW REPORT CARD"
-DISCLAIMER = ("ENTRY = contract price when the flow printed · HIGH / LOW / NOW = traded since, vs. entry\n"
-              "OTM · bought · single prints of $1M+ · Alpaca prices ~15 min delayed · not trade recommendations")
-COLS = {"time": w.LEFT + 0.25, "contract": w.LEFT + 0.95, "prem": w.LEFT + 3.05, "entry": w.LEFT + 3.7,
-        "high": w.LEFT + 4.6, "low": w.LEFT + 5.5, "now": w.LEFT + 6.4}
-BAND_H, ROW_H, GROUP_GAP = 0.40, 0.58, 0.10
-PAGE1_CAP, PAGE_CAP = 5.4, 9.3          # inches of table per page (page 1 sits under the summary tiles)
+TITLE = "$1M+ FLOW CARD"
+W = 3600
+BG, PANEL_BG, ROW_SHADES = "#0B1220", "#141D31", ("#16203A", "#121A2E")
+TXT, TXT2, DIM, HAIR = "#F1F5F9", "#9AA7BC", "#5E6B84", "#223052"
+ACCENT = {"puts": ("#F472B6", "#3B1F33"), "calls": ("#60A5FA", "#1B2B4A")}
+PILL = {"SWEEP": ("#1E3A8A", "#93C5FD"), "BLOCK": ("#26303F", "#9CA3AF")}
+MARGIN, GUTTER = 50, 36
+ROW_H, ROW_GAP = 116, 8
+EXPLAINER = "One row per name · sorted by total premium · details = largest print."
+FOOTER = ("OTM = strike vs stock price at the print · BE = move needed to break even at expiry",
+          "V/OI = volume vs open interest · PRICE = latest trade (Alpaca) · not trade recommendations")
+
+_FONT_DIRS = [os.getenv("FLOW_CARD_FONT_DIR", ""), os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")]
 
 
-def _clock12(ts: datetime) -> str:
-    h = ts.hour % 12 or 12
-    return f"{h}:{ts.minute:02d}{'a' if ts.hour < 12 else 'p'}"
+def _font_path(bold: bool) -> str:
+    """Inter when it is installed or dropped in ./fonts; otherwise the DejaVu Sans that ships with matplotlib."""
+    for d in _FONT_DIRS:
+        for name in (("Inter-Bold.ttf", "Inter_28pt-Bold.ttf") if bold else ("Inter-Regular.ttf", "Inter_28pt-Regular.ttf")):
+            p = os.path.join(d, name) if d else ""
+            if p and os.path.exists(p):
+                return p
+    import matplotlib
+    return os.path.join(matplotlib.get_data_path(), "fonts", "ttf", "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf")
 
 
-def _pct_color(v: float | None) -> str:
+_FONTS: dict[tuple, ImageFont.FreeTypeFont] = {}
+
+
+def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+    k = (size, bold)
+    if k not in _FONTS:
+        _FONTS[k] = ImageFont.truetype(_font_path(bold), size)
+    return _FONTS[k]
+
+
+def _tw(text: str, size: int, bold: bool = False) -> int:
+    return int(round(_font(size, bold).getlength(text)))
+
+
+def _fit(text: str, size: int, bold: bool, max_w: int, min_size: int) -> int:
+    """Largest font size <= size (never below min_size) at which text fits max_w; raises if even min_size does not."""
+    s = size
+    while s > min_size and _tw(text, s, bold) > max_w:
+        s -= 1
+    if _tw(text, s, bold) > max_w:
+        raise ValueError(f"flow card: {text!r} does not fit {max_w}px even at {s}px")
+    return s
+
+
+def _money(v: float, dec: int = 2) -> str:
+    if v >= 1e9:
+        return f"${v / 1e9:.{dec}f}B"
+    if v >= 1e6:
+        return f"${v / 1e6:.{dec}f}M"
+    return f"${v / 1e3:.0f}K"
+
+
+def _fmt_vol_oi(v) -> str:
     if v is None:
-        return w.GRAY
-    return w.UP if v > 0.05 else w.DOWN if v < -0.05 else w.TXT_DIM
+        return "—"
+    return "new" if v == "new" else (f"{v:.1f}x" if v < 100 else f"{v:.0f}x")
 
 
-def _footer(T, ax, H, page_label: str):
-    ax.plot([w.LEFT, w.RIGHT], [H - 0.82, H - 0.82], color=w.PANEL_BORDER, linewidth=1)
-    T(w.CENTER, H - 0.74, DISCLAIMER, ha="center", fontsize=7.4, color=w.GRAY, fontfamily=w.HEADER_FONT, linespacing=1.5)
-    T(w.CENTER, H - 0.28, page_label, ha="center", fontsize=8.5, color=w.TXT_DIM, fontfamily=w.HEADER_FONT)
+def _row_side(g: dict) -> str:
+    return "puts" if g["put_premium"] > g["call_premium"] else "calls"
 
 
-def _header(T, report: dict, page_no: int, pages: int, big: bool) -> None:
-    day = report["day"]
-    if big:
-        T(w.CENTER, 0.40, TITLE, ha="center", fontsize=24, color=w.TXT_LIGHT, fontweight="bold", fontfamily=w.HEADER_FONT)
-        T(w.CENTER, 0.98, day.strftime("%A, %B %d, %Y"), ha="center", fontsize=14, color=w.TXT_DIM, fontfamily=w.HEADER_FONT)
-        T(w.CENTER, 1.38, f"Grouped by stock · priced through ~{(report['as_of'] - timedelta(minutes=16)).strftime('%I:%M %p').lstrip('0')} ET",
-          ha="center", fontsize=10.5, color=w.GRAY, fontfamily=w.HEADER_FONT)
-    else:
-        T(w.LEFT, 0.28, TITLE, fontsize=15, color=w.TXT_LIGHT, fontweight="bold", fontfamily=w.HEADER_FONT)
-        T(w.LEFT, 0.62, day.strftime("%A, %B %d, %Y"), fontsize=10.5, color=w.TXT_DIM, fontfamily=w.HEADER_FONT)
-        T(w.RIGHT, 0.28, f"Page {page_no} of {pages}", ha="right", fontsize=11, color=w.TXT_DIM, fontfamily=w.HEADER_FONT)
+def build_card_payload(report: dict[str, Any]) -> dict[str, Any]:
+    """The landscape card's input contract (field names fixed by the design spec), built from the report.
+    Keys starting with '_' carry raw numbers for the consistency asserts; they are never drawn."""
+    st = report["stats"]
+    tot = max(st["call_premium"] + st["put_premium"], 1)
+    rows = []
+    for g in report["groups"]:
+        t = g["top"]
+        voi = t["vol_oi"]
+        strike = w._fmt_strike(t["strike"]) if t.get("strike") is not None else "?"
+        exp = t["expiry"].strftime("%b %d, %Y") if t.get("expiry") else "?"
+        rows.append({
+            "ticker": g["ticker"], "price": w._fmt_px(g["stock_px"]) if g.get("stock_px") else None, "side": _row_side(g),
+            "total_premium": _money(g["total_premium"]), "_premium": g["total_premium"], "n_prints": g["n_flows"],
+            "largest_print": f"{(t['put_call'] or '?')[:1]} {strike} · {exp}",
+            "dte": None if t["dte"] is None else f"DTE {t['dte']}",
+            "otm": None if t["otm_pct"] is None else f"OTM {t['otm_pct']:.1f}%",
+            "paid": f"paid {w._fmt_px(t['paid'])}" if t["paid"] else None,
+            "be": None if t["be_move_pct"] is None else f"BE {t['be_move_pct']:+.1f}%",
+            "voi": None if voi is None else f"V/OI {_fmt_vol_oi(voi)}",
+            "cts": None if t["size"] is None else f"{t['size']:,} cts",
+            "kind": t["kind"], "today": f"today {_money(t['day_total'])}" if t["day_total"] else None,
+        })
+    return {
+        "date_label": report["day"].strftime("%A, %B %d, %Y").replace(" 0", " "),
+        "cutoff_label": f"through {report['as_of'].strftime('%I:%M %p').lstrip('0')} ET",
+        "stats": {"flows": st["count"], "stocks": st["unique_tickers"], "total_premium": _money(st["total_premium"], 1),
+                  "calls_puts_pct": f"{st['call_premium'] / tot * 100:.0f}% / {st['put_premium'] / tot * 100:.0f}%",
+                  "sweeps_blocks": f"{st['sweeps']} / {st['blocks']}", "_total": st["total_premium"]},
+        "rows": rows,
+    }
 
 
-def _column_headers(ax, T, y: float) -> float:
-    for key, lab, ha in (("time", "TIME", "left"), ("contract", "CONTRACT", "left"), ("prem", "PREMIUM", "right"),
-                         ("entry", "ENTRY", "center"), ("high", "HIGH", "center"), ("low", "LOW", "center"),
-                         ("now", "NOW", "center")):
-        T(COLS[key], y, lab, ha=ha, fontsize=8, color=w.GRAY, fontweight="bold", fontfamily=w.HEADER_FONT)
-    ax.plot([w.LEFT, w.RIGHT], [y + 0.28, y + 0.28], color=w.PANEL_BORDER, linewidth=1)
-    return y + 0.36
+def _split_panels(payload: dict[str, Any]) -> list[tuple[str, list[dict], float]]:
+    """[(side, rows, subtotal)], larger-premium side first. Fails loudly rather than drawing a wrong card."""
+    rows, st = payload["rows"], payload["stats"]
+    for r in rows:
+        if not (r["ticker"] and r["total_premium"] and r["largest_print"] and r["kind"] in ("SWEEP", "BLOCK", None)):
+            raise ValueError(f"flow card: incomplete row {r.get('ticker')!r}")
+    by = {s: [r for r in rows if r["side"] == s] for s in ("puts", "calls")}
+    sub = {s: sum(r["_premium"] for r in by[s]) for s in by}
+    for s in by:
+        prem = [r["_premium"] for r in by[s]]
+        if prem != sorted(prem, reverse=True):
+            raise ValueError(f"flow card: {s} rows are not in descending premium order")
+    if sub["puts"] + sub["calls"] != st["_total"] or _money(st["_total"], 1) != st["total_premium"]:
+        raise ValueError("flow card: panel subtotals do not add up to the total premium")
+    first = "puts" if sub["puts"] > sub["calls"] else "calls"
+    second = "calls" if first == "puts" else "puts"
+    return [(first, by[first], sub[first]), (second, by[second], sub[second])]
 
 
-def _draw_band(ax, T, g: dict, y: float, cont: bool) -> None:
-    """Ticker header: symbol, flow count, which side(s) it was on, and (only when the ticker has more than one
-    contract) the ticker's total premium at the right edge. A single-contract ticker's premium is already on its row."""
-    ax.add_patch(FancyBboxPatch((w.LEFT - 0.08, y), w.RIGHT - w.LEFT + 0.16, BAND_H - 0.04,
-                                boxstyle="round,pad=0,rounding_size=0.05", linewidth=0, facecolor=w.PANEL_BG, zorder=0))
-    ax.plot([w.LEFT - 0.08, w.LEFT - 0.08], [y + 0.04, y + BAND_H - 0.08], color=w.TXT_DIM, linewidth=3, solid_capstyle="butt")
-    T(w.LEFT + 0.12, y + 0.04, g["ticker"] + (" (cont.)" if cont else ""), fontsize=13.5, color=w.TXT_LIGHT,
-      fontweight="bold", fontfamily=w.DATA_FONT)
-    T(w.LEFT + 1.85, y + 0.08, f"{g['n_flows']} flow{'s' if g['n_flows'] != 1 else ''}", fontsize=9.5, color=w.TXT_DIM, fontfamily=w.DATA_FONT)
-    x = w.LEFT + 2.75
-    if g["call_premium"] and g["put_premium"]:
-        T(x, y + 0.08, f"C {w._fmt_prem(g['call_premium'])}", fontsize=9.5, color=w.CALL_HUE, fontweight="bold", fontfamily=w.DATA_FONT)
-        T(x + 0.7, y + 0.08, "·", fontsize=9.5, color=w.GRAY, fontfamily=w.DATA_FONT)
-        T(x + 0.88, y + 0.08, f"P {w._fmt_prem(g['put_premium'])}", fontsize=9.5, color=w.PUT_HUE, fontweight="bold", fontfamily=w.DATA_FONT)
-    else:
-        calls = bool(g["call_premium"])
-        T(x, y + 0.08, "calls" if calls else "puts", fontsize=9.5, color=w.CALL_HUE if calls else w.PUT_HUE,
-          fontweight="bold", fontfamily=w.DATA_FONT)
-    if len(g["rows"]) > 1:
-        T(w.RIGHT - 0.12, y + 0.06, f"total {w._fmt_prem(g['total_premium'])}", ha="right", fontsize=11, color=w.TXT_LIGHT,
-          fontweight="bold", fontfamily=w.DATA_FONT)
+def _pill(d, right: int, cy: int, text: str, bg: str, fg: str, size: int = 24, pad: int = 18) -> int:
+    """Fully rounded pill with its right edge at `right`; returns its left edge."""
+    h = size + 18
+    left = right - _tw(text, size, True) - 2 * pad
+    d.rounded_rectangle((left, cy - h // 2, right, cy + h // 2), radius=h // 2, fill=bg)
+    d.text((left + pad, cy), text, font=_font(size, True), fill=fg, anchor="lm")
+    return left
 
 
-def _draw_contract_row(ax, T, f: dict, y: float) -> None:
-    """One contract: time, contract, premium, the price it printed at, then HIGH / LOW / NOW each as a percentage
-    versus that entry price with the dollar price underneath."""
-    cp = f["put_call"] or "?"
-    hue = w.CALL_HUE if cp == "CALL" else w.PUT_HUE if cp == "PUT" else w.GRAY
-    k = w._fmt_strike(f["strike"]) if f.get("strike") is not None else "?"
-    exp = f["expiry"].strftime("%b %d") if f.get("expiry") else "?"
-    T(COLS["time"], y + 0.07, _clock12(f["alerted_at"]), fontsize=9.5, color=w.TXT_DIM, fontfamily=w.DATA_FONT)
-    T(COLS["contract"], y + 0.06, f"{cp[:1]} {k} · {exp}", fontsize=10.5, color=hue, fontweight="bold", fontfamily=w.DATA_FONT)
-    T(COLS["prem"], y + 0.05, w._fmt_prem(f["premium"]), ha="right", fontsize=11, color=w.TXT_LIGHT, fontfamily=w.DATA_FONT)
-    T(COLS["entry"], y + 0.05, w._fmt_px(f.get("entry_px")), ha="center", fontsize=11, color=w.TXT_LIGHT, fontweight="bold", fontfamily=w.DATA_FONT)
-    if not f["ok"]:
-        for key in ("high", "low", "now"):
-            T(COLS[key], y + 0.06, "—", ha="center", fontsize=11, color=w.GRAY, fontfamily=w.DATA_FONT)
-        return
-    for key, pc, px in (("high", f["high_pct"], f["high_px"]), ("low", f["low_pct"], f["low_px"]), ("now", f["last_pct"], f["last_px"])):
-        T(COLS[key], y + 0.05, w._fmt_pct(pc), ha="center", fontsize=11, color=_pct_color(pc), fontweight="bold", fontfamily=w.DATA_FONT)
-        T(COLS[key], y + 0.32, w._fmt_px(px), ha="center", fontsize=8.4, color=w.TXT_DIM, fontfamily=w.DATA_FONT)
+def _draw_row(d, x: int, y: int, pw: int, rank: int, r: dict, shade: str) -> None:
+    d.rounded_rectangle((x, y, x + pw, y + ROW_H), radius=18, fill=shade)
+    fg, bg = ACCENT[r["side"]]
+    cy1, cy2, pad = y + 36, y + 84, 24
+    # right side first (kind pill, then the total) so line 1 knows how much room the left side has
+    kind_left = _pill(d, x + pw - pad, cy1, r["kind"], *PILL[r["kind"]]) if r["kind"] else x + pw - pad + 22   # no pill if the print had no sweep/block tag
+    d.text((kind_left - 22, cy1), r["total_premium"], font=_font(40, True), fill=TXT, anchor="rm")
+    limit = kind_left - 22 - _tw(r["total_premium"], 40, True) - 30
+    d.text((x + pad, cy1 - 6), f"#{rank}", font=_font(25), fill=DIM, anchor="lm")
+    tx = x + pad + _tw(f"#{rank}", 25) + 22
+    d.text((tx, cy1), r["ticker"], font=_font(42, True), fill=TXT, anchor="lm")
+    px = tx + _tw(r["ticker"], 42, True) + 20
+    label = r["side"].upper() + (f" ×{r['n_prints']}" if r["n_prints"] > 1 else "")
+    pill_w = _tw(label, 24, True) + 36
+    _pill(d, px + pill_w, cy1, label, bg, fg)
+    px += pill_w + 20
+    if r["price"]:
+        if px + _tw(r["price"], 29) > limit:
+            raise ValueError(f"flow card: {r['ticker']} line 1 would touch its total")
+        d.text((px, cy1 + 2), r["price"], font=_font(29), fill=TXT2, anchor="lm")
+    # line 2: largest print, then today, then the dim detail tail; all on one line
+    lx = x + pad
+    d.text((lx, cy2), r["largest_print"], font=_font(29, True), fill=TXT, anchor="lm")
+    lx += _tw(r["largest_print"], 29, True) + 24
+    if r["today"]:
+        d.text((lx, cy2 + 1), r["today"], font=_font(27), fill=TXT2, anchor="lm")
+        lx += _tw(r["today"], 27) + 24
+    tail = "  ·  ".join(v for v in (r["dte"], r["otm"], r["paid"], r["be"], r["voi"], r["cts"]) if v)
+    if tail:
+        size = _fit(tail, 27, False, x + pw - pad - lx, 22)
+        d.text((lx, cy2 + 1), tail, font=_font(size), fill=DIM, anchor="lm")
 
 
-def _summary_tiles(ax, T, stats: dict, y: float) -> float:
-    tw, th, tg = (w.RIGHT - w.LEFT - 0.2) / 2, 1.2, 0.2
-
-    def tile(col: int, row: int):
-        x0, y0 = w.LEFT + col * (tw + tg), y + row * (th + tg)
-        ax.add_patch(FancyBboxPatch((x0, y0), tw, th, boxstyle="round,pad=0,rounding_size=0.09",
-                                    linewidth=1, edgecolor=w.PANEL_BORDER, facecolor=w.PANEL_BG))
-        return x0 + tw / 2, y0
-
-    cx, y0 = tile(0, 0)
-    T(cx, y0 + 0.13, str(stats["count"]), ha="center", fontsize=28, color=w.TXT_LIGHT, fontweight="bold", fontfamily=w.HEADER_FONT)
-    T(cx, y0 + 0.80, f"FLOWS · {stats['unique_tickers']} TICKERS", ha="center", fontsize=9.5, color=w.TXT_DIM, fontweight="bold", fontfamily=w.HEADER_FONT)
-    cx, y0 = tile(1, 0)
-    T(cx, y0 + 0.13, w._fmt_prem(stats["total_premium"]), ha="center", fontsize=28, color=w.TXT_LIGHT, fontweight="bold", fontfamily=w.HEADER_FONT)
-    T(cx, y0 + 0.80, "TOTAL PREMIUM", ha="center", fontsize=9.5, color=w.TXT_DIM, fontweight="bold", fontfamily=w.HEADER_FONT)
-    cx, y0 = tile(0, 1)
-    tot = max(stats["call_premium"] + stats["put_premium"], 1)
-    bx0, bx1 = cx - tw / 2 + 0.3, cx + tw / 2 - 0.3
-    cw = (bx1 - bx0) * stats["call_premium"] / tot
-    T(cx, y0 + 0.12, f"{stats['calls']} calls  ·  {stats['puts']} puts", ha="center", fontsize=16, color=w.TXT_LIGHT, fontweight="bold", fontfamily=w.HEADER_FONT)
-    ax.add_patch(plt.Rectangle((bx0, y0 + 0.62), cw, 0.14, facecolor=w.CALL_HUE, edgecolor="none"))
-    ax.add_patch(plt.Rectangle((bx0 + cw, y0 + 0.62), (bx1 - bx0) - cw, 0.14, facecolor=w.PUT_HUE, edgecolor="none"))
-    T(cx, y0 + 0.86, f"BY PREMIUM  {stats['call_premium'] / tot * 100:.0f}% CALLS / {stats['put_premium'] / tot * 100:.0f}% PUTS",
-      ha="center", fontsize=8.8, color=w.TXT_DIM, fontweight="bold", fontfamily=w.HEADER_FONT)
-    cx, y0 = tile(1, 1)
-    mh, ml = stats["median_high_pct"], stats["median_low_pct"]
-    if mh is not None:
-        T(cx - 0.12, y0 + 0.15, w._fmt_pct(mh), ha="right", fontsize=22, color=w.UP, fontweight="bold", fontfamily=w.HEADER_FONT)
-        T(cx, y0 + 0.15, "/", ha="center", fontsize=22, color=w.GRAY, fontfamily=w.HEADER_FONT)
-        T(cx + 0.12, y0 + 0.15, w._fmt_pct(ml), ha="left", fontsize=22, color=w.DOWN, fontweight="bold", fontfamily=w.HEADER_FONT)
-    T(cx, y0 + 0.80, "TYPICAL HIGH / LOW SINCE", ha="center", fontsize=9.5, color=w.TXT_DIM, fontweight="bold", fontfamily=w.HEADER_FONT)
-    return y + 2 * th + tg
-
-
-def paginate(groups: list[dict[str, Any]]) -> list[list[tuple]]:
-    """Lay ticker groups out onto pages as ('band', group, cont) / ('row', row) / ('gap',) blocks. A ticker's
-    header always has at least one contract under it on the same page; a ticker too long for the space left
-    continues on the next page under a repeated '(cont.)' header; a ticker that would fit whole on a fresh page
-    starts there instead of being split when the current page is mostly used."""
-    pages: list[list[tuple]] = [[]]
-    used = 0.0
-
-    def cap() -> float:
-        return PAGE1_CAP if len(pages) == 1 else PAGE_CAP
-
-    def new_page():
-        nonlocal used
-        pages.append([])
-        used = 0.0
-
-    for g in groups:
-        whole = BAND_H + len(g["rows"]) * ROW_H + GROUP_GAP
-        if used + whole > cap() and whole <= PAGE_CAP and (cap() - used) < 0.5 * cap() and pages[-1]:
-            new_page()
-        cont = False
-        i = 0
-        while i < len(g["rows"]):
-            if used + BAND_H + ROW_H > cap() + 1e-9 and pages[-1]:
-                new_page()
-                cont = i > 0
-            pages[-1].append(("band", g, cont))
-            used += BAND_H
-            while i < len(g["rows"]) and used + ROW_H <= cap() + 1e-9:
-                pages[-1].append(("row", g["rows"][i]))
-                used += ROW_H
-                i += 1
-            if i < len(g["rows"]):
-                new_page()
-                cont = True
-        pages[-1].append(("gap",))
-        used += GROUP_GAP
-    return [p for p in pages if p]
+def _stat_card(d, x0: int, y0: int, cw: int, ch: int, num: str, lab: str) -> None:
+    d.rounded_rectangle((x0, y0, x0 + cw, y0 + ch), radius=22, fill=PANEL_BG, outline=HAIR, width=2)
+    inner, gap = cw - 80, 28
+    lab_w = _tw(lab, 30, True)
+    size = 60
+    while size > 42 and _tw(num, size, True) + gap + lab_w > inner:
+        size -= 1
+    if _tw(num, size, True) + gap + lab_w <= inner:       # number left, label beside it
+        d.text((x0 + 40, y0 + ch // 2), num, font=_font(size, True), fill=TXT, anchor="lm")
+        d.text((x0 + 40 + _tw(num, size, True) + gap, y0 + ch // 2 + 8), lab, font=_font(30, True), fill=DIM, anchor="lm")
+    else:                                                  # label drops below the number only when they cannot fit side by side
+        size = _fit(num, 60, True, inner, 42)
+        d.text((x0 + 40, y0 + 48), num, font=_font(size, True), fill=TXT, anchor="lm")
+        d.text((x0 + 40, y0 + 112), lab, font=_font(30, True), fill=DIM, anchor="lm")
 
 
 def render_report_cards(report: dict[str, Any], out_dir: str) -> list[str]:
-    """Page 1 = header + summary tiles + the first tickers; further pages continue the grouped table."""
+    """The whole day as ONE landscape PNG, 3600px wide: a stat strip, then PUTS and CALLS tables side by side (the
+    larger-premium side on the left). Returns a one-element list so callers can post it like any set of cards."""
     os.makedirs(out_dir, exist_ok=True)
-    pages = paginate(report["groups"])
-    paths = []
-    for n, blocks in enumerate(pages, start=1):
-        body = sum(BAND_H if b[0] == "band" else ROW_H if b[0] == "row" else GROUP_GAP for b in blocks)
-        note = n == len(pages) and report["stats"]["with_data"] < report["stats"]["count"]
-        H = (1.8 + 2.6 + 0.55 if n == 1 else 1.25 + 0.4) + body + (0.3 if note else 0) + 1.15
-        fig, ax, T = w._canvas(H)
-        _header(T, report, n, len(pages), big=(n == 1))
-        y = _summary_tiles(ax, T, report["stats"], 1.85) + 0.40 if n == 1 else 1.2
-        y = _column_headers(ax, T, y)
-        for b in blocks:
-            if b[0] == "band":
-                _draw_band(ax, T, b[1], y, b[2])
-                y += BAND_H
-            elif b[0] == "row":
-                _draw_contract_row(ax, T, b[1], y)
-                y += ROW_H
+    payload = build_card_payload(report)
+    panels = _split_panels(payload)
+    n_rows = max(1, min(MAX_ROWS_PER_PANEL, max(len(p[1]) for p in panels)))
+    pw = (W - 2 * MARGIN - GUTTER) // 2
+    stat_y, panel_y = 280, 470
+    rows_y = panel_y + 100
+    H = rows_y + n_rows * (ROW_H + ROW_GAP) + 30 + 140
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    cx = W // 2
+    d.text((cx, 86), TITLE, font=_font(84, True), fill=TXT, anchor="mm")
+    d.text((cx, 176), f"{payload['date_label']}  ·  {payload['cutoff_label']}", font=_font(40), fill=TXT2, anchor="mm")
+    d.text((cx, 236), EXPLAINER, font=_font(30), fill=DIM, anchor="mm")
+    st = payload["stats"]
+    cells = [(str(st["flows"]), f"FLOWS · {st['stocks']} STOCKS"), (st["total_premium"], "TOTAL PREMIUM"),
+             (st["calls_puts_pct"], "CALLS / PUTS (PREMIUM)"), (st["sweeps_blocks"], "SWEEPS / BLOCKS")]
+    gap = 28
+    cw = (W - 2 * MARGIN - 3 * gap) // 4
+    for i, (num, lab) in enumerate(cells):
+        _stat_card(d, MARGIN + i * (cw + gap), stat_y, cw, 150, num, lab)
+    total = sum(p[2] for p in panels) or 1
+    for pi, (side, rows, sub) in enumerate(panels):
+        x = MARGIN + pi * (pw + GUTTER)
+        fg, bg = ACCENT[side]
+        d.rounded_rectangle((x, panel_y, x + pw, panel_y + 84), radius=22, fill=bg)
+        d.rounded_rectangle((x, panel_y, x + 14, panel_y + 84), radius=7, fill=fg)
+        d.text((x + 44, panel_y + 42), side.upper(), font=_font(52, True), fill=fg, anchor="lm")
+        d.text((x + pw - 28, panel_y + 44), f"{len(rows)} names · {_money(sub, 1)} premium · {sub / total * 100:.0f}%",
+               font=_font(33), fill=TXT2, anchor="rm")
+        shown = rows[:n_rows]
+        for i in range(n_rows):                              # both panels draw the same number of slots, so they stay aligned
+            ry = rows_y + i * (ROW_H + ROW_GAP)
+            if i < len(shown):
+                _draw_row(d, x, ry, pw, i + 1, shown[i], ROW_SHADES[i % 2])
             else:
-                y += GROUP_GAP
-        if note:
-            T(w.LEFT, y + 0.04, "— = no contract trades found for that flow yet",
-              fontsize=8.6, color=w.GRAY, fontfamily=w.HEADER_FONT)
-        _footer(T, ax, H, f"Page {n} of {len(pages)}" if len(pages) > 1 else "$1M+ flow report card")
-        pth = os.path.join(out_dir, f"bigflow_{report['day'].isoformat()}_{n:02d}.png")
-        fig.savefig(pth, facecolor=w.DARK_BG, dpi=w.DPI)
-        plt.close(fig)
-        paths.append(pth)
-    return paths
+                d.rounded_rectangle((x, ry, x + pw, ry + ROW_H), radius=18, fill=ROW_SHADES[i % 2])
+        if len(rows) > n_rows:
+            more = rows[n_rows:]
+            d.text((x + pw - 28, rows_y + n_rows * (ROW_H + ROW_GAP) + 16),
+                   f"+ {len(more)} more · {_money(sum(r['_premium'] for r in more), 1)}", font=_font(27), fill=DIM, anchor="rm")
+    fy = H - 120
+    d.line((MARGIN, fy, W - MARGIN, fy), fill=HAIR, width=2)
+    for i, line in enumerate(FOOTER):
+        d.text((cx, fy + 42 + i * 48), line, font=_font(_fit(line, 29, False, W - 2 * MARGIN, 22)), fill=DIM, anchor="mm")
+    pth = os.path.join(out_dir, f"bigflow_{report['day'].isoformat()}.png")
+    img.save(pth)
+    return [pth]
