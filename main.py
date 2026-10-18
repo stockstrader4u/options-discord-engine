@@ -19,6 +19,7 @@ from market_hours import is_market_open, market_closed_reason, is_trading_day, M
 from weekly_recap import (build_weekly_recap, render_weekly_recap_cards, post_weekly_recap_images, alpaca_configured,
                           build_expiry_results, render_expiry_cards)
 from flow_heatmap import heatmap_job
+from big_flow_report import fetch_big_flows, build_big_flow_report, render_report_cards
 from enrichment import enrich_alert, enrichment_summary, compute_levels
 from classifier import classify_alert
 from formatter import format_alert, format_plain_text
@@ -67,6 +68,8 @@ DEDUPE_WINDOW_MINUTES = int(os.getenv("DEDUPE_WINDOW_MINUTES", "30"))
 DEDUPE_PREMIUM_MULTIPLIER = float(os.getenv("DEDUPE_PREMIUM_MULTIPLIER", "2.0"))
 ALERT_FORMAT_MODE = os.getenv("ALERT_FORMAT_MODE", "subscriber")
 WEEKLY_RECAP_ENABLED = os.getenv("WEEKLY_RECAP_ENABLED", "false").lower() == "true"
+# Where the 3:30 PM $1M+ flow report card posts; falls back to the main subscriber webhook.
+BIG_FLOW_WEBHOOK_URL = os.getenv("BIG_FLOW_WEBHOOK_URL") or None
 WATCHLIST = {
     "DDOG","MDB","ANET","TWLO","CRM","UBER","NFLX","NVDA","AAPL","TSLA",
     "AMZN","ZS","NOW","CRWD","BABA","QCOM","AMD","BA","CELH","DKNG",
@@ -628,6 +631,57 @@ async def expiry_results_job():
             logger.warning("expiry_results_post_failed expiry=%s reason=non_2xx_response (will retry next run)", g["expiry"])
 
 
+async def big_flow_report_job():
+    """
+    3:30 PM ET "$1M+ Flow Report Card": every out-of-the-money, BOUGHT print of $1M+ premium JarvisFlow saw
+    today, market-wide (no watchlist or expiry filter), with how each contract has traded since. One JarvisFlow
+    call, priced from Alpaca option bars. Posts nothing if no flow qualified. See big_flow_report.py.
+    """
+    now_et = datetime.now(EASTERN)
+    if not is_trading_day(now_et.date()):
+        logger.info("big_flow_report_skipped reason=not_a_trading_day")
+        return
+    webhook = BIG_FLOW_WEBHOOK_URL or DISCORD_WEBHOOK_URL
+    if not webhook:
+        logger.warning("big_flow_report_skipped reason=webhook_missing")
+        return
+    if not alpaca_configured():
+        logger.error("big_flow_report_skipped reason=ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY_missing")
+        return
+
+    try:
+        items = await fetch_big_flows(now_et.date(), now_et, JARVIS_API_KEY or "")
+    except Exception as e:
+        logger.exception("big_flow_report_fetch_failed error=%s", str(e))
+        return
+    if not items:
+        logger.info("big_flow_report_skipped reason=no_1m_flows_today")
+        return
+
+    try:
+        report = await asyncio.to_thread(build_big_flow_report, items, now_et.date(), now_et, FINNHUB_API_KEY or "")
+    except Exception as e:
+        logger.exception("big_flow_report_build_failed error=%s", str(e))
+        return
+    logger.info("big_flow_report_built flows=%d priced=%d total_premium=%d",
+                report["stats"]["count"], report["stats"]["with_data"], report["stats"]["total_premium"])
+
+    import shutil, tempfile
+    card_dir = tempfile.mkdtemp(prefix="big_flow_")
+    try:
+        paths = render_report_cards(report, card_dir)
+        posted = await post_weekly_recap_images(webhook, paths, report["caption"])
+    except Exception as e:
+        logger.exception("big_flow_report_post_failed error=%s", str(e))
+        return
+    finally:
+        shutil.rmtree(card_dir, ignore_errors=True)
+    if posted:
+        logger.info("big_flow_report_posted ok")
+    else:
+        logger.warning("big_flow_report_post_failed reason=non_2xx_response")
+
+
 async def daily_flow_summary_job():
     """
     "Today's Flow at a Glance" — standalone end-of-day recap, posted at
@@ -721,6 +775,12 @@ async def lifespan(app: FastAPI):
             misfire_grace_time=900, coalesce=True,
         )
         scheduler.add_job(
+            big_flow_report_job, "cron",
+            day_of_week="mon-fri", hour=15, minute=30, timezone="America/New_York",
+            id="big_flow_report", replace_existing=True, max_instances=1,
+            misfire_grace_time=600,
+        )
+        scheduler.add_job(
             heatmap_job, "cron",
             day_of_week="mon-fri", hour=16, minute=30, timezone="America/New_York",
             id="flow_heatmap", replace_existing=True, max_instances=1,
@@ -741,6 +801,8 @@ async def lifespan(app: FastAPI):
                     bool(FINNHUB_API_KEY), WEEKLY_RECAP_ENABLED)
         if not alpaca_configured():
             logger.error("expiry_results_WILL_NOT_POST ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY not set on this service")
+        logger.info("big_flow_report_job_registered mon-fri_15:30_ET webhook=%s",
+                    "BIG_FLOW_WEBHOOK_URL" if BIG_FLOW_WEBHOOK_URL else "DISCORD_WEBHOOK_URL")
         logger.info("heatmap_job_registered mon-fri_16:30_ET webhook_configured=%s", bool(HEATMAP_WEBHOOK_URL))
         logger.info("daily_flow_summary_job_registered mon-fri_16:35_ET")
     else:
