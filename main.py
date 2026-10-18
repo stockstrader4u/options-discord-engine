@@ -13,8 +13,11 @@ import asyncio
 from models import FlowAlert
 from scoring import auto_score_alert
 from flow_filters import filter_flow_items, is_high_conviction, MAX_DTE_DAYS
+from conviction import evaluate_conviction, TIER_HIGH, TIER_STANDARD
+import db as db_module
 from market_hours import is_market_open, market_closed_reason, is_trading_day, MARKET_OPEN, MARKET_CLOSE, EASTERN
-from weekly_recap import build_weekly_recap, render_weekly_recap_cards, post_weekly_recap_images, alpaca_configured
+from weekly_recap import (build_weekly_recap, render_weekly_recap_cards, post_weekly_recap_images, alpaca_configured,
+                          build_expiry_results, render_expiry_cards)
 from flow_heatmap import heatmap_job
 from enrichment import enrich_alert, enrichment_summary, compute_levels
 from classifier import classify_alert
@@ -24,6 +27,8 @@ from db import (
     init_all_tables,
     add_premium_column_migration,
     add_vol_oi_columns_migration,
+    ensure_conviction_schema,
+    mark_results_posted,
     alert_hash_exists_in_window,
     get_same_day_published_premium,
     save_published_alert,
@@ -61,6 +66,7 @@ DEDUPE_WINDOW_MINUTES = int(os.getenv("DEDUPE_WINDOW_MINUTES", "30"))
 # duplicate. 2.0 = must be at least double the prior same-day premium.
 DEDUPE_PREMIUM_MULTIPLIER = float(os.getenv("DEDUPE_PREMIUM_MULTIPLIER", "2.0"))
 ALERT_FORMAT_MODE = os.getenv("ALERT_FORMAT_MODE", "subscriber")
+WEEKLY_RECAP_ENABLED = os.getenv("WEEKLY_RECAP_ENABLED", "false").lower() == "true"
 WATCHLIST = {
     "DDOG","MDB","ANET","TWLO","CRM","UBER","NFLX","NVDA","AAPL","TSLA",
     "AMZN","ZS","NOW","CRWD","BABA","QCOM","AMD","BA","CELH","DKNG",
@@ -361,7 +367,7 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25, since: datetime | 
             filtered_items = filter_items_since(filtered_items, since)
 
         posted = skipped = skipped_score = skipped_classifier = 0
-        skipped_dedupe = skipped_post_error = 0
+        skipped_dedupe = skipped_post_error = skipped_standard = 0
         previews = []
 
         for item in filtered_items[:limit]:
@@ -398,10 +404,25 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25, since: datetime | 
                 skipped += 1; skipped_dedupe += 1
                 continue
 
+            # Rule-based conviction tier (conviction.py). Only High and Very High are published: a flow
+            # that misses the baseline (tier "Standard", e.g. volume <= open interest) is skipped like any
+            # other filtered flow, and nothing is logged for it. evaluate_conviction never raises; if it
+            # somehow does, fail open (post as "High") rather than silently dropping alerts.
+            try:
+                conviction = evaluate_conviction(alert, enrichment, item, db_module)
+            except Exception as e:
+                logger.exception("conviction_eval_failed %s %s: %s", alert.ticker, alert.contract, e)
+                conviction = None
+
+            if conviction and conviction["tier"] == TIER_STANDARD:
+                skipped += 1; skipped_standard += 1
+                continue
+
             message = format_plain_text(format_alert(
                 alert, enrichment, classification, final_score, score_reasons,
                 mode=ALERT_FORMAT_MODE,  # type: ignore[arg-type]
                 payload_type="plain_text",
+                conviction_label=conviction["tier"] if conviction else TIER_HIGH,
             ))
             posted_ok = await post_to_discord(message)
 
@@ -418,6 +439,14 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25, since: datetime | 
                     volume=alert.volume, open_interest=alert.open_interest,
                 )
                 save_classification_row(event_id, alert_hash, classification)
+                if conviction:
+                    try:
+                        db_module.update_flow_event_conviction(
+                            event_id,
+                            (item.get("interpreted_Conviction") or item.get("interpretedConviction") or "").upper() or None,
+                            conviction["tier"], conviction)
+                    except Exception as e:
+                        logger.warning("conviction record failed for %s %s: %s", alert.ticker, alert.contract, e)
                 try:
                     create_outcome_row(
                         alert_hash=alert_hash, ticker=alert.ticker, contract=alert.contract,
@@ -433,6 +462,7 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25, since: datetime | 
                 previews.append({
                     "ticker": alert.ticker, "contract": alert.contract,
                     "score": final_score, "high_conviction_override": high_conviction,
+                    "conviction": conviction["tier"] if conviction else None,
                 })
             else:
                 skipped += 1; skipped_post_error += 1
@@ -446,7 +476,7 @@ async def process_jarvis_ticker(ticker: str, limit: int = 25, since: datetime | 
             "checked": min(limit, len(filtered_items)),
             "posted": posted, "skipped": skipped,
             "skipped_score": skipped_score, "skipped_classifier": skipped_classifier,
-            "skipped_dedupe": skipped_dedupe,
+            "skipped_dedupe": skipped_dedupe, "skipped_standard": skipped_standard,
             "skipped_post_error": skipped_post_error, "previews": previews
         }
 
@@ -551,6 +581,53 @@ async def weekly_recap_job():
         logger.warning("weekly_recap_post_failed reason=non_2xx_response")
 
 
+async def expiry_results_job():
+    """
+    Posts each flow's result once its contract has EXPIRED, instead of one recap of the whole week on Friday.
+    Runs mon-fri 16:45 ET: by then the 4pm close has happened and the data feed (15-minute delay) covers it.
+    Finds published, rule-based-tier flows whose expiry date has arrived and whose result has not been posted,
+    groups them by expiry date, posts one set of cards per date, and only then marks them posted -- so a
+    failed post is retried at the next run, and an outage is caught up (EXPIRY_RESULTS_LOOKBACK_DAYS).
+    Flows published before the rule-based tiers went live (conviction_rule_version NULL) are never posted.
+    """
+    if not DISCORD_WEBHOOK_URL:
+        logger.warning("expiry_results_skipped reason=DISCORD_WEBHOOK_URL_missing")
+        return
+    if not alpaca_configured():
+        logger.error("expiry_results_skipped reason=ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY_missing")
+        return
+
+    try:
+        groups = await asyncio.to_thread(build_expiry_results, FINNHUB_API_KEY or "")
+    except Exception as e:
+        logger.exception("expiry_results_build_failed error=%s", str(e))
+        return
+    if not groups:
+        logger.info("expiry_results_none_due")
+        return
+
+    import shutil, tempfile
+    for g in groups:
+        ids = [f["flow_event_id"] for f in g["flows"]]
+        card_dir = tempfile.mkdtemp(prefix="expiry_results_")
+        try:
+            paths = render_expiry_cards(g, card_dir)
+            posted = await post_weekly_recap_images(DISCORD_WEBHOOK_URL, paths, g["caption"])
+        except Exception as e:
+            logger.exception("expiry_results_post_failed expiry=%s error=%s", g["expiry"], str(e))
+            continue
+        finally:
+            shutil.rmtree(card_dir, ignore_errors=True)
+        if posted:
+            try:
+                mark_results_posted(ids)
+            except Exception as e:
+                logger.exception("expiry_results_mark_failed expiry=%s error=%s", g["expiry"], str(e))
+            logger.info("expiry_results_posted expiry=%s flows=%d", g["expiry"], len(ids))
+        else:
+            logger.warning("expiry_results_post_failed expiry=%s reason=non_2xx_response (will retry next run)", g["expiry"])
+
+
 async def daily_flow_summary_job():
     """
     "Today's Flow at a Glance" — standalone end-of-day recap, posted at
@@ -602,6 +679,10 @@ async def lifespan(app: FastAPI):
     init_all_tables()
     add_premium_column_migration()
     add_vol_oi_columns_migration()
+    try:
+        ensure_conviction_schema()
+    except Exception as e:
+        logger.exception("conviction_schema_failed (alerts keep posting; conviction columns not recorded): %s", e)
     backend = "PostgreSQL" if is_postgres() else "SQLite"
     logger.info("db_backend=%s", backend)
 
@@ -624,11 +705,20 @@ async def lifespan(app: FastAPI):
                     id=job_id, replace_existing=True, max_instances=1,
                     misfire_grace_time=300, coalesce=True,
                 )
+        # Results are now posted per flow after its contract expires (expiry_results_job). The Friday
+        # whole-week recap is kept in the code but off unless WEEKLY_RECAP_ENABLED=true.
+        if WEEKLY_RECAP_ENABLED:
+            scheduler.add_job(
+                weekly_recap_job, "cron",
+                day_of_week="fri", hour=16, minute=32, timezone="America/New_York",
+                id="weekly_recap", replace_existing=True, max_instances=1,
+                misfire_grace_time=300,
+            )
         scheduler.add_job(
-            weekly_recap_job, "cron",
-            day_of_week="fri", hour=16, minute=32, timezone="America/New_York",
-            id="weekly_recap", replace_existing=True, max_instances=1,
-            misfire_grace_time=300,
+            expiry_results_job, "cron",
+            day_of_week="mon-fri", hour=16, minute=45, timezone="America/New_York",
+            id="expiry_results", replace_existing=True, max_instances=1,
+            misfire_grace_time=900, coalesce=True,
         )
         scheduler.add_job(
             heatmap_job, "cron",
@@ -647,9 +737,10 @@ async def lifespan(app: FastAPI):
             "scheduler_started watchlist=%d mode=%s interval=%s dedupe_window=%s concurrency=%s dedupe_premium_multiplier=%s",
             len(WATCHLIST), ALERT_POLL_MODE, POLL_INTERVAL_SECONDS, DEDUPE_WINDOW_MINUTES, JARVIS_CONCURRENCY, DEDUPE_PREMIUM_MULTIPLIER,
         )
-        logger.info("weekly_recap_job_registered fri_16:32_ET finnhub_configured=%s", bool(FINNHUB_API_KEY))
+        logger.info("expiry_results_job_registered mon-fri_16:45_ET finnhub_configured=%s weekly_recap_enabled=%s",
+                    bool(FINNHUB_API_KEY), WEEKLY_RECAP_ENABLED)
         if not alpaca_configured():
-            logger.error("weekly_recap_WILL_NOT_POST ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY not set on this service")
+            logger.error("expiry_results_WILL_NOT_POST ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY not set on this service")
         logger.info("heatmap_job_registered mon-fri_16:30_ET webhook_configured=%s", bool(HEATMAP_WEBHOOK_URL))
         logger.info("daily_flow_summary_job_registered mon-fri_16:35_ET")
     else:

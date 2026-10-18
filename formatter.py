@@ -109,19 +109,16 @@ def _vol_oi_line(alert: FlowAlert) -> str | None:
     return f"📊 Vol {vol:,} · OI {oi_str} · Vol/OI {ratio:.1f}x"
 
 
-def _setup_tag(classification: FlowClassification) -> str:
+def _setup_tag(classification: FlowClassification) -> str | None:
     """
-    One concise tag describing what kind of setup this is — uses the
-    classifier's own trade_style label directly (lotto/swing/unknown),
-    since that's already the engine's real conclusion. No re-derivation
-    from enrichment fields.
+    Optional one-word tag from the classifier's trade_style. Only "Swing" is worth printing: every flow
+    we publish is a short-dated OTM sweep, so "Lotto" sat on every card and told subscribers nothing, and
+    the old "Standard" fallback now collides with the conviction tier word. Returns None for those, and
+    the card simply omits the line.
     """
-    label = classification.trade_style.label
-    if label == "lotto":
-        return "Lotto"
-    if label == "swing":
+    if classification.trade_style.label == "swing":
         return "Swing"
-    return "Standard"
+    return None
 
 
 def _entry_thesis_line(
@@ -164,6 +161,7 @@ def _subscriber_plain(
     classification: FlowClassification,
     score: int,
     reasons: list[str],
+    conviction_label: str | None = None,
 ) -> str:
     emoji = _sentiment_emoji(alert.sentiment)
     direction = alert.sentiment.title()
@@ -171,7 +169,7 @@ def _subscriber_plain(
     contract_short = _contract_short(alert.contract)
     premium_str = _premium_display(alert.premium)
     dte_str = _dte_display(enrichment)
-    conviction = _conviction_label(score)
+    conviction = conviction_label or _conviction_label(score)
     setup_tag = _setup_tag(classification)
 
     # Moneyness now folds into the header line instead of its own
@@ -205,7 +203,10 @@ def _subscriber_plain(
     lines = [
         ALERT_DIVIDER,
         header,
-        f"🏷️ **{setup_tag}**",
+    ]
+    if setup_tag:
+        lines.append(f"🏷️ **{setup_tag}**")
+    lines += [
         "",
         contract_line,
         f"💰 {premium_str} premium · {flow}",
@@ -246,13 +247,14 @@ def _subscriber_embed(
     classification: FlowClassification,
     score: int,
     reasons: list[str],
+    conviction_label: str | None = None,
 ) -> dict[str, Any]:
     emoji = _sentiment_emoji(alert.sentiment)
     direction = alert.sentiment.title()
     flow = (alert.flow_type or "flow").title()
     premium_str = _premium_display(alert.premium)
     dte_str = _dte_display(enrichment)
-    conviction = _conviction_label(score)
+    conviction = conviction_label or _conviction_label(score)
     contract_short = _contract_short(alert.contract)
 
     catalyst_suffix = f" into {alert.catalyst}" if alert.catalyst else ""
@@ -471,11 +473,14 @@ def format_alert(
     reasons: list[str],
     mode: FormatMode = "subscriber",
     payload_type: PayloadType = "plain_text",
+    conviction_label: str | None = None,
 ) -> str | dict[str, Any]:
+    # conviction_label: the rule-based tier from conviction.py. When omitted (manual MCP tools, tests) the
+    # word falls back to the old score thresholds, so nothing about those callers changes.
     if mode == "subscriber":
         if payload_type == "embed":
-            return _subscriber_embed(alert, enrichment, classification, score, reasons)
-        return _subscriber_plain(alert, enrichment, classification, score, reasons)
+            return _subscriber_embed(alert, enrichment, classification, score, reasons, conviction_label)
+        return _subscriber_plain(alert, enrichment, classification, score, reasons, conviction_label)
     else:
         if payload_type == "embed":
             return _internal_embed(alert, enrichment, classification, score, reasons)

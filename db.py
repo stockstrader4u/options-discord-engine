@@ -966,33 +966,39 @@ def get_outcome_stats(days_back: int = 30, min_score: int = 0, ticker: str | Non
 
 def get_flow_events_in_range(start_date: str, end_date: str) -> list[dict]:
     """
-    Fetch all flow_events rows with ingested_at between start_date and
+    Fetch the PUBLISHED flow_events rows with ingested_at between start_date and
     end_date, inclusive, regardless of outcome/resolution status.
+
+    Only was_published rows: the recap and the conviction scoreboard must count what subscribers
+    actually saw, not every flow the engine logged and suppressed.
 
     Args:
         start_date: ISO date string "YYYY-MM-DD" (inclusive, start of day)
         end_date: ISO date string "YYYY-MM-DD" (inclusive, end of day)
     """
+    ensure_conviction_schema()
     p = "%s" if _POSTGRES else "?"
     if _POSTGRES:
         sql = f"""
-            SELECT alert_hash, ticker, contract, premium, sentiment,
+            SELECT id, alert_hash, ticker, contract, premium, sentiment,
                    put_call, strike, expiry_date, dte, spot_price,
-                   moneyness_tier, score, ingested_at
+                   moneyness_tier, score, conviction_label, conviction_rule_version, jarvis_conviction, ingested_at
             FROM flow_events
             WHERE ingested_at >= {p}::date
               AND ingested_at < ({p}::date + INTERVAL '1 day')
+              AND was_published = TRUE
             ORDER BY ingested_at ASC
         """
         params = (start_date, end_date)
     else:
         sql = f"""
-            SELECT alert_hash, ticker, contract, premium, sentiment,
+            SELECT id, alert_hash, ticker, contract, premium, sentiment,
                    put_call, strike, expiry_date, dte, spot_price,
-                   moneyness_tier, score, ingested_at
+                   moneyness_tier, score, conviction_label, conviction_rule_version, jarvis_conviction, ingested_at
             FROM flow_events
             WHERE date(ingested_at) >= date({p})
               AND date(ingested_at) <= date({p})
+              AND was_published = 1
             ORDER BY ingested_at ASC
         """
         params = (start_date, end_date)
@@ -1000,6 +1006,218 @@ def get_flow_events_in_range(start_date: str, end_date: str) -> list[dict]:
     with db_cursor() as (conn, cur):
         cur.execute(sql, params)
         return [dict(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Conviction tier (rule-based label) + per-flow option outcomes
+# ---------------------------------------------------------------------------
+# conviction_rule_version: NULL = legacy, label derived from the score thresholds (80/70/60).
+#                          1    = rule-based tier from conviction.py (Very High / High / Standard).
+# Evaluation windows must split on this column, the two labels mean different things.
+
+CONVICTION_RULE_VERSION = 1
+
+_CONVICTION_COLUMNS = [
+    ("jarvis_conviction", "TEXT"),
+    ("conviction_label", "TEXT"),
+    ("conviction_rule_version", "INTEGER"),
+    ("conviction_detail", "JSONB" if _POSTGRES else "TEXT"),
+]
+
+_conviction_schema_ready = False
+
+
+def _flow_option_outcomes_sql() -> str:
+    ts = "TIMESTAMPTZ" if _POSTGRES else "TEXT"
+    boolean = "BOOLEAN" if _POSTGRES else "INTEGER"
+    now_default = "TIMESTAMPTZ DEFAULT NOW()" if _POSTGRES else "TEXT"
+    return f"""
+        CREATE TABLE IF NOT EXISTS flow_option_outcomes (
+            flow_event_id          INTEGER PRIMARY KEY,
+            alert_hash             TEXT NOT NULL,
+            ticker                 TEXT NOT NULL,
+            contract               TEXT,
+            put_call               TEXT,
+            strike                 REAL,
+            expiry_date            TEXT,
+            alerted_at             {ts},
+            alert_px               REAL,
+            high_px                REAL,
+            low_px                 REAL,
+            last_px                REAL,
+            high_pct               REAL,
+            low_pct                REAL,
+            last_pct               REAL,
+            hit_50_before_minus_50 TEXT CHECK (hit_50_before_minus_50 IN ('yes','no','neither','both')),
+            time_to_peak_min       REAL,
+            expired                {boolean},
+            bars_ok                {boolean},
+            computed_at            {now_default},
+            result_posted_at       {ts}
+        )"""
+
+
+def ensure_conviction_schema() -> None:
+    """Idempotent: add the conviction columns to flow_events, create flow_option_outcomes, and backfill
+    history. Safe to call any number of times (cached per process after the first success).
+    Mirrors migrations/v1_conviction.sql, which is the same thing for running by hand in psql."""
+    global _conviction_schema_ready
+    if _conviction_schema_ready:
+        return
+    with db_cursor() as (conn, cur):
+        if _POSTGRES:
+            for name, typ in _CONVICTION_COLUMNS:
+                cur.execute(f"ALTER TABLE flow_events ADD COLUMN IF NOT EXISTS {name} {typ}")
+        else:
+            cur.execute("PRAGMA table_info(flow_events)")
+            have = {r[1] for r in cur.fetchall()}
+            for name, typ in _CONVICTION_COLUMNS:
+                if name not in have:
+                    cur.execute(f"ALTER TABLE flow_events ADD COLUMN {name} {typ}")
+        cur.execute(_flow_option_outcomes_sql())
+        # result_posted_at: set once the flow's expiry-result card has been posted to subscribers.
+        if _POSTGRES:
+            cur.execute("ALTER TABLE flow_option_outcomes ADD COLUMN IF NOT EXISTS result_posted_at TIMESTAMPTZ")
+        else:
+            cur.execute("PRAGMA table_info(flow_option_outcomes)")
+            if "result_posted_at" not in {r[1] for r in cur.fetchall()}:
+                cur.execute("ALTER TABLE flow_option_outcomes ADD COLUMN result_posted_at TEXT")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_fo_outcomes_ticker_time ON flow_option_outcomes (ticker, alerted_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_fo_outcomes_computed ON flow_option_outcomes (computed_at)")
+
+        # Backfill jarvis_conviction from the note ("JarvisFlow | BOUGHT CALL | OTM | Conviction: HIGH").
+        # Done in Python, not a regex UPDATE, so SQLite and Postgres behave the same. Non-matching rows stay NULL.
+        import re
+        cur.execute("SELECT id, note FROM flow_events WHERE jarvis_conviction IS NULL AND note LIKE '%Conviction:%'")
+        pat = re.compile(r"Conviction:\s*([A-Za-z]+)")
+        p = "%s" if _POSTGRES else "?"
+        for r in cur.fetchall():
+            row = dict(r) if _POSTGRES else {"id": r[0], "note": r[1]}
+            m = pat.search(row["note"] or "")
+            if m:
+                cur.execute(f"UPDATE flow_events SET jarvis_conviction = {p} WHERE id = {p}",
+                            (m.group(1).upper(), row["id"]))
+
+        # Legacy label for pre-change rows: the OLD score thresholds, rule version stays NULL.
+        cur.execute("""
+            UPDATE flow_events SET conviction_label = CASE
+                WHEN score >= 80 THEN 'Very High' WHEN score >= 70 THEN 'High'
+                WHEN score >= 60 THEN 'Medium' ELSE 'Low' END
+            WHERE conviction_label IS NULL AND score IS NOT NULL""")
+    _conviction_schema_ready = True
+
+
+def update_flow_event_conviction(event_id: int, jarvis_conviction: str | None, label: str,
+                                 detail: dict) -> None:
+    """Write the rule-based tier, Jarvis's own label and the full B/S breakdown onto a flow_events row.
+    A separate UPDATE (not part of save_flow_event_row's INSERT) so a schema hiccup can never block the
+    row from being logged."""
+    p = "%s" if _POSTGRES else "?"
+    cast = "::jsonb" if _POSTGRES else ""
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            f"""UPDATE flow_events SET jarvis_conviction = {p}, conviction_label = {p},
+                    conviction_rule_version = {p}, conviction_detail = {p}{cast}
+                WHERE id = {p}""",
+            (jarvis_conviction, label, CONVICTION_RULE_VERSION, json.dumps(detail), event_id),
+        )
+
+
+def count_same_day_published_prints(contract: str, sentiment: str, since_utc: str) -> int:
+    """Published flow_events rows for this exact contract + direction logged at/after since_utc
+    ('YYYY-MM-DD HH:MM:SS' UTC). Used for the repeat-accumulation signal."""
+    p = "%s" if _POSTGRES else "?"
+    true_ = "TRUE" if _POSTGRES else "1"
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            f"""SELECT COUNT(*) AS n FROM flow_events
+                WHERE contract = {p} AND sentiment = {p} AND was_published = {true_}
+                  AND ingested_at >= {p}""",
+            (contract, sentiment, since_utc),
+        )
+        row = cur.fetchone()
+        return int(row["n"] if _POSTGRES else row[0])
+
+
+def get_recent_published_premiums(ticker: str, since_utc: str) -> list[int]:
+    """Premiums of this ticker's published prints since since_utc (UTC string). For the
+    unusual-for-the-name signal."""
+    p = "%s" if _POSTGRES else "?"
+    true_ = "TRUE" if _POSTGRES else "1"
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            f"""SELECT premium FROM flow_events
+                WHERE ticker = {p} AND was_published = {true_} AND ingested_at >= {p}
+                  AND premium IS NOT NULL""",
+            (ticker, since_utc),
+        )
+        return [int((r["premium"] if _POSTGRES else r[0])) for r in cur.fetchall()]
+
+
+def get_unposted_expired_flows(today: str, since_utc: str) -> list[dict]:
+    """Published, rule-based-tier flows whose contract has reached its expiry date (expiry <= today, ISO
+    'YYYY-MM-DD') and whose result card has not been posted yet. Restricted to conviction_rule_version = 1
+    so only flows published under the new rules are ever posted: nothing that happened before go-live is
+    touched. since_utc ('YYYY-MM-DD HH:MM:SS') bounds the catch-up window after an outage."""
+    ensure_conviction_schema()
+    p = "%s" if _POSTGRES else "?"
+    true_ = "TRUE" if _POSTGRES else "1"
+    sql = f"""
+        SELECT e.id, e.alert_hash, e.ticker, e.contract, e.premium, e.sentiment, e.put_call, e.strike,
+               e.expiry_date, e.dte, e.spot_price, e.moneyness_tier, e.score, e.conviction_label,
+               e.conviction_rule_version, e.jarvis_conviction, e.ingested_at
+        FROM flow_events e
+        LEFT JOIN flow_option_outcomes o ON o.flow_event_id = e.id
+        WHERE e.was_published = {true_} AND e.conviction_rule_version = 1
+          AND e.expiry_date IS NOT NULL AND substr(e.expiry_date, 1, 10) <= {p}
+          AND e.ingested_at >= {p}
+          AND o.result_posted_at IS NULL
+        ORDER BY e.ingested_at ASC"""
+    with db_cursor() as (conn, cur):
+        cur.execute(sql, (today, since_utc))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def mark_results_posted(flow_event_ids: list[int]) -> None:
+    """Stamp result_posted_at on these flows (their outcome rows must already exist: the expiry job
+    upserts before it posts)."""
+    if not flow_event_ids:
+        return
+    p = "%s" if _POSTGRES else "?"
+    now = "NOW()" if _POSTGRES else "datetime('now')"
+    with db_cursor() as (conn, cur):
+        for fid in flow_event_ids:
+            cur.execute(f"UPDATE flow_option_outcomes SET result_posted_at = {now} WHERE flow_event_id = {p}", (fid,))
+
+
+def upsert_flow_option_outcomes(rows: list[dict]) -> int:
+    """Insert/refresh one flow_option_outcomes row per flow (keyed by flow_event_id). Price fields are
+    refreshed every time the recap recomputes them, so a flow still trading keeps updating until expiry."""
+    ensure_conviction_schema()
+    rows = [r for r in rows if r.get("flow_event_id") is not None]
+    if not rows:
+        return 0
+    cols = ["flow_event_id", "alert_hash", "ticker", "contract", "put_call", "strike", "expiry_date",
+            "alerted_at", "alert_px", "high_px", "low_px", "last_px", "high_pct", "low_pct", "last_pct",
+            "hit_50_before_minus_50", "time_to_peak_min", "expired", "bars_ok"]
+    p = "%s" if _POSTGRES else "?"
+    now = "NOW()" if _POSTGRES else "datetime('now')"
+    updates = ", ".join(f"{c} = excluded.{c}" for c in cols[1:])
+    sql = (f"INSERT INTO flow_option_outcomes ({', '.join(cols)}, computed_at) "
+           f"VALUES ({', '.join([p] * len(cols))}, {now}) "
+           f"ON CONFLICT (flow_event_id) DO UPDATE SET {updates}, computed_at = {now}")
+    with db_cursor() as (conn, cur):
+        for r in rows:
+            vals = []
+            for c in cols:
+                v = r.get(c)
+                if c == "alerted_at" and v is not None and not _POSTGRES:
+                    v = v.isoformat()
+                if c in ("expired", "bars_ok") and v is not None:
+                    v = bool_val(bool(v))
+                vals.append(v)
+            cur.execute(sql, tuple(vals))
+    return len(rows)
 
 
 def get_flow_events_for_day(date_str: str | None = None) -> list[dict]:

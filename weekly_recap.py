@@ -43,7 +43,7 @@ import numpy as np
 from matplotlib.patches import FancyBboxPatch
 
 from market_hours import most_recent_trading_day, trading_days_before
-from db import get_flow_events_in_range
+from db import get_flow_events_in_range, upsert_flow_option_outcomes
 
 logger = logging.getLogger("options-weekly-recap")
 
@@ -207,6 +207,26 @@ def _is_expired(expiry: date, now_et: datetime) -> bool:
     return expiry < now_et.date() or (expiry == now_et.date() and now_et.hour >= 16)
 
 
+def hit_50_before_minus_50(alert_px: float, bars: list[tuple], alerted_at: datetime) -> str:
+    """Path order, from publish: did the contract's traded HIGH reach +50% before its traded LOW reached -50%?
+    'yes' / 'no' / 'neither', or 'both' when a single 5-minute bar touched both (order unknowable, kept
+    separate rather than folded into yes/no). Bars that open at or before the publish minute are skipped,
+    because they mix pre-publish prints in. A contract that settles at zero after its last trade is not a
+    -50% touch here (no traded bar shows it), so such a flow reads 'neither' unless a bar printed that low."""
+    up, down = alert_px * 1.5, alert_px * 0.5
+    for b in sorted(bars, key=lambda x: x[0]):
+        if b[0] <= alerted_at:
+            continue
+        touched_up, touched_down = b[2] >= up, b[3] <= down
+        if touched_up and touched_down:
+            return "both"
+        if touched_up:
+            return "yes"
+        if touched_down:
+            return "no"
+    return "neither"
+
+
 def compute_flow_result(row: dict[str, Any], bars: list[tuple] | None,
                         daily_closes: dict[date, float] | None,
                         spot_last: float | None, now_et: datetime) -> dict[str, Any]:
@@ -224,6 +244,9 @@ def compute_flow_result(row: dict[str, Any], bars: list[tuple] | None,
         "spot_alert": spot_alert, "spot_last": spot_last,
         "spot_chg_pct": ((spot_last - spot_alert) / spot_alert * 100) if (spot_last and spot_alert) else None,
         "ok": False, "reason": None, "expired": bool(expiry and _is_expired(expiry, now_et)),
+        "flow_event_id": row.get("id"), "conviction_label": row.get("conviction_label"),
+        "conviction_rule_version": row.get("conviction_rule_version"),
+        "hit_50_before_minus_50": None, "time_to_peak_min": None,
     }
     if expiry is None or strike is None or not put_call:
         res["reason"] = "contract details missing"
@@ -275,6 +298,8 @@ def compute_flow_result(row: dict[str, Any], bars: list[tuple] | None,
     path.append((end_x, last_px))
 
     pct = lambda px: (px / alert_px - 1.0) * 100.0
+    res["hit_50_before_minus_50"] = hit_50_before_minus_50(alert_px, window, alerted_at)
+    res["time_to_peak_min"] = max(0.0, trading_x(hi_bar[0], alerted_at)) if hi_bar[2] > alert_px else 0.0
     res.update(
         ok=True, alert_px=alert_px, alert_note=alert_note,
         high_px=high_px, low_px=low_px, last_px=last_px, last_note=last_note,
@@ -288,16 +313,11 @@ def compute_flow_result(row: dict[str, Any], bars: list[tuple] | None,
 # Recap assembly
 # ---------------------------------------------------------------------------
 
-def build_weekly_recap(api_key: str = "", as_of: date | None = None) -> dict[str, Any]:
-    """
-    Pull the window's published flows, fetch each contract's traded prices from
-    Alpaca, and return a neutral recap dict. `api_key` is the optional Finnhub key
-    (used only if Alpaca has no daily bar for a stock).
-    """
-    start_date, end_date = resolve_recap_window(as_of)
-    rows = get_flow_events_in_range(start_date.isoformat(), end_date.isoformat())
-    now_et = datetime.now(ET)
-
+def compute_flows_for_rows(rows: list[dict[str, Any]], api_key: str, now_et: datetime,
+                           end_date: date | None = None) -> list[dict[str, Any]]:
+    """Price each published flow: fetch its contract's Alpaca bars and the underlying's daily closes, then
+    compute_flow_result per flow. Shared by the weekly recap and the expiry-result job."""
+    end_date = end_date or now_et.date()
     flows: list[dict[str, Any]] = []
     if rows and alpaca_configured():
         syms: dict[int, str] = {}
@@ -335,13 +355,74 @@ def build_weekly_recap(api_key: str = "", as_of: date | None = None) -> dict[str
             f = compute_flow_result(r, None, None, None, now_et)
             f["reason"] = "Alpaca keys not configured" if not alpaca_configured() else f["reason"]
             flows.append(f)
+    return flows
 
+
+def build_weekly_recap(api_key: str = "", as_of: date | None = None) -> dict[str, Any]:
+    """
+    Pull the window's published flows, fetch each contract's traded prices from
+    Alpaca, and return a neutral recap dict. `api_key` is the optional Finnhub key
+    (used only if Alpaca has no daily bar for a stock).
+    """
+    start_date, end_date = resolve_recap_window(as_of)
+    rows = get_flow_events_in_range(start_date.isoformat(), end_date.isoformat())
+    now_et = datetime.now(ET)
+
+    flows = compute_flows_for_rows(rows, api_key, now_et, end_date)
+    _persist_outcomes(flows)
     stats = _summarize(flows)
     return {
         "start_date": start_date, "end_date": end_date,
         "total_alerts": len(flows), "flows": flows, "stats": stats,
         "caption": format_weekly_recap_caption(start_date, end_date, stats),
+        "conviction_check": _conviction_check(flows),
     }
+
+
+def _persist_outcomes(flows: list[dict[str, Any]], raise_on_error: bool = False) -> None:
+    """Upsert every flow's computed option outcome into flow_option_outcomes so the conviction scoreboard
+    has them. By default never lets a DB problem break the recap; the expiry-result job passes
+    raise_on_error=True because it must not post (and mark posted) results it failed to store."""
+    rows = []
+    for f in flows:
+        rows.append({
+            "flow_event_id": f.get("flow_event_id"), "alert_hash": f.get("alert_hash"), "ticker": f["ticker"],
+            "contract": f.get("contract"), "put_call": f.get("put_call"), "strike": f.get("strike"),
+            "expiry_date": f["expiry"].isoformat() if f.get("expiry") else None,
+            "alerted_at": f["alerted_at"],
+            "alert_px": f.get("alert_px"), "high_px": f.get("high_px"), "low_px": f.get("low_px"),
+            "last_px": f.get("last_px"), "high_pct": f.get("high_pct"), "low_pct": f.get("low_pct"),
+            "last_pct": f.get("last_pct"), "hit_50_before_minus_50": f.get("hit_50_before_minus_50"),
+            "time_to_peak_min": f.get("time_to_peak_min"), "expired": f.get("expired"), "bars_ok": f["ok"],
+        })
+    try:
+        n = upsert_flow_option_outcomes(rows)
+        logger.info("weekly_recap outcomes_persisted n=%d", n)
+    except Exception as e:
+        logger.warning("weekly_recap outcomes_persist_failed %s", e)
+        if raise_on_error:
+            raise
+
+
+def _conviction_check(flows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Per-tier facts for the summary card: this week's flows vs. everything since the rule-based tiers
+    went live. None until at least one rule-based flow exists. Cumulative figures come from Postgres."""
+    from conviction_scoreboard import TIERS, cumulative_rows, summarize
+    week_rows = [f for f in flows if f.get("ok") and f.get("conviction_rule_version") == 1]
+    if not week_rows:
+        return None
+    try:
+        cum = cumulative_rows()
+    except Exception as e:
+        logger.warning("weekly_recap conviction_cumulative_failed %s", e)
+        cum = []
+    out = {}
+    for tier in TIERS:
+        wk = [{"high_pct": f["high_pct"], "last_pct": f["last_pct"], "hit": f["hit_50_before_minus_50"]}
+              for f in week_rows if f.get("conviction_label") == tier]
+        cu = [r for r in cum if r["conviction_label"] == tier]
+        out[tier] = {"week": summarize(wk), "since_live": summarize(cu)}
+    return out
 
 
 def _summarize(flows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -481,8 +562,60 @@ def _outcome_buckets(flows: list[dict]) -> list[tuple[str, int, str]]:
     return out
 
 
+def conviction_ui_enabled() -> bool:
+    """The Conviction check panel and the per-row tier badge are opt-in (RECAP_CONVICTION_UI=1) so the recap
+    renders exactly as before until the owner switches them on."""
+    return os.getenv("RECAP_CONVICTION_UI", "0") == "1"
+
+
+CONVICTION_PANEL_H = 4.75
+
+
+_WEEKLY_PANEL_COLUMNS = (("FLOWS", "n", str), ("MEDIAN PEAK", "median_peak", _fmt_pct),
+                         ("REACHED +50%", "pct_reach_50", lambda v: f"{v:.0f}%"),
+                         ("+50% FIRST", "pct_hit_50_first", lambda v: f"{v:.0f}%"),
+                         ("UP AT LAST", "pct_up_last", lambda v: f"{v:.0f}%"))
+_WEEKLY_PANEL_PERIODS = (("this week", "week"), ("since live", "since_live"))
+_WEEKLY_PANEL_NOTE = "+50% FIRST = share that traded +50% before -50% (5-minute bars). Small samples are noisy."
+
+
+def _draw_conviction_panel(ax, T, check: dict, y: float, *, title: str | None = "CONVICTION CHECK",
+                           subtitle: str = "What each tier did after publish. Facts, not grades.",
+                           columns=_WEEKLY_PANEL_COLUMNS, periods=_WEEKLY_PANEL_PERIODS,
+                           note: str = _WEEKLY_PANEL_NOTE) -> float:
+    """Per-tier table: one block per tier, one line per period. Defaults draw the weekly 'Conviction check';
+    the expiry scorecard passes its own title/columns/periods/note. Returns the y below the table."""
+    if title:
+        T(LEFT, y, title, fontsize=12, color=TXT_LIGHT, fontweight="bold", fontfamily=HEADER_FONT)
+        y += 0.40
+    if subtitle:
+        T(LEFT, y, subtitle, fontsize=10.5, color=GRAY, fontfamily=HEADER_FONT)
+        y += 0.46
+    xs = [LEFT + 2.45, LEFT + 3.45, LEFT + 4.5, LEFT + 5.6, LEFT + 6.7]
+    for cx, (lab, _, _) in zip(xs, columns):
+        T(cx, y, lab, ha="center", fontsize=7.8, color=GRAY, fontweight="bold", fontfamily=HEADER_FONT)
+    y += 0.30
+    ax.plot([LEFT, RIGHT], [y, y], color=PANEL_BORDER, linewidth=1)
+    y += 0.10
+    for tier, by_period in check.items():
+        T(LEFT, y + 0.04, tier, fontsize=12, color=TXT_LIGHT, fontweight="bold", fontfamily=HEADER_FONT)
+        for k, (lab, key) in enumerate(periods):
+            st = by_period[key]
+            yy = y + k * 0.36
+            T(LEFT + 1.25, yy + 0.05, lab, fontsize=8.8, color=TXT_DIM, fontfamily=HEADER_FONT)
+            if not st["n"]:
+                T(xs[0], yy, "0", ha="center", fontsize=10.5, color=GRAY, fontfamily=DATA_FONT)
+                continue
+            for cx, (_, field, fmt) in zip(xs, columns):
+                T(cx, yy, fmt(st[field]), ha="center", fontsize=10.5, color=TXT_LIGHT, fontfamily=DATA_FONT)
+        y += 0.95
+    T(LEFT, y - 0.05, note, fontsize=8.6, color=GRAY, fontfamily=HEADER_FONT)
+    return y
+
+
 def render_summary_card(recap: dict[str, Any], out_path: str, pages: int = 1) -> None:
     stats, flows = recap["stats"], recap["flows"]
+    check = recap.get("conviction_check") if conviction_ui_enabled() else None
     by_day: dict[date, list] = {}
     for f in flows:
         by_day.setdefault(f["alerted_at"].date(), []).append(f)
@@ -490,6 +623,8 @@ def render_summary_card(recap: dict[str, Any], out_path: str, pages: int = 1) ->
     nodata = [f for f in flows if not f["ok"]]
 
     H = 1.9 + 2.75 + (0.62 + len(by_day) * 0.52) + (0.62 + len(buckets) * 0.52 + (0.40 if nodata else 0)) + 0.95
+    if check:
+        H += CONVICTION_PANEL_H
     fig, ax, T = _canvas(H)
 
     T(CENTER, 0.40, "WEEK IN FLOW", ha="center", fontsize=26, color=TXT_LIGHT, fontweight="bold", fontfamily=HEADER_FONT)
@@ -558,18 +693,24 @@ def render_summary_card(recap: dict[str, Any], out_path: str, pages: int = 1) ->
         y += 0.52
     if nodata:
         T(LEFT, y + 0.02, f"+ {len(nodata)} flow(s) with no trades since being published", fontsize=10.5, color=GRAY, fontfamily=HEADER_FONT)
+    if check:
+        y += 0.40 if nodata else 0.0
+        _draw_conviction_panel(ax, T, check, y + 0.35)
 
     _footer(T, ax, H, f"Summary · flow-by-flow detail on the next {pages - 1} page{'s' if pages != 2 else ''}" if pages > 1 else "Summary")
     fig.savefig(out_path, facecolor=DARK_BG, dpi=DPI)
     plt.close(fig)
 
 
-def render_detail_page(recap: dict[str, Any], flows: list[dict], page_no: int, pages: int, out_path: str) -> None:
+def render_detail_page(recap: dict[str, Any], flows: list[dict], page_no: int, pages: int, out_path: str,
+                       show_conviction: bool | None = None) -> None:
+    """show_conviction: draw the tier badge on each row. None = follow RECAP_CONVICTION_UI (the weekly recap)."""
+    badge = conviction_ui_enabled() if show_conviction is None else show_conviction
     head = 1.55
     H = head + len(flows) * ROW_H + 0.85
     fig, ax, T = _canvas(H)
-    T(LEFT, 0.28, "WEEK IN FLOW", fontsize=15, color=TXT_LIGHT, fontweight="bold", fontfamily=HEADER_FONT)
-    T(LEFT, 0.62, _range(recap), fontsize=10.5, color=TXT_DIM, fontfamily=HEADER_FONT)
+    T(LEFT, 0.28, recap.get("title", "WEEK IN FLOW"), fontsize=15, color=TXT_LIGHT, fontweight="bold", fontfamily=HEADER_FONT)
+    T(LEFT, 0.62, recap.get("subtitle") or _range(recap), fontsize=10.5, color=TXT_DIM, fontfamily=HEADER_FONT)
     T(RIGHT, 0.28, f"Page {page_no} of {pages}", ha="right", fontsize=11, color=TXT_DIM, fontfamily=HEADER_FONT)
 
     SP_X0, SP_X1 = LEFT + 0.22, LEFT + 3.25
@@ -584,14 +725,14 @@ def render_detail_page(recap: dict[str, Any], flows: list[dict], page_no: int, p
 
     y = head
     for f in flows:
-        _draw_row(ax, T, f, y, SP_X0, SP_X1, COL)
+        _draw_row(ax, T, f, y, SP_X0, SP_X1, COL, badge)
         y += ROW_H
     _footer(T, ax, H, f"Page {page_no} of {pages}")
     fig.savefig(out_path, facecolor=DARK_BG, dpi=DPI)
     plt.close(fig)
 
 
-def _draw_row(ax, T, f, y, SP_X0, SP_X1, COL):
+def _draw_row(ax, T, f, y, SP_X0, SP_X1, COL, badge: bool = False):
     ax.add_patch(FancyBboxPatch((LEFT, y), RIGHT - LEFT, ROW_H - 0.14, boxstyle="round,pad=0,rounding_size=0.07",
                                 linewidth=0, facecolor=PANEL_BG, zorder=0))
     cp = f["put_call"] or "?"
@@ -602,6 +743,10 @@ def _draw_row(ax, T, f, y, SP_X0, SP_X1, COL):
     T(LEFT + 0.22, y + 0.10, f"${f['ticker']}", fontsize=16, color=TXT_LIGHT, fontweight="bold", fontfamily=DATA_FONT)
     T(LEFT + 1.55, y + 0.14, f"{cp} {k} · {exp}", fontsize=12.5, color=hue, fontweight="bold", fontfamily=DATA_FONT)
     T(RIGHT - 0.18, y + 0.14, f"{_fmt_prem(f['premium'])} flow", ha="right", fontsize=12.5, color=TXT_LIGHT, fontweight="bold", fontfamily=DATA_FONT)
+    if badge and f.get("conviction_rule_version") == 1 and f.get("conviction_label"):
+        T(RIGHT - 1.55, y + 0.17, f["conviction_label"].upper(), ha="right", fontsize=7.8, color=TXT_DIM,
+          fontweight="bold", fontfamily=HEADER_FONT,
+          bbox=dict(boxstyle="round,pad=0.28", facecolor=PANEL_BG, edgecolor=PANEL_BORDER, linewidth=1))
     sub = f"{_clock(f['alerted_at'])}"
     if f.get("alert_px") is not None:
         sub += f" · {_fmt_px(f['alert_px'])} when published"
@@ -657,6 +802,162 @@ def render_weekly_recap_cards(recap: dict[str, Any], out_dir: str) -> list[str]:
     for n, chunk in enumerate(chunks, start=1):
         pth = os.path.join(out_dir, f"recap_{n:02d}_flows.png")
         render_detail_page(recap, chunk, n + 1, pages, pth)
+        paths.append(pth)
+    return paths
+
+
+# ---------------------------------------------------------------------------
+# Expiry results: each flow's result is posted once its contract has expired
+# ---------------------------------------------------------------------------
+
+EXPIRY_LOOKBACK_DAYS = int(os.getenv("EXPIRY_RESULTS_LOOKBACK_DAYS", "14"))   # catch-up window after an outage
+
+
+def _fmt_day(d: date) -> str:
+    return d.strftime("%a %b %d")
+
+
+def format_expiry_caption(expiry: date, flows: list[dict[str, Any]], page_count: int = 1) -> str:
+    prem = sum(f["premium"] for f in flows)
+    return (f"**Expiry Results — {_fmt_day(expiry)}**   {len(flows)} flow{'s' if len(flows) != 1 else ''} we published "
+            f"expired · {_fmt_prem(prem)} premium\n"
+            f"*Each card shows where the contract traded from publish through expiry — not trade recommendations.*")
+
+
+SCORECARD_TIERS = ("Very High", "High")
+SCORECARD_TIER_COLORS = {"Very High": UP, "High": "#8d99b8"}
+SCORECARD_FEW = 10          # fewer flows than this in a group and the card says so
+
+
+def build_expiry_scorecard(flows: list[dict[str, Any]]) -> dict[str, Any]:
+    """High vs Very High for this expiry date and for every settled flow since the rule-based tiers went
+    live. Call AFTER the outcomes are stored, so 'all expired' already includes this group."""
+    from conviction_scoreboard import cumulative_rows, summarize
+    try:
+        cum = cumulative_rows(expired_only=True)
+    except Exception as e:
+        logger.warning("expiry_scorecard cumulative_failed %s", e)
+        cum = []
+    out = {}
+    for tier in SCORECARD_TIERS:
+        day = [{"high_pct": f["high_pct"], "last_pct": f["last_pct"], "hit": f["hit_50_before_minus_50"]}
+               for f in flows if f.get("ok") and f.get("conviction_label") == tier]
+        out[tier] = {"day": summarize(day),
+                     "since_live": summarize([r for r in cum if r["conviction_label"] == tier])}
+    return out
+
+
+def _scorecard_panel(ax, T, y: float, title: str, by_tier: dict[str, dict]) -> float:
+    """One group (e.g. 'this expiry'): a bar per tier for each plain-English measure. Returns the y below it."""
+    BAR_X0, BAR_MAX = LEFT + 1.45, 3.1
+    T(LEFT, y, title, fontsize=12.5, color=TXT_LIGHT, fontweight="bold", fontfamily=HEADER_FONT)
+    y += 0.52
+
+    def heading(name: str, sub: str):
+        nonlocal y
+        T(LEFT, y, name, fontsize=11.5, color=TXT_LIGHT, fontweight="bold", fontfamily=HEADER_FONT)
+        T(LEFT, y + 0.30, sub, fontsize=9, color=GRAY, fontfamily=HEADER_FONT)
+        y += 0.66
+
+    def bar_rows(pct_key: str, count_key: str):
+        nonlocal y
+        for tier in SCORECARD_TIERS:
+            st = by_tier[tier]
+            color = SCORECARD_TIER_COLORS[tier]
+            T(LEFT + 0.1, y, tier, fontsize=10.5, color=color, fontweight="bold", fontfamily=HEADER_FONT)
+            if not st["n"]:
+                T(BAR_X0, y, "no flows", fontsize=10, color=GRAY, fontfamily=HEADER_FONT)
+            else:
+                pct = st[pct_key]
+                ax.add_patch(plt.Rectangle((BAR_X0, y + 0.04), BAR_MAX, 0.20, facecolor=PANEL_BG, edgecolor="none"))
+                ax.add_patch(plt.Rectangle((BAR_X0, y + 0.04), max(BAR_MAX * pct / 100, 0.03), 0.20, facecolor=color, edgecolor="none", alpha=0.95))
+                T(BAR_X0 + BAR_MAX + 0.15, y - 0.01, f"{pct:.0f}%", fontsize=12, color=TXT_LIGHT, fontweight="bold", fontfamily=DATA_FONT)
+                T(BAR_X0 + BAR_MAX + 0.95, y + 0.02, f"{st[count_key]} of {st['n']} flows", fontsize=9, color=TXT_DIM, fontfamily=DATA_FONT)
+            y += 0.40
+
+    heading("Win rate", "finished above the price it was published at")
+    bar_rows("pct_up_last", "n_up_last")
+    y += 0.16
+    heading("Hit +50%", "traded at least 50% above its publish price at some point")
+    bar_rows("pct_reach_50", "n_reach_50")
+    y += 0.16
+    heading("Typical high", "the middle flow's best price after publish")
+    for tier in SCORECARD_TIERS:
+        st = by_tier[tier]
+        T(LEFT + 0.1, y + 0.02, tier, fontsize=10.5, color=SCORECARD_TIER_COLORS[tier], fontweight="bold", fontfamily=HEADER_FONT)
+        if st["n"]:
+            T(BAR_X0, y - 0.04, _fmt_pct(st["median_peak"]), fontsize=15, color=TXT_LIGHT, fontweight="bold", fontfamily=DATA_FONT)
+        else:
+            T(BAR_X0, y, "no flows", fontsize=10, color=GRAY, fontfamily=HEADER_FONT)
+        y += 0.42
+    if any(0 < by_tier[t]["n"] < SCORECARD_FEW for t in SCORECARD_TIERS):
+        T(LEFT, y, f"Fewer than {SCORECARD_FEW} flows in a group: too few to read much into.", fontsize=9, color=DOWN, fontfamily=HEADER_FONT)
+        y += 0.30
+    return y
+
+
+def render_expiry_scorecard(group: dict[str, Any], out_path: str) -> None:
+    """One summary image that opens every expiry post: how Very High and High flows did, side by side."""
+    check = group["scorecard"]
+    panel_h = 0.52 + 2 * (0.66 + 2 * 0.40 + 0.16) + (0.66 + 2 * 0.42) + 0.30
+    H = 1.9 + 2 * panel_h + 0.45 + 1.0
+    fig, ax, T = _canvas(H)
+    T(CENTER, 0.40, "CONVICTION SCORECARD", ha="center", fontsize=24, color=TXT_LIGHT, fontweight="bold", fontfamily=HEADER_FONT)
+    T(CENTER, 1.00, "How Very High and High flows did", ha="center", fontsize=13, color=TXT_DIM, fontfamily=HEADER_FONT)
+    T(CENTER, 1.38, "once their contracts expired", ha="center", fontsize=13, color=TXT_DIM, fontfamily=HEADER_FONT)
+    y = _scorecard_panel(ax, T, 1.95, f"EXPIRED {group['expiry'].strftime('%a %b %d').upper()}", {t: check[t]["day"] for t in SCORECARD_TIERS})
+    ax.plot([LEFT, RIGHT], [y + 0.12, y + 0.12], color=PANEL_BORDER, linewidth=1)
+    y = _scorecard_panel(ax, T, y + 0.40, "ALL EXPIRED SINCE LAUNCH", {t: check[t]["since_live"] for t in SCORECARD_TIERS})
+    _footer(T, ax, H, "Conviction scorecard")
+    fig.savefig(out_path, facecolor=DARK_BG, dpi=DPI)
+    plt.close(fig)
+
+
+def build_expiry_results(api_key: str = "", now_et: datetime | None = None) -> list[dict[str, Any]]:
+    """Flows (published under the rule-based conviction tiers) whose contract has expired and whose result has
+    not been posted yet, priced and grouped by expiry date, oldest first. Each group is
+    {"expiry", "flows", "title", "subtitle", "caption"}. Outcomes are stored in flow_option_outcomes BEFORE
+    this returns (raising if that fails), so the caller can post and then mark_results_posted safely."""
+    from db import get_unposted_expired_flows
+    now_et = now_et or datetime.now(ET)
+    since = (now_et - timedelta(days=EXPIRY_LOOKBACK_DAYS)).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    rows = get_unposted_expired_flows(now_et.date().isoformat(), since)
+    if not rows:
+        return []
+    flows = compute_flows_for_rows(rows, api_key, now_et)
+    flows = [f for f in flows if f["expired"]]       # e.g. today's expiries before the 4pm close wait for tonight
+    if not flows:
+        return []
+    _persist_outcomes(flows, raise_on_error=True)
+    by_expiry: dict[date, list[dict[str, Any]]] = {}
+    for f in flows:
+        by_expiry.setdefault(f["expiry"], []).append(f)
+    groups = []
+    for expiry in sorted(by_expiry):
+        fs = sorted(by_expiry[expiry], key=lambda f: f["alerted_at"])
+        groups.append({
+            "expiry": expiry, "flows": fs, "title": "EXPIRY RESULTS",
+            "subtitle": f"Contracts that expired {_fmt_day(expiry)}",
+            "caption": format_expiry_caption(expiry, fs),
+            "scorecard": build_expiry_scorecard(fs),
+        })
+    return groups
+
+
+def render_expiry_cards(group: dict[str, Any], out_dir: str) -> list[str]:
+    """The conviction scorecard, then detail pages (ROWS_PER_PAGE flows each) for one expiry date, with the
+    tier badge on every row. Returns PNG paths in posting order."""
+    os.makedirs(out_dir, exist_ok=True)
+    flows = group["flows"]
+    chunks = [flows[i:i + ROWS_PER_PAGE] for i in range(0, len(flows), ROWS_PER_PAGE)]
+    paths = []
+    if group.get("scorecard"):
+        pth = os.path.join(out_dir, f"expiry_{group['expiry'].isoformat()}_00_scorecard.png")
+        render_expiry_scorecard(group, pth)
+        paths.append(pth)
+    for n, chunk in enumerate(chunks, start=1):
+        pth = os.path.join(out_dir, f"expiry_{group['expiry'].isoformat()}_{n:02d}.png")
+        render_detail_page(group, chunk, n, len(chunks), pth, show_conviction=True)
         paths.append(pth)
     return paths
 
