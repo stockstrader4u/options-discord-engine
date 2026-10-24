@@ -533,9 +533,9 @@ def _canvas(height: float):
     return fig, ax, T
 
 
-def _footer(T, ax, H, page_label: str):
+def _footer(T, ax, H, page_label: str, disclaimer: str = DISCLAIMER):
     ax.plot([LEFT, RIGHT], [H - 0.62, H - 0.62], color=PANEL_BORDER, linewidth=1)
-    T(CENTER, H - 0.50, DISCLAIMER, ha="center", fontsize=7.8, color=GRAY, fontfamily=HEADER_FONT)
+    T(CENTER, H - 0.50, disclaimer, ha="center", fontsize=7.8, color=GRAY, fontfamily=HEADER_FONT)
     T(CENTER, H - 0.28, page_label, ha="center", fontsize=8.5, color=TXT_DIM, fontfamily=HEADER_FONT)
 
 
@@ -717,8 +717,8 @@ def render_detail_page(recap: dict[str, Any], flows: list[dict], page_no: int, p
     COL = [LEFT + 4.05, LEFT + 5.25, LEFT + 6.45]
     ly = 1.00
     ax.plot([SP_X0, SP_X0 + 0.28], [ly + 0.07, ly + 0.07], color=GRAY, linewidth=1, linestyle=(0, (3, 2)))
-    T(SP_X0 + 0.34, ly - 0.02, "price when published", fontsize=8.8, color=TXT_DIM, fontfamily=HEADER_FONT)
-    T(SP_X0, ly + 0.24, "PRICE PATH SINCE FLOW PUBLISHED", fontsize=8.5, color=GRAY, fontweight="bold", fontfamily=HEADER_FONT)
+    T(SP_X0 + 0.34, ly - 0.02, recap.get("legend_label", "price when published"), fontsize=8.8, color=TXT_DIM, fontfamily=HEADER_FONT)
+    T(SP_X0, ly + 0.24, recap.get("path_label", "PRICE PATH SINCE FLOW PUBLISHED"), fontsize=8.5, color=GRAY, fontweight="bold", fontfamily=HEADER_FONT)
     for cx, lab in zip(COL, ("HIGH", "LOW", "LAST")):
         T(cx, ly + 0.24, lab, ha="center", fontsize=9, color=GRAY, fontweight="bold", fontfamily=HEADER_FONT)
     ax.plot([LEFT, RIGHT], [head - 0.12, head - 0.12], color=PANEL_BORDER, linewidth=1)
@@ -727,7 +727,7 @@ def render_detail_page(recap: dict[str, Any], flows: list[dict], page_no: int, p
     for f in flows:
         _draw_row(ax, T, f, y, SP_X0, SP_X1, COL, badge)
         y += ROW_H
-    _footer(T, ax, H, f"Page {page_no} of {pages}")
+    _footer(T, ax, H, f"Page {page_no} of {pages}", recap.get("disclaimer", DISCLAIMER))
     fig.savefig(out_path, facecolor=DARK_BG, dpi=DPI)
     plt.close(fig)
 
@@ -742,20 +742,27 @@ def _draw_row(ax, T, f, y, SP_X0, SP_X1, COL, badge: bool = False):
     exp = f["expiry"].strftime("%b %d") if f.get("expiry") else "?"
     T(LEFT + 0.22, y + 0.10, f"${f['ticker']}", fontsize=16, color=TXT_LIGHT, fontweight="bold", fontfamily=DATA_FONT)
     T(LEFT + 1.55, y + 0.14, f"{cp} {k} · {exp}", fontsize=12.5, color=hue, fontweight="bold", fontfamily=DATA_FONT)
-    T(RIGHT - 0.18, y + 0.14, f"{_fmt_prem(f['premium'])} flow", ha="right", fontsize=12.5, color=TXT_LIGHT, fontweight="bold", fontfamily=DATA_FONT)
+    T(RIGHT - 0.18, y + 0.14, f.get("right_label") or f"{_fmt_prem(f['premium'])} flow", ha="right", fontsize=12.5, color=f.get("right_color", TXT_LIGHT), fontweight="bold", fontfamily=DATA_FONT)
     if badge and f.get("conviction_rule_version") == 1 and f.get("conviction_label"):
         T(RIGHT - 1.55, y + 0.17, f["conviction_label"].upper(), ha="right", fontsize=7.8, color=TXT_DIM,
           fontweight="bold", fontfamily=HEADER_FONT,
           bbox=dict(boxstyle="round,pad=0.28", facecolor=PANEL_BG, edgecolor=PANEL_BORDER, linewidth=1))
     sub = f"{_clock(f['alerted_at'])}"
     if f.get("alert_px") is not None:
-        sub += f" · {_fmt_px(f['alert_px'])} when published"
+        sub += f" · {_fmt_px(f['alert_px'])} {f.get('px_label', 'when published')}"
+    sub = f.get("sub_left") or sub
     T(LEFT + 0.22, y + 0.47, sub, fontsize=10.5, color=TXT_DIM, fontfamily=DATA_FONT)
-    if f.get("spot_chg_pct") is not None:
+    if f.get("sub_right"):
+        T(RIGHT - 0.18, y + 0.47, f["sub_right"], ha="right", fontsize=10.5, color=GRAY, fontfamily=DATA_FONT)
+    elif f.get("spot_chg_pct") is not None:
         T(RIGHT - 0.18, y + 0.47, f"stock {f['spot_chg_pct']:+.1f}%", ha="right", fontsize=10.5, color=GRAY, fontfamily=DATA_FONT)
+    # optional third line (trade-setup details); a taller ROW_H pushes the chart and numbers down to fit it
+    dy = ROW_H - 1.52
+    if f.get("detail"):
+        T(LEFT + 0.22, y + 0.72, f["detail"], fontsize=9.2, color=TXT_DIM, fontfamily=DATA_FONT)
 
     if not f["ok"]:
-        T((LEFT + RIGHT) / 2, y + 0.90, f.get("reason") or "no contract data", ha="center", fontsize=10.5, color=GRAY, fontfamily=DATA_FONT)
+        T((LEFT + RIGHT) / 2, y + 0.90 + dy, f.get("reason") or "no contract data", ha="center", fontsize=10.5, color=GRAY, fontfamily=DATA_FONT)
         return
 
     pts = f["path_pct"]
@@ -763,7 +770,7 @@ def _draw_row(ax, T, f, y, SP_X0, SP_X1, COL, badge: bool = False):
     lo_v, hi_v = min(min(ys), -12.0), max(max(ys), 12.0)
     pad = (hi_v - lo_v) * 0.08
     lo_v, hi_v = lo_v - pad, hi_v + pad
-    top, bot = y + 0.82, y + ROW_H - 0.28
+    top, bot = y + 0.82 + dy, y + ROW_H - 0.28
     xmax = max(xs[-1], 1.0)
     mx = lambda x: SP_X0 + (x / xmax) * (SP_X1 - SP_X0)
     my = lambda v: bot - (v - lo_v) / (hi_v - lo_v) * (bot - top)
@@ -783,11 +790,11 @@ def _draw_row(ax, T, f, y, SP_X0, SP_X1, COL, badge: bool = False):
     vals = [(f["high_pct"], f["high_px"]), (f["low_pct"], f["low_px"]), (f["last_pct"], f["last_px"])]
     for i, (cx, (pc, px)) in enumerate(zip(COL, vals)):
         c = UP if pc > 0.05 else DOWN if pc < -0.05 else TXT_DIM
-        T(cx, y + 0.84, _fmt_pct(pc), ha="center", fontsize=15, color=c, fontweight="bold", fontfamily=DATA_FONT)
+        T(cx, y + 0.84 + dy, _fmt_pct(pc), ha="center", fontsize=15, color=c, fontweight="bold", fontfamily=DATA_FONT)
         sub = _fmt_px(px)
         if i == 2 and f["expired"]:
             sub = "expired " + sub
-        T(cx, y + 1.12, sub, ha="center", fontsize=9.5, color=TXT_DIM, fontfamily=DATA_FONT)
+        T(cx, y + 1.12 + dy, sub, ha="center", fontsize=9.5, color=TXT_DIM, fontfamily=DATA_FONT)
 
 
 def render_weekly_recap_cards(recap: dict[str, Any], out_dir: str) -> list[str]:

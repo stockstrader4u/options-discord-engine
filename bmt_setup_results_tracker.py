@@ -191,7 +191,8 @@ def fetch_pending_expiring_today() -> list:
     try:
         rows = conn.run("""
             SELECT id, ticker, direction, strike, entry_low, entry_high,
-                   expiry_label, expiry_date, publish_date
+                   expiry_label, expiry_date, publish_date, created_at,
+                   stop, target1, target2, role, risk
             FROM nightly_setup_ideas
             WHERE status = 'pending' AND expiry_date = :today
             ORDER BY ticker
@@ -201,7 +202,9 @@ def fetch_pending_expiring_today() -> list:
                 "id": r[0], "ticker": r[1], "direction": r[2], "strike": float(r[3]),
                 "entry_low": float(r[4]), "entry_high": float(r[5]),
                 "expiry_label": r[6],
-                "expiry_date": r[7], "publish_date": r[8],
+                "expiry_date": r[7], "publish_date": r[8], "created_at": r[9],
+                "stop": float(r[10]), "target1": float(r[11]), "target2": float(r[12]),
+                "role": r[13], "risk": r[14],
             }
             for r in rows
         ]
@@ -444,8 +447,11 @@ def run_results_check():
         # resolved so it stops showing up in
         # fetch_pending_expiring_today() on future runs. Only the
         # reporting step below excludes never_triggered.
-        save_result(row["id"], result["status"], result["entry_date"],
-                    result["period_high"], result["period_low"])
+        # never_triggered rows resolve now; triggered ones resolve only after their journey card posts,
+        # so an Alpaca outage or failed post leaves them pending for the next run.
+        if result["status"] == "never_triggered":
+            save_result(row["id"], result["status"], result["entry_date"],
+                        result["period_high"], result["period_low"])
         graded.append((row, result))
         log(f"  {row['ticker']}: {result['status']}"
             + (f" (entered {result['entry_date']}, range ${result['period_low']:.2f}-${result['period_high']:.2f})"
@@ -468,23 +474,60 @@ def run_results_check():
         log("All graded setups were never triggered -- nothing to post today.")
         return
 
-    # Most recently entered first.
-    reportable.sort(key=lambda pair: pair[1]["entry_date"], reverse=True)
+    # Report the contract's journey since the idea was published (setup_journey.py), drawn with the same
+    # cards as the flow expiry results. Win/loss above still comes from the stock-based grading and is
+    # kept in the DB; the cards themselves are neutral.
+    from setup_journey import compute_setup_results
+    from weekly_recap import ROWS_PER_PAGE, MarketDataError, render_detail_page
+    rows = []
+    for row, result in reportable:
+        row["grade"] = result          # entry date + stock high/low feed the setup-details line
+        rows.append(row)
+    try:
+        journeys = compute_setup_results(rows)
+    except MarketDataError as e:
+        log(f"✗ Option data unavailable ({e}) -- results NOT posted.")
+        return
+    journeys.sort(key=lambda f: f["alerted_at"])
+    wins = sum(1 for f in journeys if f["status"] == "win")
+    losses = sum(1 for f in journeys if f["status"] == "loss")
+    no_data = [f["ticker"] for f in journeys if f["status"] == "no_option_data"]
+    if no_data:
+        log(f"  No contract data for: {', '.join(no_data)} (shown without a verdict)")
+    record = f"  ·  {wins}W-{losses}L  ·  {round(wins / (wins + losses) * 100)}% win rate" if wins + losses else ""
 
     expiry_label = reportable[0][0]["expiry_label"] or now.strftime("%b %d")
-    out_path = "bmt_setup_results.png"
-    render_results_table(reportable, expiry_label, out_path)
+    import weekly_recap
+    weekly_recap.ROW_H = 1.82          # room for the setup-details line on every row
+    group = {
+        "title": "SETUP RESULTS",
+        "subtitle": f"Trade ideas whose contracts expired {reportable[0][0]['expiry_date']:%a %b %d}{record}",
+        "expiry_text": f"Contracts expiring {reportable[0][0]['expiry_date']:%a %b} {reportable[0][0]['expiry_date'].day}",
+        "path_label": "CONTRACT PRICE FROM ENTRY TO EXPIRY",
+        "legend_label": "price at entry",
+        "disclaimer": "WIN = contract traded at least +20% after entry · Recap of trade ideas we published · not trade recommendations · not financial advice",
+    }
+    chunks = [journeys[i:i + ROWS_PER_PAGE] for i in range(0, len(journeys), ROWS_PER_PAGE)]
+    from setup_summary_card import render_setup_summary_card
+    paths = ["bmt_setup_results_00_summary.png"]
+    render_setup_summary_card(group, journeys, len(graded), paths[0], pages=1 + len(chunks))
+    for n, chunk in enumerate(chunks, start=1):
+        pth = f"bmt_setup_results_{n:02d}.png"
+        render_detail_page(group, chunk, n + 1, 1 + len(chunks), pth, show_conviction=False)
+        paths.append(pth)
+    log(f"Rendered {len(paths)} journey page(s) for {len(journeys)} setup(s).")
 
-    wins_r = sum(1 for _, r in reportable if r["status"] == "win")
-    losses_r = len(reportable) - wins_r
-    wr = round(wins_r / len(reportable) * 100)
-    caption = f"**Setup Results \u2014 {expiry_label} Expiry**   {wins_r}W / {losses_r}L  \u00b7  {wr}% win rate"
-
-    posted = post_image_to_discord(out_path, message=caption)
+    caption = (f"**Setup Results — {expiry_label} Expiry**{record}\n"
+               f"*Each card shows the contract's price from entry through expiry.*")
+    posted = all(post_image_to_discord(pth, message=caption if i == 0 else "") for i, pth in enumerate(paths))
     if posted:
-        log("\u2713 Results table posted to Discord.")
+        verdicts = {f["setup_id"]: f["status"] for f in journeys}
+        for row, result in reportable:
+            save_result(row["id"], verdicts.get(row["id"], result["status"]), result["entry_date"],
+                        result["period_high"], result["period_low"])
+        log("✓ Results cards posted to Discord.")
     else:
-        log("\u2717 Results table post FAILED.")
+        log("✗ Results post FAILED.")
 
 
 run_results_job = run_results_check
