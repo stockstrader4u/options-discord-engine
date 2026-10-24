@@ -185,7 +185,12 @@ def ensure_schema():
         conn.close()
 
 
+CATCHUP_DAYS = 14      # a missed run is posted by a later run, but not forever
+
+
 def fetch_pending_expiring_today() -> list:
+    """Pending setups whose contracts expire today, plus any that expired in the last CATCHUP_DAYS days
+    and were never reported (a missed run). Never anything that has not expired yet."""
     today = datetime.now(ET).date()
     conn = _connect()
     try:
@@ -194,9 +199,9 @@ def fetch_pending_expiring_today() -> list:
                    expiry_label, expiry_date, publish_date, created_at,
                    stop, target1, target2, role, risk
             FROM nightly_setup_ideas
-            WHERE status = 'pending' AND expiry_date = :today
-            ORDER BY ticker
-        """, today=today)
+            WHERE status = 'pending' AND expiry_date <= :today AND expiry_date >= :since
+            ORDER BY expiry_date, ticker
+        """, today=today, since=today - timedelta(days=CATCHUP_DAYS))
         return [
             {
                 "id": r[0], "ticker": r[1], "direction": r[2], "strike": float(r[3]),
@@ -424,7 +429,7 @@ def post_image_to_discord(image_path: str, message: str = "") -> bool:
 # ── Main job ──────────────────────────────────────────────────────────────
 def run_results_check():
     now = datetime.now(ET)
-    log(f"[{now.isoformat()}] Checking for setups expiring today ({now.date()})...")
+    log(f"[{now.isoformat()}] Checking for setups that have reached expiry ({now.date()})...")
 
     if not DATABASE_URL:
         log("DATABASE_URL not set -- nothing to check.")
@@ -433,10 +438,21 @@ def run_results_check():
     ensure_schema()
     pending = fetch_pending_expiring_today()
     if not pending:
-        log("No pending setups expire today -- nothing to report.")
+        log("No pending setups have reached expiry -- nothing to report.")
         return
 
-    log(f"{len(pending)} setup(s) expiring today, grading each...")
+    # one results post per expiry date: today's, plus any earlier date a missed run left behind
+    by_expiry: dict = {}
+    for row in pending:
+        by_expiry.setdefault(row["expiry_date"], []).append(row)
+    for expiry in sorted(by_expiry):
+        if expiry < now.date():
+            log(f"Catching up on expiry {expiry} (missed run).")
+        _report_expiry(now, by_expiry[expiry])
+
+
+def _report_expiry(now, pending: list):
+    log(f"{len(pending)} setup(s) expiring {pending[0]['expiry_date']}, grading each...")
     graded = []
     for row in pending:
         result = grade_setup(row)
@@ -496,7 +512,7 @@ def run_results_check():
         log(f"  No contract data for: {', '.join(no_data)} (shown without a verdict)")
     record = f"  ·  {wins}W-{losses}L  ·  {round(wins / (wins + losses) * 100)}% win rate" if wins + losses else ""
 
-    expiry_label = reportable[0][0]["expiry_label"] or now.strftime("%b %d")
+    expiry_label = reportable[0][0]["expiry_label"] or reportable[0][0]["expiry_date"].strftime("%b %d")
     import weekly_recap
     weekly_recap.ROW_H = 1.82          # room for the setup-details line on every row
     group = {
