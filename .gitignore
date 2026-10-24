@@ -4,4 +4,4 @@ __pycache__/
 .env
 alerts.db
 alerts.db-shm
-alerts.db-wal
+alerts.db-wal.env.gex
