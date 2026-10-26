@@ -25,8 +25,15 @@ from weekly_recap import (DATA_DELAY, ET, _clock, _paged_bars, _parse_bar, _utc_
                           fetch_option_bars, fetch_stock_daily_closes, occ_symbol, trading_x)
 
 WIN_GAIN = 0.20
+STOCK_FEED = "sip"
+MAX_ENTRY_GAP = timedelta(minutes=30)   # first contract trade must come this soon after entry to price it
 BARS_LOOKBACK = timedelta(days=7)    # enough to find the last trade before a weekend/holiday entry
 WIN_COLOR, LOSS_COLOR = "#6ea8ff", "#f0a04b"     # weekly_recap's UP / DOWN
+
+
+def _when(ts: datetime) -> str:
+    h12 = ts.hour % 12 or 12
+    return f"{ts:%a %b} {ts.day}  {h12}:{ts.minute:02d} {'AM' if ts.hour < 12 else 'PM'} ET"
 
 
 def _in_session(ts: datetime) -> bool:
@@ -34,14 +41,16 @@ def _in_session(ts: datetime) -> bool:
 
 
 def fetch_stock_5m(tickers: list[str], start: date, end: date) -> dict[str, list[tuple]]:
-    """{ticker: [(ts_et, o, h, l, c), ...]} regular-hours 5-minute bars (IEX feed)."""
+    """{ticker: [(ts_et, o, h, l, c), ...]} regular-hours 5-minute bars. SIP (full market) is free once the
+    data is 15+ minutes old; IEX alone is thin and misses zone touches."""
     out: dict[str, list[tuple]] = {}
     for i in range(0, len(tickers), 25):
         raw = _paged_bars("/v2/stocks/bars", {
-            "symbols": ",".join(tickers[i:i + 25]), "timeframe": "5Min", "limit": 10000, "feed": "iex",
+            "symbols": ",".join(tickers[i:i + 25]), "timeframe": "5Min", "limit": 10000, "feed": STOCK_FEED,
             "adjustment": "split", "sort": "asc",
             "start": _utc_str(datetime(start.year, start.month, start.day, tzinfo=ET)),
-            "end": _utc_str(datetime(end.year, end.month, end.day, tzinfo=ET) + timedelta(days=1))})
+            "end": _utc_str(min(datetime(end.year, end.month, end.day, tzinfo=ET) + timedelta(days=1),
+                                datetime.now(timezone.utc) - DATA_DELAY))})
         for sym, rows in raw.items():
             out[sym] = [b for b in map(_parse_bar, rows) if _in_session(b[0])]
     return out
@@ -73,7 +82,7 @@ def compute_setup_result(row: dict[str, Any], stock_bars: list[tuple], opt_bars:
                    f"  ·  T1 {sk(row['target1'])}  ·  T2 {sk(row['target2'])}"),
     }
     closes = closes or {}
-    spot_entry = next((b[4] for b in stock_bars if b[0] >= entry_ts), None)
+    spot_entry = next((b[1] for b in stock_bars if b[0] >= entry_ts), None)   # stock price at the entry bar's start
     res["spot_px"] = spot_entry
     if spot_entry and closes.get(expiry):
         res["spot_chg_pct"] = None     # card shows the contract, not the stock move
@@ -81,12 +90,27 @@ def compute_setup_result(row: dict[str, Any], stock_bars: list[tuple], opt_bars:
     if not opt_bars:
         res["reason"] = "no option trades found"
         return res
-    before = [b for b in opt_bars if b[0] <= entry_ts]
-    after = [b for b in opt_bars if b[0] > entry_ts]
-    if before:
-        entry_px = before[-1][4]
-    elif after and after[0][0].date() == entry_ts.date():
+    # contract price at the entry moment, from the entry day only (an overnight gap must not be priced off
+    # yesterday's close): the open of the bar starting at entry, else the last trade before it today,
+    # else the first trade after it today
+    today_bars = [b for b in opt_bars if b[0].date() == entry_ts.date()]
+    at = next((b for b in today_bars if b[0] == entry_ts), None)
+    prior = [b for b in today_bars if b[0] < entry_ts]
+    after = [b for b in opt_bars if b[0] >= entry_ts]
+    if at:
+        entry_px = at[1]
+    elif prior:
+        entry_px = prior[-1][4]
+    elif after and after[0][0].date() == entry_ts.date() and after[0][0] - entry_ts <= MAX_ENTRY_GAP:
         entry_px = after[0][1]
+    elif after and after[0][0].date() == entry_ts.date():
+        # the contract had not traded by the time the stock triggered, and there is no quote history to price
+        # it from: show the idea, but do not score it
+        spot = f"${spot_entry:,.2f}" if spot_entry else "n/a"
+        res.update(status="not_scored", right_label="NOT SCORED", right_color="#8a93a8",
+                   reason="No contract trade within 30 min of the trigger, so not counted",
+                   sub_left=f"Triggered {_when(entry_ts)}  ·  stock {spot}  ·  contract had not traded")
+        return res
     else:
         res["reason"] = "contract had not traded at entry"
         return res
@@ -113,8 +137,7 @@ def compute_setup_result(row: dict[str, Any], stock_bars: list[tuple], opt_bars:
     status, label, color = ("win", "WIN", WIN_COLOR) if won else ("loss", "LOSS", LOSS_COLOR)
 
     pct = lambda px: (px / entry_px - 1.0) * 100.0
-    h12 = entry_ts.hour % 12 or 12
-    when = f"{entry_ts:%a %b} {entry_ts.day}  {h12}:{entry_ts.minute:02d} {'AM' if entry_ts.hour < 12 else 'PM'} ET"
+    when = _when(entry_ts)
     spot = f"${spot_entry:,.2f}" if spot_entry else "n/a"
     res["sub_left"] = f"Triggered {when}  ·  stock {spot}  ·  contract ${entry_px:,.2f}"
     res.update(

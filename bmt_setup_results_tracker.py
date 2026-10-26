@@ -507,10 +507,18 @@ def _report_expiry(now, pending: list):
     journeys.sort(key=lambda f: f["alerted_at"])
     wins = sum(1 for f in journeys if f["status"] == "win")
     losses = sum(1 for f in journeys if f["status"] == "loss")
+    not_scored = [f["ticker"] for f in journeys if f["status"] == "not_scored"]
+    if not_scored:
+        log(f"  Not scored (contract had not traded within 30 min of the trigger): {', '.join(not_scored)}")
     no_data = [f["ticker"] for f in journeys if f["status"] == "no_option_data"]
     if no_data:
         log(f"  No contract data for: {', '.join(no_data)} (shown without a verdict)")
     record = f"  ·  {wins}W-{losses}L  ·  {round(wins / (wins + losses) * 100)}% win rate" if wins + losses else ""
+    n_ns = len(not_scored)
+    ns_note = (f"{n_ns} idea{'s' if n_ns != 1 else ''} not scored: the contract had not traded within 30 minutes of the trigger, "
+               f"so there is no entry price") if n_ns else ""
+    if n_ns:
+        record += f"  ·  {n_ns} not scored"
 
     expiry_label = reportable[0][0]["expiry_label"] or reportable[0][0]["expiry_date"].strftime("%b %d")
     import weekly_recap
@@ -534,7 +542,8 @@ def _report_expiry(now, pending: list):
     log(f"Rendered {len(paths)} journey page(s) for {len(journeys)} setup(s).")
 
     caption = (f"**Setup Results — {expiry_label} Expiry**{record}\n"
-               f"*Each card shows the contract's price from entry through expiry.*")
+               f"*Each card shows the contract's price from entry through expiry.*"
+               + (f"\n*{ns_note}.*" if ns_note else ""))
     posted = all(post_image_to_discord(pth, message=caption if i == 0 else "") for i, pth in enumerate(paths))
     if posted:
         verdicts = {f["setup_id"]: f["status"] for f in journeys}
