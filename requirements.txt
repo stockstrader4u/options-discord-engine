@@ -16,4 +16,5 @@ Pillow
 fastmcp==2.2.10
 yfinance
 lxml
-pg8000
+pg8000==1.31.5
+scramp==1.4.15
