@@ -693,6 +693,13 @@ def main():
     et_now = datetime.now(ET)
     today_date = et_now.date()
 
+    # DST GATE: Railway cron is UTC-only, so the cron lists both candidate hours
+    # ("30 14,15 * * 1-5") and only the firing that lands at 10:xx ET proceeds.
+    if os.environ.get("RUN_MODE") == "once" and not os.environ.get("FORCE_RUN"):
+        if et_now.hour != 10:
+            print(f"  ET {et_now:%H:%M} - not 10:xx, exiting (DST twin firing).")
+            return
+
     # MARKET-HOLIDAY GATE (2026-09-13) -- see module docstring for the
     # full incident this fixes. Must run BEFORE any data is fetched or
     # any Discord post happens.
