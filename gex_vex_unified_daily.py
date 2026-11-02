@@ -695,7 +695,9 @@ def main():
 
     # DST GATE: Railway cron is UTC-only, so the cron lists both candidate hours
     # ("30 14,15 * * 1-5") and only the firing that lands at 10:xx ET proceeds.
-    if os.environ.get("RUN_MODE") == "once" and not os.environ.get("FORCE_RUN"):
+    # Unconditional (2026-11-02): gating on RUN_MODE=="once" let the 9:31 ET firing
+    # through on the first post-DST day because the Railway RUN_MODE value wasn't "once".
+    if not os.environ.get("FORCE_RUN"):
         if et_now.hour != 10:
             print(f"  ET {et_now:%H:%M} - not 10:xx, exiting (DST twin firing).")
             return
